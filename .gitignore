@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Data and Cache
+historical_data/
+*.db
+*.log
+access_token.txt
+
+# Generated Reports
+*.html
+*.png
+
+# Memory and Persistence (Local Only)
+market_memory.json
+rv_engine_memory.json
+vol_memory.json
+tracked_strategies.json
+vol_regime_history.csv
+
+# Notebooks
+*.ipynb
