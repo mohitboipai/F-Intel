@@ -1,5 +1,3 @@
-from sqlalchemy.sql.elements import True_
-from aiohttp.web import route
 import os
 import time
 import json
