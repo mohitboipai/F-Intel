@@ -264,67 +264,13 @@ class VolatilityAnalyzer:
         return {'price': 0}
 
     def get_option_chain_data(self):
-        # 1. Try Data Hub first
+        # Strictly rely on Data Hub. If it's hitting rate limits (429), hitting Fyers
+        # again directly here only punishes the limit further.
         hub_data = self.data_hub.get_latest_data()
-        # If hub has data and it matches our expiry (or we don't care), use it
         if hub_data and hub_data.get('chain'):
              return hub_data['chain']
-
-        # 2. Fallback to direct Fyers (legacy)
-        # Convert expiry to epoch if set
-        ts = ""
-        if self.expiry_date:
-             try:
-                 dt = datetime.strptime(self.expiry_date, "%Y-%m-%d")
-                 ts = int(dt.timestamp())
-             except:
-                 ts = ""
-
-        data = {
-            "symbol": self.symbol,
-            "strikecount": 500, # Wide range needed for vol surface
-            "timestamp": ts
-        }
-        try:
-            response = self.fyers.optionchain(data=data)
-            
-            # Handle Token Error
-            if response.get('code') == -15 or "token" in response.get('message', '').lower():
-                print("Token expired or invalid during chain fetch. Re-authenticating...")
-                self.fyers = self._authenticate()
-                response = self.fyers.optionchain(data=data)
-
-            # Handle Invalid Expiry (Auto-Correction)
-            if response.get('s') == 'error' and 'expiryData' in response.get('data', {}):
-                valid_expiries = response['data']['expiryData']
-                correct_ts = None
-                if self.expiry_date:
-                    try:
-                        u_date = datetime.strptime(self.expiry_date, "%Y-%m-%d").date()
-                        for item in valid_expiries:
-                             api_str = item.get('date')
-                             api_ts = item.get('expiry')
-                             # Parse API date
-                             a_date = datetime.strptime(api_str, "%d-%m-%Y").date()
-                             if u_date == a_date:
-                                 correct_ts = api_ts
-                                 break
-                    except Exception as e:
-                        print(f"Date matching error: {e}")
-                
-                if correct_ts:
-                    data['timestamp'] = correct_ts
-                    response = self.fyers.optionchain(data=data)
-
-            if response.get('s') == "ok":
-                return response.get('data', {})
-            else:
-                print(f"Error fetching option chain: {response}")
-                if "expiry" in response.get('message', '').lower():
-                     print("Hint: Check if the Expiry Date matches a valid Weekly/Monthly expiry.")
-        except Exception as e:
-            print(f"Error fetching option chain: {e}")
         return None
+
 
     def parse_and_filter(self, data):
         if not data:
@@ -776,6 +722,7 @@ class VolatilityAnalyzer:
         WHITE = '#e0e0e0'
         MUTED = '#888'
         colors = ['#4fc3f7', '#ff7043', '#66bb6a', '#ab47bc', '#ffa726', '#ef5350']
+        momentum_data: dict = {}   # populated per-cycle; safe default avoids NameError in HTML template
 
         try:
             while True:
@@ -1944,6 +1891,12 @@ class VolatilityAnalyzer:
                 # ============================================================
                 # We skip manual printout here to avoid redundancy with the unified dashboard stats
                 pass
+
+                # oi_pressure / oi_pressure_score are computed in _compute_seller_data;
+                # initialise safe defaults here so the print block below never raises NameError
+                # if the velocity calculation was skipped (e.g. first run, no baseline OI yet).
+                oi_pressure: str = 'NEUTRAL'
+                oi_pressure_score: float = 0.0
 
                 if oi_pressure == 'BULLISH':
                     print(f"  → Put writers building support, spot likely to hold/move UP")

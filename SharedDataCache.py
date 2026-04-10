@@ -46,6 +46,18 @@ class SharedDataCache:
         self._ohlc_df   = None
         self._rv_data   = None
 
+        # ── Heston params cache (5-min TTL) ─────────────────────────
+        self._heston_params: dict | None = None
+        self._heston_ts: float = 0.0
+        self.HESTON_TTL = 300   # 5 minutes
+
+        # ── Raw chain blob from DataServer (dict, not parsed) ────────
+        self._raw_chain: dict | None = None
+        self._raw_chain_ts: float = 0.0
+
+        # ── Near-expiry T (DTE in years) ─────────────────────────────
+        self._T: float = 7 / 365   # sensible default
+
         # ── Listeners: list of callables notified on new spot ────────
         self._spot_listeners = []
 
@@ -234,3 +246,47 @@ class SharedDataCache:
         except Exception:
             pass
         return pd.DataFrame()
+
+    # ─────────────────────────────────────────────────────────────────
+    # HESTON PARAMS  (calibrated, TTL 300s)
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_heston_params(self) -> dict | None:
+        """Return cached Heston params, or None if stale / not yet calibrated."""
+        if self._heston_params is None:
+            return None
+        if time.time() - self._heston_ts > self.HESTON_TTL:
+            return None   # TTL expired — caller should trigger recalibration
+        return self._heston_params
+
+    def set_heston_params(self, params: dict):
+        """Store freshly calibrated Heston params with a timestamp."""
+        self._heston_params = params
+        self._heston_ts = time.time()
+
+    # ─────────────────────────────────────────────────────────────────
+    # RAW CHAIN  (DataServer pushes its chain dict here so calibrator
+    #             and PricingRouter can read without an extra Fyers call)
+    # ─────────────────────────────────────────────────────────────────
+
+    def set_raw_chain(self, chain_dict: dict):
+        """Store the raw chain payload from DataServer."""
+        self._raw_chain    = chain_dict
+        self._raw_chain_ts = time.time()
+
+    def get_raw_chain(self) -> dict | None:
+        """Return the last pushed raw chain dict, or None if never set."""
+        return self._raw_chain
+
+    # ─────────────────────────────────────────────────────────────────
+    # TIME-TO-EXPIRY  (DTE in years for the near expiry)
+    # ─────────────────────────────────────────────────────────────────
+
+    def set_T(self, T: float):
+        """Store computed DTE in years for the current near expiry."""
+        self._T = max(0.0, float(T))
+
+    def get_T(self) -> float:
+        """Return cached DTE in years (default 7/365 if never set)."""
+        return self._T
+

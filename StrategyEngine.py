@@ -213,11 +213,25 @@ class Strategy:
         pnl = self.payoff_at_expiry(spot_range)
         return float(np.min(pnl))
 
-    def pop(self, spot: float, T: float, sigma: float, r: float = RISK_FREE) -> float:
+    def pop(self, spot: float, T: float, sigma: float,
+            r: float = RISK_FREE, context: dict | None = None) -> float:
         """
-        Probability of Profit at expiry using BSM log-normal CDF.
-        Samples 2000 price points for accuracy.
+        Probability of Profit at expiry.
+        When context is provided, delegates to PricingRouter which may use
+        the Heston terminal distribution for more accurate POP in high-vol
+        or skewed markets. Existing callers with no context are unaffected.
         """
+        if context is not None:
+            try:
+                from PricingRouter import PricingRouter
+                router = PricingRouter()
+                prices, weights = router.terminal_pdf(spot, T, sigma, context)
+                pnl = self.payoff_at_expiry(prices)
+                return float(np.sum(weights * (pnl > 0)))
+            except Exception:
+                pass   # fall through to BSM
+
+        # ── BSM log-normal (default, backward-compatible) ──
         lo = spot * 0.70
         hi = spot * 1.30
         prices = np.linspace(lo, hi, 2000)
@@ -229,7 +243,6 @@ class Strategy:
         mu      = np.log(spot) + (r - 0.5 * sigma ** 2) * T
         std_dev = sigma * np.sqrt(T)
         log_prices = np.log(prices)
-        dp     = log_prices[1] - log_prices[0]
         pdf    = np.exp(-0.5 * ((log_prices - mu) / std_dev) ** 2) / (std_dev * np.sqrt(2 * np.pi))
         weights = pdf / (pdf.sum() + 1e-12)
         return float(np.sum(weights * (pnl > 0)))
@@ -456,9 +469,33 @@ class SmartStrategyGenerator:
         bcs.score = self._score_directional(bcs, 'BEARISH')
         strats.append(bcs)
 
+        # Build pricing context for POP enrichment (Heston-aware when available)
+        context = self._build_context()
+
         # Sort by score descending
         strats.sort(key=lambda x: x.score, reverse=True)
         return strats
+
+    def _build_context(self) -> dict:
+        """Build a PricingRouter context dict from current market context."""
+        # Try to pull heston_params from SharedDataCache if available
+        heston_params = None
+        try:
+            from SharedDataCache import SharedDataCache
+            from PricingRouter import _get_shared_cache
+            sc = _get_shared_cache()
+            if sc:
+                heston_params = sc.get_heston_params()
+        except Exception:
+            pass
+        return {
+            'moneyness':       0.0,   # overridden per-leg in PricingRouter.pop()
+            'regime':          self.regime,
+            'explosion_score': self.ctx.get('explosion_score', 0),
+            'term_spread':     self.ctx.get('term_spread', 0),
+            'heston_params':   heston_params,
+            'skew_ratio':      self.ctx.get('skew_ratio', 1.0),
+        }
 
     # ── Scoring ──────────────────────────────────────────────
     def _base_score(self) -> int:
@@ -701,7 +738,7 @@ class PayoffEngine:
         prem_color = GREEN if net_prem > 0 else RED
         bes_str = ' / '.join(f'{b:,.0f}' for b in bes) if bes else 'N/A'
 
-        rr_str  = f'1 : {rr:.2f}' if rr < 99 else '∞ (capped)'
+        rr_str  = f'1 : {rr:.2f}' if rr < 99 else 'Inf (capped)'
 
         return f'''
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;">
@@ -714,18 +751,18 @@ class PayoffEngine:
             <div class="metric-box" style="flex:1;min-width:110px;">
                 <div class="metric-label">Net Premium</div>
                 <div style="font-size:18px;font-weight:700;color:{prem_color};">
-                    {"+" if net_prem > 0 else ""}₹{net_prem:.0f}</div>
+                    {"+" if net_prem > 0 else ""}Rs.{net_prem:.0f}</div>
                 <div class="metric-sub">per lot</div>
             </div>
             <div class="metric-box" style="flex:1;min-width:110px;">
                 <div class="metric-label">Max Profit</div>
                 <div style="font-size:18px;font-weight:700;color:{GREEN};">
-                    {"∞" if max_p > 1e6 else f"₹{max_p:,.0f}"}</div>
+                    {"Inf" if max_p > 1e6 else f"Rs.{max_p:,.0f}"}</div>
             </div>
             <div class="metric-box" style="flex:1;min-width:110px;">
                 <div class="metric-label">Max Loss</div>
                 <div style="font-size:18px;font-weight:700;color:{RED};">
-                    {"∞" if max_l > 1e6 else f"₹{max_l:,.0f}"}</div>
+                    {"Inf" if max_l > 1e6 else f"Rs.{max_l:,.0f}"}</div>
             </div>
             <div class="metric-box" style="flex:1;min-width:110px;">
                 <div class="metric-label">Risk : Reward</div>
@@ -736,6 +773,52 @@ class PayoffEngine:
                 <div style="font-size:14px;font-weight:700;color:{ORANGE};">{bes_str}</div>
             </div>
         </div>'''
+
+    def build_risk_dial_data(self) -> dict:
+        """
+        Returns normalized greek exposures in rupee terms (per lot, lot-adjusted).
+        Also returns dial values in the range -100..+100 for UI rendering.
+
+        Scale anchors (NIFTY-specific):
+          delta_pnl_1pct : Rs. change per 1% spot move  (anchor +-5000 -> /50)
+          theta_daily    : Rs. per calendar day          (anchor +-2000 -> /20)
+          vega_1pt       : Rs. per 1 IV point move       (anchor +-3000 -> /30)
+          gamma_100pt    : delta change per 100pt Nifty  (anchor +-2 -> *50)
+        """
+        net_g = self.strategy.net_greeks(self.spot, self.T, self.r)
+
+        # Rupee exposures per lot
+        delta_pnl_1pct = net_g['delta'] * self.spot * 0.01 * NIFTY_LOT
+        theta_daily    = net_g['theta'] * NIFTY_LOT
+        vega_1pt       = net_g['vega']  * NIFTY_LOT
+        gamma_100pt    = net_g['gamma'] * 100 * NIFTY_LOT
+
+        def to_dial(val, scale):
+            """Clamp val/scale to -100..+100."""
+            if scale == 0:
+                return 0
+            return max(-100, min(100, round(val / scale, 1)))
+
+        sign_str = lambda v: '+' if v >= 0 else ''
+
+        return {
+            'delta_pnl_1pct': round(delta_pnl_1pct, 0),
+            'theta_daily':     round(theta_daily, 0),
+            'vega_1pt':        round(vega_1pt, 0),
+            'gamma_100pt':     round(gamma_100pt, 4),
+            'dials': {
+                'delta': to_dial(delta_pnl_1pct, 50),
+                'theta': to_dial(theta_daily, 20),
+                'vega':  to_dial(vega_1pt, 30),
+                'gamma': to_dial(gamma_100pt, 0.02),
+            },
+            'labels': {
+                'delta': f"{sign_str(delta_pnl_1pct)}Rs.{delta_pnl_1pct:,.0f} per 1% spot move",
+                'theta': f"{sign_str(theta_daily)}Rs.{theta_daily:,.0f} per day",
+                'vega':  f"{sign_str(vega_1pt)}Rs.{vega_1pt:,.0f} per 1 IV point",
+                'gamma': f"Delta changes {gamma_100pt:+.4f} per 100pt Nifty move",
+            }
+        }
 
 
 # ──────────────────────────────────────────────────────────────
