@@ -692,6 +692,26 @@ class GammaExplosionModel:
 
                 self._print_score_breakdown(score_res)
 
+                # ── Alert dispatch ──────────────────────────────────────────────
+                try:
+                    from AlertDispatcher import fire as _ad_fire
+                    if score_res['composite'] >= 70:
+                        _ad_fire(
+                            "GammaExplosionModel", "CRITICAL",
+                            f"Gamma Explosion Imminent — score {score_res['composite']:.0f}",
+                            f"Direction: {direction} | Trigger: {trigger}",
+                            data={"score": score_res['composite'], "direction": direction}
+                        )
+                    elif score_res['composite'] >= 50:
+                        _ad_fire(
+                            "GammaExplosionModel", "WARNING",
+                            f"Elevated explosion risk — score {score_res['composite']:.0f}",
+                            f"Direction: {direction}",
+                            data={"score": score_res['composite']}
+                        )
+                except Exception:
+                    pass
+
                 # ── Persist to SignalMemory ─────────────────────────────────
                 if self.memory is not None:
                     try:

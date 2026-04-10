@@ -21,229 +21,14 @@ from SharedDataCache import SharedDataCache
 from NiftyHestonMC import HestonMath
 from DataClient import DataHubClient
 
-class StrategyEngine:
-    """
-    Evaluates current market signals (Regime, VRP, GEX, Breach) and generates
-    a ranked list of actionable option strategies with specific strikes.
-    """
-    
-    def __init__(self, spot, df_chain, metrics, near_exp):
-        self.spot = spot
-        self.df_chain = df_chain
-        # metrics should contain: regime (COMPRESSION, EXPANSION, MEAN_REVERSION),
-        # vrp (%), net_gex, prob_density (bool flag), etc.
-        self.metrics = metrics 
-        self.near_exp = near_exp
-        
-    def _find_strike_near_delta(self, opt_type, target_delta):
-        """Estimate delta via distance and IV since we might not have live Greeks from API."""
-        try:
-            if self.df_chain.empty: return None
-            df = self.df_chain[self.df_chain['type'] == opt_type].copy()
-            if df.empty: return None
-            
-            # Simple heuristic target distance for ~20 delta (roughly 0.5 to 1 std dev)
-            iv = self.metrics.get('iv', 15) / 100.0
-            dte_yrs = max((pd.to_datetime(self.near_exp) - pd.to_datetime('today')).days / 365.0, 1/365.0)
-            std_dev_pts = self.spot * iv * np.sqrt(dte_yrs)
-            
-            if opt_type == 'CE':
-                target_dist = std_dev_pts * (1.1 if target_delta <= 0.25 else 0.5)
-                target_strike = self.spot + target_dist
-            else:
-                target_dist = std_dev_pts * (1.1 if target_delta <= 0.25 else 0.5)
-                target_strike = self.spot - target_dist
-                
-            df['err'] = abs(df['strike'] - target_strike)
-            best_row = df.loc[df['err'].idxmin()]
-            return {'strike': float(best_row['strike']), 'price': float(best_row['price'])}
-        except Exception as e:
-            return None
+# ────────────────────────────────────────────────────────
+# NOTE: The old local StrategyEngine class has been retired.
+# Strategy generation is now performed exclusively by
+# SmartStrategyGenerator in StrategyEngine.py (BSM-backed,
+# greeks-aware, POP-scored). Imported lazily inside the
+# dashboard loop at _create_unified_dashboard().
+# ────────────────────────────────────────────────────────
 
-    def _get_legs_price(self, legs):
-        """Calculate net premium for a structured trade."""
-        net = 0
-        for leg in legs:
-            mult = 1 if leg['action'] == 'SELL' else -1
-            net += leg['price'] * mult
-        return net
-
-    def generate_strategies(self):
-        strategies = []
-        if self.df_chain.empty or self.spot <= 0:
-            return strategies
-            
-        r_state = self.metrics.get('regime', 'NORMAL')
-        vrp = self.metrics.get('vrp', 0)
-        net_gex = self.metrics.get('net_gex', 0)
-        
-        # 1. SHORT STRANGLE
-        try:
-            ce_leg = self._find_strike_near_delta('CE', 0.20)
-            pe_leg = self._find_strike_near_delta('PE', 0.20)
-            if ce_leg and pe_leg:
-                # Base score: favor Compression and high VRP
-                score = 50
-                if r_state == 'COMPRESSION': score += 30
-                if vrp > 2: score += 15
-                if net_gex > 0: score += 10 # Long gamma sticky market favors short premium
-                
-                prem = ce_leg['price'] + pe_leg['price']
-                strategies.append({
-                    'name': 'Short Strangle',
-                    'score': min(100, score),
-                    'reasoning': f"{r_state} regime with VRP {'rich' if vrp>0 else 'poor'} ({vrp:+.1f}%). Sticky GEX." if net_gex > 0 else f"{r_state} regime, VRP {vrp:+.1f}%.",
-                    'premium': prem,
-                    'type': 'CREDIT',
-                    'legs': [
-                        {'strike': pe_leg['strike'], 'type': 'PE', 'action': 'SELL', 'price': pe_leg['price']},
-                        {'strike': ce_leg['strike'], 'type': 'CE', 'action': 'SELL', 'price': ce_leg['price']}
-                    ]
-                })
-        except: pass
-        
-        # 2. IRON CONDOR
-        try:
-            short_ce = self._find_strike_near_delta('CE', 0.25)
-            short_pe = self._find_strike_near_delta('PE', 0.25)
-            if short_ce and short_pe:
-                # Look for long wings 100-200 pts further out
-                wing_dist = 100
-                df_c = self.df_chain[self.df_chain['type']=='CE']
-                df_p = self.df_chain[self.df_chain['type']=='PE']
-                
-                long_ce_strike = short_ce['strike'] + wing_dist
-                long_pe_strike = short_pe['strike'] - wing_dist
-                
-                long_ce_row = df_c.iloc[(df_c['strike'] - long_ce_strike).abs().argsort()[:1]]
-                long_pe_row = df_p.iloc[(df_p['strike'] - long_pe_strike).abs().argsort()[:1]]
-                
-                if not long_ce_row.empty and not long_pe_row.empty:
-                    long_ce = {'strike': float(long_ce_row['strike'].values[0]), 'price': float(long_ce_row['price'].values[0])}
-                    long_pe = {'strike': float(long_pe_row['strike'].values[0]), 'price': float(long_pe_row['price'].values[0])}
-                    
-                    score = 60
-                    if r_state == 'COMPRESSION': score += 20
-                    elif r_state == 'MEAN_REVERSION': score += 15
-                    if vrp > 0: score += 10
-                    if net_gex > 2e6: score += 10
-                    
-                    prem = short_ce['price'] + short_pe['price'] - long_ce['price'] - long_pe['price']
-                    if prem > 0:
-                        strategies.append({
-                            'name': 'Iron Condor',
-                            'score': min(100, score),
-                            'reasoning': f"Defined risk short premium for {r_state} regime.",
-                            'premium': prem,
-                            'type': 'CREDIT',
-                            'legs': [
-                                {'strike': long_pe['strike'], 'type': 'PE', 'action': 'BUY', 'price': long_pe['price']},
-                                {'strike': short_pe['strike'], 'type': 'PE', 'action': 'SELL', 'price': short_pe['price']},
-                                {'strike': short_ce['strike'], 'type': 'CE', 'action': 'SELL', 'price': short_ce['price']},
-                                {'strike': long_ce['strike'], 'type': 'CE', 'action': 'BUY', 'price': long_ce['price']}
-                            ]
-                        })
-        except: pass
-
-        # 3. LONG STRADDLE
-        try:
-            df_c = self.df_chain[self.df_chain['type']=='CE']
-            df_p = self.df_chain[self.df_chain['type']=='PE']
-            atm_ce = df_c.iloc[(df_c['strike'] - self.spot).abs().argsort()[:1]]
-            atm_pe = df_p.iloc[(df_p['strike'] - self.spot).abs().argsort()[:1]]
-            
-            if not atm_ce.empty and not atm_pe.empty:
-                ce = {'strike': float(atm_ce['strike'].values[0]), 'price': float(atm_ce['price'].values[0])}
-                pe = {'strike': float(atm_pe['strike'].values[0]), 'price': float(atm_pe['price'].values[0])}
-                
-                score = 20 # Baseline low because it's expensive
-                if r_state == 'EXPANSION': score += 40
-                if vrp < -2: score += 20 # Premium is cheap
-                if net_gex < -1e6: score += 20 # Slippery market
-                
-                prem = ce['price'] + pe['price']
-                strategies.append({
-                    'name': 'Long Straddle',
-                    'score': min(100, score),
-                    'reasoning': f"Volatility expansion expected. VRP cheap ({vrp:+.1f}%). Market slippery (GEX < 0)." if net_gex < 0 else f"Expansion regime. VRP {vrp:+.1f}%.",
-                    'premium': prem * -1,
-                    'type': 'DEBIT',
-                    'legs': [
-                        {'strike': ce['strike'], 'type': 'CE', 'action': 'BUY', 'price': ce['price']},
-                        {'strike': pe['strike'], 'type': 'PE', 'action': 'BUY', 'price': pe['price']}
-                    ]
-                })
-        except: pass
-        
-        # 4. BULL PUT SPREAD (Directional)
-        try:
-            short_pe = self._find_strike_near_delta('PE', 0.30)
-            if short_pe:
-                long_pe_strike = short_pe['strike'] - 100
-                df_p = self.df_chain[self.df_chain['type']=='PE']
-                long_pe_row = df_p.iloc[(df_p['strike'] - long_pe_strike).abs().argsort()[:1]]
-                
-                if not long_pe_row.empty:
-                    long_pe = {'strike': float(long_pe_row['strike'].values[0]), 'price': float(long_pe_row['price'].values[0])}
-                    
-                    score = 40
-                    # For bullishness, we look at GEX calls wall and spot distance. If spot is above put wall.
-                    put_wall = self.metrics.get('put_wall', 0)
-                    if put_wall > 0 and self.spot > put_wall:
-                        score += 20
-                    if vrp > 0: score += 10
-                    # if IV skew favors puts, selling puts is richer
-                    
-                    prem = short_pe['price'] - long_pe['price']
-                    if prem > 0:
-                        strategies.append({
-                            'name': 'Bull Put Spread',
-                            'score': min(100, score),
-                            'reasoning': f"Spot ({self.spot:.0f}) comfortably above Put Wall ({put_wall:.0f}). Short premium lean.",
-                            'premium': prem,
-                            'type': 'CREDIT',
-                            'legs': [
-                                {'strike': long_pe['strike'], 'type': 'PE', 'action': 'BUY', 'price': long_pe['price']},
-                                {'strike': short_pe['strike'], 'type': 'PE', 'action': 'SELL', 'price': short_pe['price']}
-                            ]
-                        })
-        except: pass
-
-        # 5. BEAR CALL SPREAD (Directional)
-        try:
-            short_ce = self._find_strike_near_delta('CE', 0.30)
-            if short_ce:
-                long_ce_strike = short_ce['strike'] + 100
-                df_c = self.df_chain[self.df_chain['type']=='CE']
-                long_ce_row = df_c.iloc[(df_c['strike'] - long_ce_strike).abs().argsort()[:1]]
-                
-                if not long_ce_row.empty:
-                    long_ce = {'strike': float(long_ce_row['strike'].values[0]), 'price': float(long_ce_row['price'].values[0])}
-                    
-                    score = 40
-                    call_wall = self.metrics.get('call_wall', 0)
-                    if call_wall > 0 and self.spot < call_wall:
-                        score += 20
-                    if vrp > 0: score += 10
-                    
-                    prem = short_ce['price'] - long_ce['price']
-                    if prem > 0:
-                        strategies.append({
-                            'name': 'Bear Call Spread',
-                            'score': min(100, score),
-                            'reasoning': f"Spot ({self.spot:.0f}) testing resistance below Call Wall ({call_wall:.0f}).",
-                            'premium': prem,
-                            'type': 'CREDIT',
-                            'legs': [
-                                {'strike': short_ce['strike'], 'type': 'CE', 'action': 'SELL', 'price': short_ce['price']},
-                                {'strike': long_ce['strike'], 'type': 'CE', 'action': 'BUY', 'price': long_ce['price']}
-                            ]
-                        })
-        except: pass
-
-        # Sort descending by score
-        strategies.sort(key=lambda x: x['score'], reverse=True)
-        return strategies
 
 # ────────────────────────────────────────────────────────
 #  GLOBAL UI CONSTANTS
@@ -692,6 +477,21 @@ class VolatilityAnalyzer:
             strategy = "Wait for clearer signal"
 
         confidence = abs(composite - 50) / 50
+
+        # ── Alert dispatch ──────────────────────────────────────────────────────
+        try:
+            from AlertDispatcher import fire as _ad_fire
+            if composite > 65:
+                _ad_fire("VolatilityAnalyzer", "WARNING",
+                         f"SELL VOL signal — composite {composite:.0f}",
+                         f"Action: {action} | Strategy: {strategy}")
+            elif composite < 35:
+                _ad_fire("VolatilityAnalyzer", "WARNING",
+                         f"BUY VOL signal — composite {composite:.0f}",
+                         f"Action: {action}")
+        except Exception:
+            pass
+
         return {'scores': scores, 'composite': composite, 'action': action, 'strategy': strategy, 'confidence': confidence}
 
     def _format_signal_report(self, spot, iv, hv, signal_result, regime, iv_velocity_5d=0, iv_accel=0, vrp=0):
@@ -3792,6 +3592,7 @@ class VolatilityAnalyzer:
                     strategy_tab_html = '<div class="card"><p style="color:#888;">Initializing Strategy Engine...</p></div>'
                     try:
                         from StrategyEngine import (SmartStrategyGenerator, PayoffEngine,
+                                                     build_strategy_card_html,
                                                      NIFTY_LOT, DARK_BG as _SE_BG)
 
                         # ── Market context ──────────────────────────────────────

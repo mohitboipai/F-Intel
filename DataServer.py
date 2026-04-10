@@ -47,15 +47,21 @@ class DataHub:
         return False
 
     def broadcast(self, data):
-        """Send data to all connected WebSocket clients."""
+        """Send data to all connected WebSocket clients (thread-safe)."""
         msg = json.dumps(data)
+        dead = []
+        # Snapshot clients without holding lock during send
         with self.lock:
-            # Create a copy of the clients set to avoid modification during iteration
-            for client in list(self.clients):
-                try:
-                    client.send(msg)
-                except:
-                    self.clients.remove(client)
+            clients_snapshot = list(self.clients)
+        for client in clients_snapshot:
+            try:
+                client.send(msg)
+            except Exception:
+                dead.append(client)
+        # Remove dead clients under lock using set arithmetic
+        if dead:
+            with self.lock:
+                self.clients -= set(dead)
 
     # --- Fyers WebSocket (Real-time Ticks) ---
     def on_ticks(self, ticks):

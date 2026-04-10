@@ -44,6 +44,8 @@ LOOKBACK_DAYS = 300
 SEQ_LEN = 60 # Look back 60 minutes
 MODEL_PATH = "models/nifty_lstm_15m_opt_v1.keras"
 
+LOT_SIZE = 75   # NIFTY lot size — must match GammaExplosionModel.LOT_SIZE
+
 class NiftyRangePredictor:
     def __init__(self):
         self.fyers = None
@@ -54,10 +56,20 @@ class NiftyRangePredictor:
         self.scaler = StandardScaler()
         self.data = pd.DataFrame()
         self.data_hub = DataHubClient()
+
+        # Cached option-chain scalars (updated each live cycle)
+        self._last_atm_iv          = 15.0   # ATM IV % (default 15)
+        self._last_call_wall_dist  = 0.0    # (call_wall - spot) / spot
+        self._last_put_wall_dist   = 0.0    # (spot - put_wall)  / spot
         
         # Targets: [H_15, L_15]
         self.target_cols = ['H_15', 'L_15']
-        self.feature_cols = ['log_ret', 'rvol', 'atr', 'rsi', 'bb_width', 'dist_ma20', 'dist_vwap', 'min_sin']
+        self.feature_cols = [
+            'log_ret', 'rvol', 'atr', 'rsi', 'bb_width',
+            'dist_ma20', 'dist_vwap',
+            'min_sin', 'hour_sin', 'hour_cos',
+            'atm_iv', 'call_wall_dist', 'put_wall_dist'
+        ]
         
         # Auth
         self.app_id = "QUTT4YYMIG-100"
@@ -173,9 +185,8 @@ class NiftyRangePredictor:
             if o_type == 'CE': call_oi_map[strike] = call_oi_map.get(strike, 0) + oi
             else: put_oi_map[strike] = put_oi_map.get(strike, 0) + oi
             
-            # Calculate GEX contribution
-            # 1 contract = 1 share (roughly, need lot size but relative is fine)
-            gex_val = gamma * oi * spot
+            # Calculate GEX contribution — multiply by LOT_SIZE to match GammaExplosionModel scale
+            gex_val = gamma * oi * spot * LOT_SIZE
             
             if o_type == 'CE': 
                 net_gamma -= gex_val # Dealer Short Call
@@ -225,6 +236,15 @@ class NiftyRangePredictor:
         d['dist_vwap'] = (d['close'] - d['vwap']) / d['vwap']
         
         d['min_sin'] = np.sin(2 * np.pi * d.index.minute / 60)
+
+        # Hour-of-day encoding (captures 9:15 open and 15:15 close dynamics)
+        d['hour_sin'] = np.sin(2 * np.pi * d.index.hour / 24)
+        d['hour_cos'] = np.cos(2 * np.pi * d.index.hour / 24)
+
+        # Option-chain scalars (forward-filled from latest cached values)
+        d['atm_iv']         = getattr(self, '_last_atm_iv', 15.0) / 100.0
+        d['call_wall_dist'] = getattr(self, '_last_call_wall_dist', 0.0)
+        d['put_wall_dist']  = getattr(self, '_last_put_wall_dist', 0.0)
         
         # Replace inf with NaN, then drop all NaNs
         d = d.replace([np.inf, -np.inf], np.nan)
@@ -340,7 +360,8 @@ class NiftyRangePredictor:
             print("\n" + "-"*30 + " GEX STRUCTURAL LEVELS " + "-"*30)
             print(f"Call Wall (Res): {gex['call_wall']}  (Max Call OI)")
             print(f"Put Wall (Sup):  {gex['put_wall']}  (Max Put OI)")
-            print(f"Net Gamma:       {gex['net_gamma']:.0f} (Positive=Sticky, Negative=Slippery)")
+            print(f"Net Gamma:       {gex['net_gamma']:+,.0f}  (Positive=Sticky, Negative=Slippery)")
+            print(f"  [sanity: net_gamma above includes LOT_SIZE=75 multiplier — same scale as GammaExplosionModel]")
         
         print("\n" + "="*70)
         print("Press Ctrl+C to Exit")
@@ -349,12 +370,24 @@ class NiftyRangePredictor:
         if not os.path.exists(MODEL_PATH):
             print("Model not found. Please Train first.")
             return
-            
+
         try:
             self.model = load_model(MODEL_PATH)
-        except:
+        except Exception:
             print("Error loading model.")
             return
+
+        # ── Model input-shape guard ─────────────────────────────────────────
+        expected_features = len(self.feature_cols)
+        if self.model is not None:
+            model_input_shape = self.model.input_shape[-1]
+            if model_input_shape != expected_features:
+                print(
+                    f"[NiftyPredictor] Model input shape {model_input_shape} "
+                    f"!= feature count {expected_features}. "
+                    "Feature set has changed — please retrain (option 2)."
+                )
+                return
 
         print("Initializing Live Feed...")
         current_prediction = None
@@ -384,6 +417,20 @@ class NiftyRangePredictor:
                 # 2. Compute Features & GEX
                 df_features = self.prepare_data(df, training=False)
                 gex = self.fetch_gex_profile(spot_price)
+
+                # Update cached GEX scalars used as LSTM features
+                if gex:
+                    self._last_call_wall_dist = (gex['call_wall'] - spot_price) / spot_price
+                    self._last_put_wall_dist  = (spot_price - gex['put_wall'])  / spot_price
+
+                # Update cached ATM IV from option chain
+                chain_data = self.get_option_chain_data()
+                if chain_data:
+                    options = chain_data.get('optionsChain', [])
+                    atm_opts = [o for o in options
+                                if abs(o.get('strike_price', 0) - spot_price) < 60]
+                    if atm_opts:
+                        self._last_atm_iv = float(atm_opts[0].get('iv', 15.0) or 15.0)
                 
                 # 3. Detect Regime
                 regime = self.detect_regime(df_features, gex)
@@ -424,8 +471,18 @@ class NiftyRangePredictor:
                         advice = "IN RANGE: Monitor Levels."
                         
                     if gex:
-                        if spot_price > gex['call_wall']: advice += " [GEX SQUEEZE UP]"
-                        if spot_price < gex['put_wall']: advice += " [GEX CRASH ALERT]"
+                        if spot_price > gex['call_wall']:
+                            advice += " [GEX SQUEEZE UP]"
+                            from AlertDispatcher import fire as _ad_fire
+                            _ad_fire("NiftyPredictor", "WARNING",
+                                     f"GEX Squeeze Up — spot {spot_price:.0f} above Call Wall {gex['call_wall']}",
+                                     "")
+                        if spot_price < gex['put_wall']:
+                            advice += " [GEX CRASH ALERT]"
+                            from AlertDispatcher import fire as _ad_fire
+                            _ad_fire("NiftyPredictor", "CRITICAL",
+                                     f"GEX Crash Alert — spot {spot_price:.0f} below Put Wall {gex['put_wall']}",
+                                     "")
 
                 # 6. Display
                 if current_prediction:
