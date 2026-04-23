@@ -120,7 +120,18 @@ class HestonCalibrator:
             T = max(self.cache.get_T(), 0.001)
 
             # 6. Calibrate
-            params = self._mc.calibrate_parameters(subset, spot, T, RISK_FREE)
+            raw_params = self._mc.calibrate_parameters(subset, spot, T, RISK_FREE)
+
+            # 6.5 Apply EMA Smoothing (.3 alpha) to prevent extreme jumps
+            prev_params = self.cache.get_heston_params()
+            if prev_params and all(k in prev_params for k in ['kappa', 'theta', 'v0', 'rho', 'xi']):
+                alpha = 0.3 # 30% new, 70% old
+                params = {
+                    k: alpha * raw_params[k] + (1 - alpha) * prev_params[k]
+                    for k in ['kappa', 'theta', 'v0', 'rho', 'xi']
+                }
+            else:
+                params = raw_params
 
             # 7. Store
             self.cache.set_heston_params(params)

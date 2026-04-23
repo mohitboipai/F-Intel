@@ -20,6 +20,9 @@ from SignalMemory import SignalMemory
 from SharedDataCache import SharedDataCache
 from NiftyHestonMC import HestonMath
 from DataClient import DataHubClient
+from RealizedVolEngine import RealizedVolEngine
+from ConfluenceEngine import ConfluenceEngine
+from OptionBuyerEngine import OptionBuyerEngine
 
 # ────────────────────────────────────────────────────────
 # NOTE: The old local StrategyEngine class has been retired.
@@ -215,6 +218,10 @@ class VolatilityAnalyzer:
         # Shared context / memory (persisted across module sessions)
         self.memory = SignalMemory()
         self.cache  = SharedDataCache(self.fyers, symbol=self.symbol)
+        
+        self.regime_engine = RealizedVolEngine()
+        self.confluence_engine = ConfluenceEngine()
+        self.buyer_engine = OptionBuyerEngine()
 
     def _authenticate(self):
         print("Authenticating with Fyers...")
@@ -2188,7 +2195,8 @@ class VolatilityAnalyzer:
                     hist_cache = {
                         'closes': [c[4] for c in candles],
                         'highs': [c[2] for c in candles],
-                        'lows': [c[3] for c in candles]
+                        'lows': [c[3] for c in candles],
+                        'opens': [c[1] for c in candles]
                     }
                 else:
                     hist_cache = None
@@ -2245,7 +2253,7 @@ class VolatilityAnalyzer:
             except:
                 pass
 
-        def _compute_vol_intelligence(spot):
+        def _compute_vol_intelligence(spot, momentum_data):
             """Compute vol cone / regime / VRP data. Returns dict."""
             nonlocal _last_regime, _regime_changed_at
             hist = _fetch_history_once()
@@ -2290,10 +2298,20 @@ class VolatilityAnalyzer:
             bw_percentile = (bandwidth < current_bw).mean() * 100 if not bandwidth.empty else 50
 
             # --- NEW STATISTICAL REGIME SYSTEM ---
-            # Uses Bandwidth Percentile (coiling) and HV Trend
+            # Uses Bandwidth Percentile (coiling) and HV Trend + INTRADAY OVERLAY
             ml_prob = 0.50  # Kept for compatibility with return dict
             
-            if bw_percentile < 25:
+            # Intraday momentum override
+            m_stat = momentum_data.get('status', 'NEUTRAL') if momentum_data else 'NEUTRAL'
+            
+            # If intraday trend is strong and volume/slope matches
+            if m_stat in ['LONG', 'SHORT'] and (iv_accel > 0 or hv_slope > 0):
+                regime = "EXPANSION (LIVE)"
+                regime_desc = f"Vol exploding intraday! Spot > VWAP/EMA. (BBw: {bw_percentile:.0f}th)"
+            elif m_stat != 'NEUTRAL' and bw_percentile < 30:
+                regime = "MOMENTUM / TRENDING"
+                regime_desc = f"Trending directional breakout in progress."
+            elif bw_percentile < 25:
                 regime = "COMPRESSION"
                 regime_desc = f"Vol tightly coiled (BBw: {bw_percentile:.0f}th) — Breakout likely"
             elif bw_percentile > 75 and hv_slope > 0:
@@ -2845,7 +2863,7 @@ class VolatilityAnalyzer:
                     self.expiry_date = old_exp
 
                     # ── COMPUTE ALL TABS ──
-                    vol_intel = _compute_vol_intelligence(spot)
+                    vol_intel = _compute_vol_intelligence(spot, momentum_data if 'momentum_data' in locals() else None)
                     seller = _compute_seller_data(spot, df_chain.copy() if not df_chain.empty else df_chain)
                     # Track IV internally without saving a massive array
                     _live_iv = (vol_intel or {}).get('iv', 0)
@@ -2862,6 +2880,29 @@ class VolatilityAnalyzer:
                     if not prob_density:
                         prob_density = bsm_density
                         bsm_density = None  # no overlay needed
+
+                    # ── REGIME SNAPSHOT ──
+                    hist_cache = _fetch_history_once()
+                    df_daily = pd.DataFrame(hist_cache) if hist_cache else pd.DataFrame()
+                    rv_intra = (vol_intel or {}).get('rv_intra', 0)
+                    momentum_vwap = momentum_data.get('vwap', 0) if 'momentum_data' in locals() else 0
+                    regime_snapshot = self.regime_engine.get_regime_snapshot(spot, df_daily, _pd_iv, momentum_vwap, rv_intra)
+
+                    # ── CONFLUENCE VERDICT ──
+                    verdict_data = self.confluence_engine.evaluate(regime_snapshot, pred, seller, momentum_data if 'momentum_data' in locals() else None)
+
+                    # ── BUYER SETUP ──
+                    gex_accel = 0.0 # Will compute if needed, or default
+                    buyer_setup = None
+                    if not df_chain.empty and regime_snapshot:
+                        buyer_setup = self.buyer_engine.generate_trade_setup(
+                            confluence_verdict=verdict_data,
+                            spot=spot,
+                            vwap=momentum_vwap,
+                            df_chain=df_chain,
+                            gex_acceleration=gex_accel,
+                            intraday_regime=regime_snapshot.get('regime', {}).get('name', '')
+                        )
 
                     # ══════════════════════════════════════════
                     #  BUILD HTML
@@ -4105,6 +4146,50 @@ class VolatilityAnalyzer:
                         _total_pnl    = summary.get('total_realized_pnl', 0)
                         _total_pnl_clr = GREEN if _total_pnl >= 0 else RED
 
+                        buyer_setup_html = ""
+                        if buyer_setup:
+                            _bu = buyer_setup
+                            _bc_color = GREEN if 'BULLISH' in _bu['verdict_base'] else RED if 'BEARISH' in _bu['verdict_base'] else YELLOW
+                            buyer_setup_html = f'''
+                            <div class="card" style="margin-bottom:12px; border:1px solid {_bc_color}66; background:rgba(20,20,35,0.7);">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                                    <div style="color:{_bc_color};font-size:14px;font-weight:900;letter-spacing:1px;">
+                                        ⚡ OPTION BUYER SETUP
+                                    </div>
+                                    <span style="color:{WHITE};font-size:12px;font-weight:700;background:{_bc_color}33;padding:2px 8px;border-radius:4px;">
+                                        {_bu['timing']}
+                                    </span>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;margin-bottom:10px;">
+                                    <div>
+                                        <div style="color:{MUTED};font-size:11px;text-transform:uppercase;">Action</div>
+                                        <div style="color:{WHITE};font-size:16px;font-weight:900;">{_bu['action']}</div>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <div style="color:{MUTED};font-size:11px;text-transform:uppercase;">Entry Limit</div>
+                                        <div style="color:{ACCENT};font-size:16px;font-weight:900;">₹{_bu['entry_limit']}</div>
+                                    </div>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;gap:10px;">
+                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {GREEN}33;">
+                                        <div style="color:{MUTED};font-size:10px;">Target 1 (0.5%)</div>
+                                        <div style="color:{GREEN};font-weight:700;">₹{_bu['t1_premium']}</div>
+                                    </div>
+                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {GREEN}55;">
+                                        <div style="color:{MUTED};font-size:10px;">Target 2 (1.0%)</div>
+                                        <div style="color:{GREEN};font-weight:700;">₹{_bu['t2_premium']}</div>
+                                    </div>
+                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {RED}44;">
+                                        <div style="color:{MUTED};font-size:10px;">Stop Loss</div>
+                                        <div style="color:{RED};font-weight:700;">₹{_bu['sl_premium']}</div>
+                                    </div>
+                                </div>
+                                <div style="margin-top:10px;text-align:center;color:{MUTED};font-size:10px;">
+                                    VWAP Level: {_bu['vwap_hard_level']} | Delta Proxy: {_bu['delta_exposure']}
+                                </div>
+                            </div>
+                            '''
+
                         strategy_tab_html = f'''
                         <!-- Context Bar -->
                         <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;
@@ -4131,8 +4216,9 @@ class VolatilityAnalyzer:
 
                         <!-- Main 2-column layout -->
                         <div style="display:grid;grid-template-columns:1fr 1.6fr;gap:14px;">
-                            <!-- LEFT: Live P&L Tracker -->
+                            <!-- LEFT: P&L + Buyer Setup -->
                             <div>
+                                {buyer_setup_html}
                                 <div class="card" style="margin-bottom:12px;">
                                     <div style="display:flex;justify-content:space-between;
                                                 align-items:center;margin-bottom:12px;">
@@ -4302,18 +4388,98 @@ class VolatilityAnalyzer:
                         </script>'''
 
                     # ──────────────────────────────────────────
-                    #  ASSEMBLE FULL HTML  (4 tabs, seamless refresh)
+                    #  REGIME TAB HTML 
                     # ──────────────────────────────────────────
+                    if regime_snapshot:
+                        regime_tab_html = f'''
+                        <div style="display:flex; flex-direction:column; gap:16px;">
+                            <div class="card" style="border-left: 4px solid {ACCENT};">
+                                <h2 style="color:{ACCENT}; margin-bottom: 8px;">MARKET REGIME: {regime_snapshot['regime']['name']}</h2>
+                                <p style="color:{WHITE}; font-size:14px; margin-bottom: 12px;">{regime_snapshot['regime']['description']}</p>
+                                <div style="color:{MUTED}; font-size:12px;">ACTION BIAS: <strong style="color:{WHITE};">{regime_snapshot['regime']['bias']}</strong> &nbsp;|&nbsp; VOL ACTION: <strong style="color:{GREEN}">{regime_snapshot['regime']['vol_action']}</strong></div>
+                            </div>
+                            
+                            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px;">
+                                <div class="metric-box">
+                                    <div class="metric-label">Consensus Realized Vol</div>
+                                    <div style="font-size:24px; font-weight:700; color:{WHITE};">{regime_snapshot['rv']['consensus']:.2f}%</div>
+                                    <div class="metric-sub">Trend: {regime_snapshot['rv']['trend']}</div>
+                                </div>
+                                <div class="metric-box">
+                                    <div class="metric-label">Volatility Risk Premium</div>
+                                    <div style="font-size:24px; font-weight:700; color:{GREEN if regime_snapshot['vrp']['iv_rv'] > 0 else RED};">{regime_snapshot['vrp']['iv_rv']:+.2f}%</div>
+                                    <div class="metric-sub">IV vs Consensus RV</div>
+                                </div>
+                                <div class="metric-box">
+                                    <div class="metric-label">Historical Vol (20d)</div>
+                                    <div style="font-size:24px; font-weight:700; color:{WHITE};">{regime_snapshot['hv']['20d']:.2f}%</div>
+                                    <div class="metric-sub">Percentile: {regime_snapshot['hv']['percentile']:.0f}%</div>
+                                </div>
+                            </div>
+                            
+                            <div class="card">
+                                <h3 style="color:{ACCENT}; font-size:14px; margin-bottom:12px; border-bottom: 1px solid #333; padding-bottom:6px;">Realized Volatility Term Structure</h3>
+                                <table class="data-table">
+                                    <thead><tr><th style="text-align:left;">Estimator</th><th>5-Day</th><th>10-Day</th><th>20-Day</th><th>60-Day</th></tr></thead>
+                                    <tbody>
+                                        <tr>
+                                            <td style="text-align:left; color:{WHITE};">Close-to-Close</td>
+                                            <td>{regime_snapshot['rv']['5d']:.2f}%</td>
+                                            <td>{regime_snapshot['rv']['10d']:.2f}%</td>
+                                            <td>{regime_snapshot['rv']['20d']:.2f}%</td>
+                                            <td>{regime_snapshot['rv']['60d']:.2f}%</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="text-align:left; color:{WHITE};">Parkinson (High/Low)</td>
+                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['parkinson_20d']:.2f}%</td><td>-</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="text-align:left; color:{WHITE};">Garman-Klass (OHLC)</td>
+                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['garman_klass_20d']:.2f}%</td><td>-</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="text-align:left; color:{WHITE};">Yang-Zhang (Gap+OHLC)</td>
+                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['yang_zhang_20d']:.2f}%</td><td>-</td>
+                                        </tr>
+                                        <tr style="background:rgba(79,195,247,0.1);">
+                                            <td style="text-align:left; font-weight:600; color:{ACCENT};">CONSENSUS (Avg)</td>
+                                            <td colspan="4" style="text-align:center; font-weight:600; font-size:16px; color:{ACCENT};">{regime_snapshot['rv']['consensus']:.2f}%</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            
+                            <div class="card" style="margin-top:4px;">
+                                <div style="color:{MUTED}; font-size:12px; text-align:center;">Intraday Consensus RV: {regime_snapshot['rv']['intraday']:.2f}%</div>
+                            </div>
+                        </div>
+                        '''
+                    else:
+                        regime_tab_html = "<div style='padding:40px; color:#ff4444; text-align:center;'>Waiting for sufficient daily history data (requires 20+ trading days).</div>"
+
+                    # ── CONFLUENCE HEADER HTML ──
+                    vd = verdict_data
+                    v_color = GREEN if 'BULLISH' in vd['verdict'] else RED if 'BEARISH' in vd['verdict'] else YELLOW
+                    verdict_html = f'''
+                    <div style="display:flex; flex-direction:column; align-items:center; background:#0d0d1e; padding:8px 16px; border-radius:8px; border:1px solid {v_color}44;">
+                        <div style="font-size:10px; color:{MUTED}; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">CONFLUENCE VERDICT</div>
+                        <div style="font-size:16px; font-weight:900; color:{v_color}; text-shadow: 0 0 10px {v_color}44;">{vd['verdict']}</div>
+                        <div style="font-size:10px; color:{WHITE}; margin-top:2px;">Confidence: {vd['confidence']:.0%} | Score: {vd['score']:.2f}</div>
+                    </div>
+                    '''
 
                     # Write fragment file that the running page will fetch
                     frag_path = html_path.replace('.html', '_fragment.html')
                     fragment_html = f'''
+<div id="frag-regime">{regime_tab_html}</div>
 <div id="frag-iv">{iv_tab_html}</div>
 <div id="frag-vol">{vol_tab_html}</div>
 <div id="frag-chain">{chain_tab_html}</div>
 <div id="frag-prob">{prob_tab_html}</div>
 <div id="frag-strat">{strategy_tab_html}</div>
-<div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}"></div>'''
+<div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}">
+    <span id="frag-verdict-transfer" style="display:none;">{verdict_html}</span>
+</div>'''
                     with open(frag_path, 'w', encoding='utf-8') as f:
                         f.write(fragment_html)
 
@@ -4368,6 +4534,9 @@ class VolatilityAnalyzer:
                     {momentum_data['status']} (V:{momentum_data['vwap']} | E:{momentum_data['ema']})
                 </div>
             </div>
+            <div id="verdict-container" style="margin-left:10px;">
+                {verdict_html}
+            </div>
         </div>
         <div>
             <span id="live-pulse"></span>
@@ -4378,22 +4547,24 @@ class VolatilityAnalyzer:
     </div>
 
     <div class="tab-bar">
-        <div class="tab-btn active" onclick="switchTab('iv')">IV Surface</div>
+        <div class="tab-btn active" onclick="switchTab('regime')">Regime Engine</div>
+        <div class="tab-btn" onclick="switchTab('iv')">IV Surface</div>
         <div class="tab-btn" onclick="switchTab('vol')">Vol Intelligence</div>
         <div class="tab-btn" onclick="switchTab('chain')">Option Chain Analyser</div>
         <div class="tab-btn" onclick="switchTab('prob')">Prob Density</div>
         <div class="tab-btn" onclick="switchTab('strat')">Strategy Engine</div>
     </div>
 
-    <div id="tab-iv" class="tab-content active">{iv_tab_html}</div>
+    <div id="tab-regime" class="tab-content active">{regime_tab_html}</div>
+    <div id="tab-iv" class="tab-content">{iv_tab_html}</div>
     <div id="tab-vol" class="tab-content">{vol_tab_html}</div>
     <div id="tab-chain" class="tab-content">{chain_tab_html}</div>
     <div id="tab-prob" class="tab-content">{prob_tab_html}</div>
     <div id="tab-strat" class="tab-content">{strategy_tab_html}</div>
 
     <script>
-    var tabMap = {{'iv':0,'vol':1,'chain':2,'prob':3, 'strat':4}};
-    var activeTab = localStorage.getItem('volDashActiveTab') || 'iv';
+    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'strat':5}};
+    var activeTab = localStorage.getItem('volDashActiveTab') || 'regime';
 
     function switchTab(id) {{
         document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -4430,7 +4601,7 @@ class VolatilityAnalyzer:
                 var tmp = document.createElement('div');
                 tmp.innerHTML = xhr.responseText;
                 // Swap each tab's content
-                ['iv', 'vol', 'chain', 'prob', 'strat'].forEach(function(id) {{
+                ['regime', 'iv', 'vol', 'chain', 'prob', 'strat'].forEach(function(id) {{
                     var fragEl = tmp.querySelector('#frag-' + id);
                     var tabEl = document.getElementById('tab-' + id);
                     if (fragEl && tabEl) {{

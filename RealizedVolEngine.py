@@ -241,8 +241,81 @@ class RealizedVolEngine:
             return 0
 
     # ══════════════════════════════════════════════════════════════════════
+    # PROGRAMMATIC API (NON-BLOCKING)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def get_regime_snapshot(self, spot, df_daily, atm_iv, intra_vwap=0, intra_rv=0):
+        """
+        Computes regime stats programmatically returning a dictionary.
+        Does not block or prompt for user input.
+        """
+        if df_daily.empty or len(df_daily) < 20:
+            return None
+
+        closes = df_daily['closes'] if 'closes' in df_daily else df_daily['close']
+        highs = df_daily['highs'] if 'highs' in df_daily else df_daily['high']
+        lows = df_daily['lows'] if 'lows' in df_daily else df_daily['low']
+        opens = df_daily['opens'] if 'opens' in df_daily else df_daily['open']
+
+        rv_5d  = self.rv_estimators.close_to_close(closes, window=5)
+        rv_10d = self.rv_estimators.close_to_close(closes, window=10)
+        rv_20d = self.rv_estimators.close_to_close(closes, window=20)
+        rv_60d = self.rv_estimators.close_to_close(closes, window=60) if len(closes) >= 60 else rv_20d
+
+        rv_park = self.rv_estimators.parkinson(highs, lows, window=20)
+        rv_gk   = self.rv_estimators.garman_klass(opens, highs, lows, closes, window=20)
+        rv_yz   = self.rv_estimators.yang_zhang(opens, highs, lows, closes, window=20)
+
+        cur_rv_5  = float(rv_5d.iloc[-1]) if len(rv_5d) > 0 else 0
+        cur_rv_10 = float(rv_10d.iloc[-1]) if len(rv_10d) > 0 else 0
+        cur_rv_20 = float(rv_20d.iloc[-1]) if len(rv_20d) > 0 else 0
+        cur_rv_60 = float(rv_60d.iloc[-1]) if len(rv_60d) > 0 else 0
+        cur_park  = float(rv_park.iloc[-1]) if len(rv_park) > 0 else 0
+        cur_gk    = float(rv_gk.iloc[-1]) if len(rv_gk) > 0 else 0
+        cur_yz    = float(rv_yz.iloc[-1]) if len(rv_yz) > 0 else 0
+
+        # Consensus RV
+        vals = [v for v in [cur_rv_20, cur_park, cur_gk, cur_yz] if v > 0]
+        consensus_rv = np.mean(vals) if vals else cur_rv_20
+
+        # Historical Vol
+        hv_series = self.analytics.calculate_rolling_historical_volatility(closes, window=20)
+        cur_hv = float(hv_series.iloc[-1]) if len(hv_series) > 0 else 0
+        hv_pctile = float((hv_series < cur_hv).mean() * 100) if len(hv_series) > 0 else 50
+        
+        hv_mean = float(hv_series.mean()) if len(hv_series) > 0 else cur_hv
+
+        # Trend and spreads
+        rv_trend = "STABLE"
+        if cur_rv_5 > 0 and cur_rv_20 > 0:
+            if cur_rv_5 / cur_rv_20 > 1.3: rv_trend = "ACCELERATING"
+            elif cur_rv_5 / cur_rv_20 < 0.7: rv_trend = "DECELERATING"
+
+        vrp_iv_hv = atm_iv - cur_hv
+        vrp_iv_rv = atm_iv - consensus_rv
+        rv_term_slope = cur_rv_5 - cur_rv_60 # short term vs long term spread
+
+        # Classify regime
+        regime = self._classify_regime(atm_iv, cur_hv, consensus_rv, rv_trend, hv_pctile)
+
+        return {
+            'spot': spot,
+            'atm_iv': atm_iv,
+            'rv': {
+                '5d': cur_rv_5, '10d': cur_rv_10, '20d': cur_rv_20, '60d': cur_rv_60,
+                'parkinson_20d': cur_park, 'garman_klass_20d': cur_gk, 'yang_zhang_20d': cur_yz,
+                'consensus': consensus_rv, 'intraday': intra_rv,
+                'trend': rv_trend, 'term_slope': rv_term_slope
+            },
+            'hv': {'20d': cur_hv, 'percentile': hv_pctile, 'mean': hv_mean},
+            'vrp': {'iv_hv': vrp_iv_hv, 'iv_rv': vrp_iv_rv},
+            'regime': regime
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
     # CORE: Volatility Comparison & Prediction
     # ══════════════════════════════════════════════════════════════════════
+
 
     def run_analysis(self):
         """Main analysis pipeline — called from menu."""

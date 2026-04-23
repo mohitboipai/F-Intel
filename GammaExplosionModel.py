@@ -209,7 +209,10 @@ class GammaExplosionModel:
                     pe_gamma = row.get('gamma', 0)
                 pe_oi = row['oi']
 
-            gex = (ce_gamma * ce_oi - pe_gamma * pe_oi) * spot * self.LOT_SIZE
+            # Institutional GEX Formula: Rupee Value per 1% move in underlying
+            # Assuming Dealers are long calls, short puts (Standard Baseline)
+            # GEX = Gamma * OI * (Spot * 0.01) * Lot_Size * Spot
+            gex = (ce_gamma * ce_oi - pe_gamma * pe_oi) * (spot * spot * 0.01) * self.LOT_SIZE
             profile[strike] = gex
 
         if not profile:
@@ -379,10 +382,11 @@ class GammaExplosionModel:
         conc_score = min(100, concentration * 2.5)  # 40% → 100
 
         # 2. Short gamma score: negative GEX = destabilizing = high score
-        if net_gex < -1e9:
+        # Scale adjusted for new `Spot * Spot * 0.01` calculation (values are ~200x larger)
+        if net_gex < -300e9:
             sg_score = 100
         elif net_gex < 0:
-            sg_score = min(100, abs(net_gex) / 1e9 * 100)
+            sg_score = min(100, abs(net_gex) / 300e9 * 100)
         else:
             sg_score = 0  # long gamma = stabilizing = no explosion risk
 

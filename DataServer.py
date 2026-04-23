@@ -501,6 +501,171 @@ def api_scenario():
         return jsonify({'ok': False, 'error': str(e),
                         'trace': traceback.format_exc()}), 500
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GEX / Signals / Regime  API  (Institutional UI — Phase 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory GEX snapshot refreshed by the background thread below
+_gex_snapshot: dict = {
+    "score": 0, "regime": "UNKNOWN", "net_gex": 0,
+    "strikes": [], "direction": "NEUTRAL", "last_update": None,
+}
+_gex_lock = threading.Lock()
+
+
+def _gex_refresh_loop(interval: int = 300):
+    """Background thread: refresh GEX snapshot every `interval` seconds."""
+    while True:
+        try:
+            if hub.fyers and hub.latest_data.get("chain"):
+                from GammaExplosionModel import GammaExplosionModel
+                import pandas as pd
+                gm = GammaExplosionModel(fyers_instance=hub.fyers)
+                gm.spot_price = hub.latest_data.get("spot", 0)
+                chain = hub.latest_data["chain"]
+                df = gm.parse_chain(chain) if hasattr(gm, "parse_chain") else pd.DataFrame()
+                if df.empty:
+                    # Fallback: parse optionsChain manually
+                    rows = chain.get("optionsChain", [])
+                    if rows:
+                        df = pd.DataFrame([{
+                            "strike":     float(r.get("strike_price", 0)),
+                            "type":       r.get("option_type", "CE"),
+                            "oi":         int(r.get("oi", 0) or 0),
+                            "iv":         float(r.get("iv", 0) or 0),
+                            "price":      float(r.get("ltp", 0) or 0),
+                        } for r in rows])
+                if not df.empty and gm.spot_price > 0:
+                    result = gm.run_analysis(df)      # returns full dict
+                    snap = {
+                        "score":       result.get("composite_score", 0),
+                        "regime":      result.get("regime", "NORMAL"),
+                        "net_gex":     result.get("net_gex", 0),
+                        "direction":   result.get("explosion_direction", "NEUTRAL"),
+                        "strikes":     result.get("gex_by_strike", []),
+                        "last_update": datetime.now().strftime("%H:%M:%S"),
+                    }
+                    with _gex_lock:
+                        _gex_snapshot.update(snap)
+                    print(f"[GEX] Refreshed — score={snap['score']}, regime={snap['regime']}")
+        except Exception as _e:
+            print(f"[GEX] Refresh error (non-fatal): {_e}")
+        time.sleep(interval)
+
+
+@app.route('/api/gex', methods=['GET'])
+def api_gex():
+    """
+    GET /api/gex
+    Returns the cached GammaExplosionModel snapshot.
+    Refreshed every 5 minutes by _gex_refresh_loop().
+
+    Response shape:
+      { ok, score, regime, net_gex, direction, strikes:[{strike,gex,label}], last_update }
+    """
+    with _gex_lock:
+        snap = dict(_gex_snapshot)
+    return jsonify({"ok": True, **snap})
+
+
+@app.route('/api/signals', methods=['GET'])
+def api_signals():
+    """
+    GET /api/signals
+    Returns the full SignalMemory store: active signals, resolved signals, context.
+
+    Response shape:
+      { ok, active:[...], resolved:[...], context:{...} }
+    """
+    try:
+        from SignalMemory import SignalMemory
+        mem = SignalMemory()
+        data = mem._data
+        return jsonify({
+            "ok":       True,
+            "active":   data.get("active_signals", []),
+            "resolved": data.get("resolved_signals", [])[-30:],  # last 30
+            "context":  data.get("context", {}),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
+
+@app.route('/api/regime', methods=['GET'])
+def api_regime():
+    """
+    GET /api/regime
+    Returns a snapshot of the current volatility regime, VRP, RV estimates,
+    ATM IV, and cached Heston parameters.
+
+    Response shape:
+      { ok, regime, atm_iv, vrp, rv_5d, rv_20d, dte_days, heston:{...}, last_update }
+    """
+    try:
+        import pandas as pd
+
+        spot  = hub.latest_data.get("spot", 0.0)
+        chain = hub.latest_data.get("chain", {})
+        T     = hub_cache.get_T()
+        dte_days = max(1, round(T * 365))
+
+        # ── ATM IV from live chain ─────────────────────────────────────
+        atm_iv = 0.0
+        if chain.get("optionsChain") and spot > 0:
+            df_c = pd.DataFrame(chain["optionsChain"])
+            if not df_c.empty and "iv" in df_c.columns and "strike_price" in df_c.columns:
+                df_c["dist"] = abs(df_c["strike_price"].astype(float) - spot)
+                row = df_c.loc[df_c["dist"].idxmin()]
+                atm_iv = float(row.get("iv", 0) or 0)
+
+        # ── RV estimates from SignalMemory context ─────────────────────
+        rv_5d = rv_20d = vrp = 0.0
+        regime_label = "UNKNOWN"
+        try:
+            from SignalMemory import SignalMemory
+            ctx = SignalMemory()._data.get("context", {})
+            rv_5d  = float(ctx.get("rv_5d")  or 0)
+            rv_20d = float(ctx.get("rv_20d") or 0)
+            vrp    = float(ctx.get("vrp")    or 0)
+            regime_label = ctx.get("regime") or "UNKNOWN"
+        except Exception:
+            pass
+
+        # ── Derive regime if still unknown ────────────────────────────
+        if regime_label == "UNKNOWN" and atm_iv > 0:
+            if vrp < -2:
+                regime_label = "UNDERPRICED"
+            elif vrp > 3:
+                regime_label = "OVERPRICED"
+            else:
+                regime_label = "COMPRESSION"
+
+        heston = hub_cache.get_heston_params() or {}
+
+        return jsonify({
+            "ok":          True,
+            "regime":      regime_label,
+            "atm_iv":      round(atm_iv, 2),
+            "vrp":         round(vrp, 2),
+            "rv_5d":       round(rv_5d, 2),
+            "rv_20d":      round(rv_20d, 2),
+            "dte_days":    dte_days,
+            "spot":        spot,
+            "heston":      heston,
+            "last_update": hub.latest_data.get("last_update"),
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     hub.start()
     print(f"DataHub Real-Time server starting on port {PORT}...")
@@ -513,4 +678,10 @@ if __name__ == "__main__":
     except Exception as _e:
         print(f"[DataServer] HestonCalibrator could not start (non-fatal): {_e}")
 
+    # ── Background GEX Refresher ───────────────────────────────────────
+    threading.Thread(target=_gex_refresh_loop, args=(300,),
+                     daemon=True, name="GEXRefresher").start()
+    print("[DataServer] GEX refresh thread started (interval=300s).")
+
     app.run(port=PORT, debug=False, use_reloader=False)
+
