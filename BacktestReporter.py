@@ -126,6 +126,10 @@ class BacktestReporter:
             f'fill="rgba(255,68,68,0.08)" />'
         )
 
+        # Define color and points
+        line_color = "#66bb6a" if arr[-1] >= 0 else "#ff4444"
+        pts = " ".join([f"{xp(i):.1f},{yp(v):.1f}" for i, v in enumerate(arr)])
+
         # Gradient definition for the line
         def_gradient = (
             f'<defs>'
