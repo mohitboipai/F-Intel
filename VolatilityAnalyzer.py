@@ -3711,7 +3711,7 @@ class VolatilityAnalyzer:
                             _i         = _sd['idx']
                             _sc        = GREEN if _sd['score'] >= 70 else YELLOW if _sd['score'] >= 45 else RED
                             _active    = 'strat-pill-active' if _i == 0 else ''
-                            _pstyle    = '' if _i == 0 else 'display:none;'
+                            _pstyle_attr = '' if _i == 0 else ' style="display:none;"'
 
                             _pills_html += f'''
                             <button class="strat-pill {_active}" onclick="selectStrat({_i})"
@@ -3727,7 +3727,7 @@ class VolatilityAnalyzer:
                             </button>'''
 
                             _panels_html += f'''
-                            <div id="strat-panel-{_i}" style="{_pstyle}">
+                            <div id="strat-panel-{_i}"{_pstyle_attr}>
                                 <!-- Top metrics row -->
                                 <div style="display:grid;grid-template-columns:repeat(6,1fr);
                                             gap:8px;margin-bottom:12px;">
@@ -4048,8 +4048,8 @@ class VolatilityAnalyzer:
                             try {{ payload = JSON.parse(payloadStr.replace(/&quot;/g, '"')); }}
                             catch(e) {{ alert('Parse error: ' + e); return; }}
 
-                            // Try DataServer first, fall back to local /track endpoint
-                            var targets = ['http://127.0.0.1:8082/api/track_strategy', '/track_strategy'];
+                            // Use relative path — works locally and via Cloudflare tunnel
+                            var targets = ['/api/track_strategy'];
                             var attempt = function(idx) {{
                                 if (idx >= targets.length) {{
                                     alert('Could not save — DataServer and local handler not available.');
@@ -4488,6 +4488,9 @@ class VolatilityAnalyzer:
                         full_html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#0d1117">
 <title>Unified Vol Dashboard | {self.symbol}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
@@ -4519,6 +4522,23 @@ class VolatilityAnalyzer:
     @keyframes pulse {{ 0% {{opacity:1;}} 50% {{opacity:0.2;}} 100% {{opacity:1;}} }}
     #refresh-indicator {{ opacity:0; transition:opacity 0.3s; }}
     #refresh-indicator.show {{ opacity:1; }}
+    
+    @media (max-width: 768px) {{
+        body {{ padding: 4px; font-size: 13px; }}
+        .header {{ flex-direction: column; align-items: flex-start; gap: 10px; }}
+        .header > div {{ flex-direction: column; align-items: flex-start !important; gap: 5px !important; }}
+        .title {{ font-size: 14px; }}
+        #spot-display {{ font-size: 26px !important; }}
+        .tab-bar {{ overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }}
+        .tab-btn {{ flex: 0 0 auto; padding: 12px 16px; min-height: 44px; }}
+        .card > div {{ grid-template-columns: 1fr !important; }}
+        .metric-box {{ min-width: 100%; margin-bottom: 8px; }}
+        .data-table {{ display: block; overflow-x: auto; white-space: nowrap; }}
+        .plotly-graph-div {{ width: 100% !important; min-height: 300px; }}
+        button, input {{ min-height: 44px; font-size: 16px; }}
+        #verdict-container {{ margin-left: 0 !important; width: 100%; }}
+        #verdict-container > div {{ width: 100%; }}
+    }}
 </style>
 </head><body>
     <div class="header">
@@ -4587,8 +4607,8 @@ class VolatilityAnalyzer:
         }}
     }})();
 
-    // Seamless refresh — served over HTTP, fetch fragment each cycle
-    var FRAG_URL = '{_base_url}/{os.path.basename(frag_path)}';
+    // Seamless refresh — fetch fragment from DataServer (works locally and via Cloudflare tunnel)
+    var FRAG_URL = '/fragment';
 
     function refreshContent() {{
         var indicator = document.getElementById('refresh-indicator');
@@ -4641,7 +4661,7 @@ class VolatilityAnalyzer:
     window.isScrubbing = false;
 
     function trackStrategy(payloadStr) {{
-        fetch('http://localhost:8081/track_strategy', {{
+        fetch('/api/track_strategy', {{
             method: 'POST',
             headers: {{'Content-Type': 'application/json'}},
             body: payloadStr
@@ -4650,11 +4670,11 @@ class VolatilityAnalyzer:
                 console.log("Tracking started");
                 if (!window.isScrubbing) refreshContent(); // instantly update UI
             }} else alert("Error starting tracking.");
-        }}).catch(e => console.error("Error calling local API:", e));
+        }}).catch(e => console.error("Error calling API:", e));
     }}
     
     function deleteStrategy(id) {{
-        fetch('http://localhost:8081/delete_strategy', {{
+        fetch('/api/close_strategy', {{
             method: 'POST',
             headers: {{'Content-Type': 'application/json'}},
             body: JSON.stringify({{id: id}})
@@ -4671,7 +4691,7 @@ class VolatilityAnalyzer:
         if(!timeVal) return;
         window.isScrubbing = true;
         
-        fetch(`http://localhost:8081/strategy_pnl_at?time=${{timeVal}}`)
+        fetch(`/api/strategy_pnl_at?time=${{timeVal}}`) 
         .then(r => r.text())
         .then(html => {{
             document.getElementById('pnlTrackerContainer').innerHTML = html;
@@ -4692,7 +4712,14 @@ class VolatilityAnalyzer:
     // Real-Time WebSocket integration with DataHub
     var ws;
     function connectDataHub() {{
-        ws = new WebSocket('ws://' + window.location.hostname + ':8082/stream');
+        var host = window.location.hostname;
+        var port = window.location.port;
+        var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        if (host === 'localhost' || host === '127.0.0.1') {{
+            port = '8082';
+        }}
+        var wsUrl = protocol + host + (port ? ':' + port : '') + '/stream';
+        ws = new WebSocket(wsUrl);
         
         ws.onopen = function() {{
             console.log("Connected to DataHub Real-Time Stream");
@@ -4724,6 +4751,16 @@ class VolatilityAnalyzer:
 
     // Start WebSocket connection
     connectDataHub();
+    
+    if ('serviceWorker' in navigator) {{
+        window.addEventListener('load', function() {{
+            navigator.serviceWorker.register('/static/sw.js').then(function(registration) {{
+                console.log('ServiceWorker registration successful with scope: ', registration.scope);
+            }}, function(err) {{
+                console.log('ServiceWorker registration failed: ', err);
+            }});
+        }});
+    }}
     </script>
 </body></html>'''
                         with open(html_path, 'w', encoding='utf-8') as f:

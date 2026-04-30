@@ -2,7 +2,7 @@ import os
 import time
 import json
 import threading
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 from flask_sock import Sock
 from datetime import datetime
@@ -198,6 +198,34 @@ def get_data():
     with hub.lock:
         return jsonify(hub.latest_data)
 
+@app.route('/', methods=['GET'])
+def index():
+    return send_file('unified_dashboard.html')
+
+@app.route('/fragment', methods=['GET'])
+def serve_fragment():
+    """Serve the latest pre-rendered dashboard fragment for refreshContent()."""
+    try:
+        response = send_file('unified_dashboard_fragment.html')
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception:
+        return '<div id="frag-regime"></div>', 200
+
+@app.route('/static/manifest.json', methods=['GET'])
+def serve_manifest():
+    return send_file('static/manifest.json')
+
+@app.route('/static/sw.js', methods=['GET'])
+def serve_sw():
+    response = send_file('static/sw.js')
+    response.headers['Cache-Control'] = 'no-cache'
+    return response
+
+@app.route('/static/icon.png', methods=['GET'])
+def serve_icon():
+    return send_file('static/icon.png')
+
 # ─────────────────────────────────────────────
 # Strategy Engine API Endpoints
 # ─────────────────────────────────────────────
@@ -233,6 +261,62 @@ def api_close_strategy():
         return jsonify({'ok': True, 'pnl': pnl})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/delete_strategy', methods=['POST'])
+def api_delete_strategy():
+    """Delete a tracked strategy (alias used by the inline strategy tab)."""
+    try:
+        from StrategyManager import StrategyManager
+        data = request.get_json(force=True)
+        sid  = data.get('id')
+        mgr  = StrategyManager()
+        if hasattr(mgr, 'delete_strategy'):
+            mgr.delete_strategy(sid)
+        else:
+            mgr.close_strategy(sid, 0, 0)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/strategy_pnl_at', methods=['GET'])
+def api_strategy_pnl_at():
+    """Return historical P&L HTML for a given intraday time (P&L scrubber)."""
+    try:
+        from StrategyManager import StrategyManager
+        from TickDatabase import IntradayTickDB
+        target_time = request.args.get('time', '')
+        if not target_time:
+            from datetime import datetime as _dt
+            target_time = _dt.now().strftime('%H:%M')
+        tick_db = IntradayTickDB()
+        hist_chain = tick_db.get_chain_at_time('NSE:NIFTY50-INDEX', target_time)
+        mgr = StrategyManager()
+        tracked = mgr.get_all_active_strategies()
+        if not tracked:
+            html = '<div style="color:#666;font-size:12px;text-align:center;padding:20px;">No strategies tracked.</div>'
+        else:
+            rows = []
+            chain_prices = {}
+            if not hist_chain.empty:
+                for _, r in hist_chain.iterrows():
+                    chain_prices[(r['type'], r['strike'])] = r['price']
+            for t in tracked:
+                entry_val = t.get('premium', 0)
+                current_val = sum(
+                    chain_prices.get((lg['type'], lg['strike']), lg['price']) * (1 if lg['action'] == 'SELL' else -1)
+                    for lg in t.get('legs', [])
+                )
+                pnl = entry_val - current_val if t.get('type') == 'CREDIT' else current_val - abs(entry_val)
+                c = '#66bb6a' if pnl > 0 else '#ff4444'
+                rows.append(f'<div style="padding:6px 0;border-bottom:1px solid #333;">'
+                            f'<b style="color:#4fc3f7">{t["name"]}</b> '
+                            f'<span style="color:{c};font-weight:700">P&L: &#8377;{pnl:+.2f}</span></div>')
+            html = ''.join(rows)
+        return html, 200, {'Content-Type': 'text/html'}
+    except Exception as e:
+        return f'<div style="color:#ff4444">Error: {e}</div>', 500, {'Content-Type': 'text/html'}
+
+
 
 @app.route('/api/strategies', methods=['GET'])
 def api_strategies():
@@ -662,6 +746,75 @@ def api_regime():
         import traceback
         return jsonify({"ok": False, "error": str(e),
                         "trace": traceback.format_exc()}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy Backtest Routes  (used by the dashboard's bt tab)
+# /bt_run  →  triggers async backtest (same logic as /api/backtest)
+# /bt_<type>.html  →  polls and serves the HTML result
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/bt_run', methods=['POST'])
+def bt_run():
+    """Legacy backtest trigger used by unified_dashboard.html."""
+    try:
+        data          = request.get_json(force=True) or {}
+        strategy_type = data.get('type', 'SHORT_STRADDLE').upper()
+        days          = int(data.get('days', 365))
+        stop_loss     = float(data.get('sl', 2.0))
+
+        if _bt_running.get(strategy_type):
+            return 'RUNNING', 200
+
+        def _run():
+            from StrategyBacktester import OptionStrategyBacktester
+            _bt_running[strategy_type] = True
+            try:
+                bt     = OptionStrategyBacktester()
+                report = bt.run(strategy_type, days=days, stop_loss_mult=stop_loss)
+                _bt_cache[strategy_type] = report
+                # Also persist static HTML file so /bt_<type>.html can serve it
+                html_path = f'bt_{strategy_type}.html'
+                with open(html_path, 'w', encoding='utf-8') as _f:
+                    _f.write(report.to_html())
+            except Exception as _e:
+                print(f'[bt_run] backtest error: {_e}')
+            finally:
+                _bt_running[strategy_type] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return 'STARTED', 200
+    except Exception as e:
+        return str(e), 500
+
+
+@app.route('/bt_<path:fname>.html', methods=['GET'])
+def bt_serve_html(fname):
+    """Legacy backtest result poller: serves the pre-rendered HTML file."""
+    import os
+    strategy_type = fname.upper()
+    # If a cached report exists in memory, serve that
+    report = _bt_cache.get(strategy_type)
+    if report:
+        try:
+            return report.to_html(), 200, {'Content-Type': 'text/html; charset=utf-8'}
+        except Exception:
+            pass
+    # Otherwise try the static file on disk
+    html_path = f'bt_{strategy_type}.html'
+    if os.path.exists(html_path):
+        return send_file(html_path)
+    # Still running or not started yet
+    if _bt_running.get(strategy_type):
+        return '', 202   # 202 = not ready, dashboard keeps polling
+    return '', 404
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Quick liveness probe."""
+    return jsonify({'ok': True, 'spot': hub.latest_data.get('spot', 0),
+                    'status': hub.latest_data.get('status', 'Unknown')})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
