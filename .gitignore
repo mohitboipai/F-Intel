@@ -27,3 +27,11 @@ vol_regime_history.csv
 
 # Notebooks
 *.ipynb
+
+# Launcher session files
+tunnel_url.txt
+fintel_session.json
+logs/
+dist/
+build/
+*.spec
