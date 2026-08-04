@@ -1,7 +1,17 @@
+import sys
+
+# Ensure stdout can print Unicode (like ✓) on Windows consoles
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+        
 import os
 import time
 import json
 import threading
+import pandas as pd
 from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 from flask_sock import Sock
@@ -93,6 +103,19 @@ class DataHub:
         while not self._stop_event.is_set():
             try:
                 if self.fyers:
+                    # REST Fallback for Spot Price if WebSocket is silent
+                    if self.latest_data["spot"] == 0:
+                        try:
+                            q_res = self.fyers.quotes({"symbols": SYMBOL})
+                            if q_res and q_res.get('s') == 'ok' and q_res.get('d'):
+                                lp = q_res['d'][0]['v']['lp']
+                                with self.lock:
+                                    self.latest_data["spot"] = lp
+                                    self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+                                self.broadcast({"type": "tick", "spot": lp, "time": self.latest_data["last_update"]})
+                        except Exception as e:
+                            print(f"DataHub: Spot Fallback Error: {e}")
+
                     c_res = self.fyers.optionchain({"symbol": SYMBOL, "strikecount": 50})
                     if c_res and c_res.get('s') == 'ok':
                         chain = c_res.get('data', {})
@@ -587,52 +610,133 @@ def api_scenario():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEX / Signals / Regime  API  (Institutional UI — Phase 0)
+# GEX / Signals / Regime / Dealer API
 # ─────────────────────────────────────────────────────────────────────────────
 
-# In-memory GEX snapshot refreshed by the background thread below
 _gex_snapshot: dict = {
     "score": 0, "regime": "UNKNOWN", "net_gex": 0,
     "strikes": [], "direction": "NEUTRAL", "last_update": None,
+    # New fields from calculations/GexEngine
+    "zero_gamma_level": 0, "dealer_long_pct": 0, "dealer_short_pct": 0,
+    "spot_gamma": 0, "forward_gex": 0,
 }
 _gex_lock = threading.Lock()
 
+# In-memory dealer snapshot (refreshed together with GEX)
+_dealer_snapshot: dict = {
+    "net_dex": 0, "net_gex_shares": 0, "net_vanna": 0, "net_charm": 0,
+    "hedge_spot_up": 0, "hedge_iv_up": 0, "hedge_1day": 0,
+    "strike_dex": [], "strike_gex": [], "last_update": None,
+}
+_dealer_lock = threading.Lock()
 
-def _gex_refresh_loop(interval: int = 300):
-    """Background thread: refresh GEX snapshot every `interval` seconds."""
+
+def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
+    """Convert Fyers optionsChain dict to a clean DataFrame for calculations/."""
+    import pandas as pd
+    rows = chain.get("optionsChain", [])
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "strike": float(r.get("strike_price", 0)),
+        "type":   r.get("option_type", "CE"),
+        "oi":     float(r.get("oi", 0) or 0),
+        "volume": float(r.get("volume", 0) or 0),
+        "iv":     float(r.get("iv", 0) or 0),
+        "price":  float(r.get("ltp", 0) or 0),
+        "dte":    float(r.get("dte", 1) or 1),
+    } for r in rows])
+
+
+def _gex_refresh_loop(interval: int = 60):
+    """Background thread: refresh GEX + Dealer snapshots every `interval` seconds."""
     while True:
         try:
-            if hub.fyers and hub.latest_data.get("chain"):
-                from GammaExplosionModel import GammaExplosionModel
+            spot  = hub.latest_data.get("spot", 0)
+            chain = hub.latest_data.get("chain", {})
+            if not spot or not chain:
+                time.sleep(5)
+                continue
+            
+            if spot > 0 and chain:
                 import pandas as pd
-                gm = GammaExplosionModel(fyers_instance=hub.fyers)
-                gm.spot_price = hub.latest_data.get("spot", 0)
-                chain = hub.latest_data["chain"]
-                df = gm.parse_chain(chain) if hasattr(gm, "parse_chain") else pd.DataFrame()
-                if df.empty:
-                    # Fallback: parse optionsChain manually
-                    rows = chain.get("optionsChain", [])
-                    if rows:
-                        df = pd.DataFrame([{
-                            "strike":     float(r.get("strike_price", 0)),
-                            "type":       r.get("option_type", "CE"),
-                            "oi":         int(r.get("oi", 0) or 0),
-                            "iv":         float(r.get("iv", 0) or 0),
-                            "price":      float(r.get("ltp", 0) or 0),
-                        } for r in rows])
-                if not df.empty and gm.spot_price > 0:
-                    result = gm.run_analysis(df)      # returns full dict
-                    snap = {
-                        "score":       result.get("composite_score", 0),
-                        "regime":      result.get("regime", "NORMAL"),
-                        "net_gex":     result.get("net_gex", 0),
-                        "direction":   result.get("explosion_direction", "NEUTRAL"),
-                        "strikes":     result.get("gex_by_strike", []),
-                        "last_update": datetime.now().strftime("%H:%M:%S"),
-                    }
+                from calculations.GexEngine import GexEngine
+                from calculations.DealerPositionEngine import DealerPositionEngine
+
+                df = _parse_chain_to_df(chain)
+                if not df.empty:
+                    # ── GEX via calculations/GexEngine ──────────────────────
+                    gex_eng = GexEngine(lot_size=75, positioning_model='standard')
+                    gex_res = gex_eng.calculate_gex(df, spot)
+
+                    profile   = gex_res.get("profile")
+                    net_gex   = gex_res.get("net_gex", 0)
+                    direction = "POSITIVE" if net_gex > 0 else "NEGATIVE"
+
+                    strike_list = []
+                    if profile is not None and not profile.empty:
+                        for strike, gex_val in profile.items():
+                            strike_list.append({"strike": float(strike), "gex": float(gex_val)})
+
+                    # Try GammaExplosionModel for regime label + composite score (non-fatal)
+                    regime = "POSITIVE GEX" if net_gex > 0 else "NEGATIVE GEX"
+                    score  = round(abs(net_gex) / 1e9, 2)
+                    try:
+                        from GammaExplosionModel import GammaExplosionModel
+                        gm = GammaExplosionModel(fyers_instance=hub.fyers)
+                        gm.spot_price = spot
+                        gm_df = gm.parse_chain(chain) if hasattr(gm, "parse_chain") else pd.DataFrame()
+                        if not gm_df.empty:
+                            gm_res = gm.run_analysis(gm_df)
+                            regime = gm_res.get("regime", regime)
+                            score  = gm_res.get("composite_score", score)
+                    except Exception:
+                        pass
+
                     with _gex_lock:
-                        _gex_snapshot.update(snap)
-                    print(f"[GEX] Refreshed — score={snap['score']}, regime={snap['regime']}")
+                        _gex_snapshot.update({
+                            "score":            score,
+                            "regime":           regime,
+                            "net_gex":          float(net_gex),
+                            "direction":        direction,
+                            "strikes":          strike_list,
+                            "zero_gamma_level": gex_res.get("zero_gamma_level", 0),
+                            "dealer_long_pct":  round(gex_res.get("dealer_long_pct", 0), 1),
+                            "dealer_short_pct": round(gex_res.get("dealer_short_pct", 0), 1),
+                            "spot_gamma":       gex_res.get("spot_gamma", 0),
+                            "forward_gex":      gex_res.get("forward_gex", 0),
+                            "last_update":      datetime.now().strftime("%H:%M:%S"),
+                        })
+                    print(f"[GEX] net={net_gex:.0f}, flip={gex_res.get('zero_gamma_level',0):.0f}, regime={regime}")
+
+                    # ── Dealer Inventory via DealerPositionEngine ──────────
+                    try:
+                        dep   = DealerPositionEngine(lot_size=75)
+                        d_res = dep.calculate_dealer_inventory(df, spot)
+                        sp    = d_res.get("strike_profile", {})
+
+                        def _to_list(s):
+                            if s is None or (hasattr(s, "empty") and s.empty):
+                                return []
+                            return [{"strike": float(k), "value": float(v)} for k, v in s.items()]
+
+                        with _dealer_lock:
+                            _dealer_snapshot.update({
+                                "net_dex":        round(d_res.get("net_delta_exposure", 0), 0),
+                                "net_gex_shares": round(d_res.get("net_gamma_shares", 0), 0),
+                                "net_vanna":      round(d_res.get("net_vanna_exposure", 0), 0),
+                                "net_charm":      round(d_res.get("net_charm_exposure", 0), 0),
+                                "hedge_spot_up":  round(d_res.get("projected_hedging", {}).get("buy_shares_if_spot_up_1pct", 0), 0),
+                                "hedge_iv_up":    round(d_res.get("projected_hedging", {}).get("buy_shares_if_iv_up_1pct", 0), 0),
+                                "hedge_1day":     round(d_res.get("projected_hedging", {}).get("buy_shares_if_1_day_passes", 0), 0),
+                                "strike_dex":     _to_list(sp.get("dex")),
+                                "strike_gex":     _to_list(sp.get("gex")),
+                                "last_update":    datetime.now().strftime("%H:%M:%S"),
+                            })
+                        print(f"[DEALER] DEX={d_res.get('net_delta_exposure',0):.0f}")
+                    except Exception as _de:
+                        print(f"[DEALER] Error (non-fatal): {_de}")
+
         except Exception as _e:
             print(f"[GEX] Refresh error (non-fatal): {_e}")
         time.sleep(interval)
@@ -641,16 +745,29 @@ def _gex_refresh_loop(interval: int = 300):
 @app.route('/api/gex', methods=['GET'])
 def api_gex():
     """
-    GET /api/gex
-    Returns the cached GammaExplosionModel snapshot.
-    Refreshed every 5 minutes by _gex_refresh_loop().
-
-    Response shape:
-      { ok, score, regime, net_gex, direction, strikes:[{strike,gex,label}], last_update }
+    GET /api/gex — GEX snapshot from calculations/GexEngine.
+    { ok, net_gex, regime, direction, zero_gamma_level,
+      dealer_long_pct, dealer_short_pct, spot_gamma,
+      strikes:[{strike, gex}], last_update }
     """
     with _gex_lock:
         snap = dict(_gex_snapshot)
     return jsonify({"ok": True, **snap})
+
+
+@app.route('/api/dealer', methods=['GET'])
+def api_dealer():
+    """
+    GET /api/dealer — Dealer inventory snapshot from DealerPositionEngine.
+    { ok, net_dex, net_gex_shares, net_vanna, net_charm,
+      hedge_spot_up, hedge_iv_up, hedge_1day,
+      strike_dex:[{strike,value}], strike_gex:[{strike,value}], last_update }
+    """
+    with _dealer_lock:
+        snap = dict(_dealer_snapshot)
+    return jsonify({"ok": True, **snap})
+
+
 
 
 @app.route('/api/signals', methods=['GET'])
@@ -812,9 +929,15 @@ def bt_serve_html(fname):
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Quick liveness probe."""
-    return jsonify({'ok': True, 'spot': hub.latest_data.get('spot', 0),
-                    'status': hub.latest_data.get('status', 'Unknown')})
+    """Quick liveness probe — returns spot, status, last tick time, and server time."""
+    return jsonify({
+        'ok':          True,
+        'spot':        hub.latest_data.get('spot', 0),
+        'status':      hub.latest_data.get('status', 'Unknown'),
+        'last_update': hub.latest_data.get('last_update'),          # last Fyers tick HH:MM:SS
+        'tick_count':  hub.latest_data.get('tick_count', 0),
+        'server_time': datetime.now().strftime('%H:%M:%S'),          # live server clock
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

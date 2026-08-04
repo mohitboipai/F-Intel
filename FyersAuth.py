@@ -1,15 +1,17 @@
-import os
-import time
-import webbrowser
-from fyers_apiv3 import fyersModel
-
+import sys
 import os
 import time
 import webbrowser
 from fyers_apiv3 import fyersModel
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
-import sys
+
+# Ensure stdout can print Unicode (like ✓) on Windows consoles
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
 
 class FyersAuthenticator:
     def __init__(self, client_id, secret_id, redirect_uri, token_file="access_token.txt"):
@@ -74,22 +76,26 @@ class FyersAuthenticator:
                     self.end_headers()
                     self.wfile.write(b"<html><body><h1>Authentication Successful!</h1><p>You can close this window and return to the terminal.</p></body></html>")
                 else:
-                    self.send_response(400)
+                    self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"Authentication Failed: No auth_code found.")
+                    self.wfile.write(b"Waiting for auth_code...")
                 
             def log_message(self, format, *args):
                 return # Suppress server logs
 
-        # Start server and handle one request
+        # Start server and handle requests until auth_code is captured
         try:
             server = HTTPServer(('127.0.0.1', 3000), CallbackHandler)
-            server.handle_request() # Blocks until request is handled
+            while not authenticator.auth_code:
+                server.handle_request() # Blocks until request is handled
             server.server_close()
         except Exception as e:
             print(f"Error starting local server: {e}")
             print("Please enter auth_code manually.")
-            self.auth_code = input("Enter the auth_code here: ").strip()
+            try:
+                self.auth_code = input("Enter the auth_code here: ").strip()
+            except EOFError:
+                pass
 
         if not self.auth_code:
             print("Failed to capture auth code.")

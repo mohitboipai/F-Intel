@@ -8,29 +8,6 @@ import os
 
 PORT = 8082
 
-def is_server_running():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('localhost', PORT)) == 0
-
-def ensure_dataserver():
-    if is_server_running():
-        return
-    
-    print("Starting DataServer...")
-    # Start in background
-    subprocess.Popen([sys.executable, "DataServer.py"], 
-                     stdout=subprocess.DEVNULL, 
-                     stderr=subprocess.DEVNULL)
-    
-    # Wait up to 15s
-    for _ in range(15):
-        if is_server_running():
-            return
-        time.sleep(1)
-        
-    print("Error: DataServer failed to start within 15 seconds.")
-    sys.exit(1)
-
 def check_cloudflared():
     try:
         subprocess.run(["cloudflared", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -49,7 +26,6 @@ def heartbeat():
         print("Tunnel active")
 
 def main():
-    ensure_dataserver()
     check_cloudflared()
     
     print("Starting Cloudflare Tunnel...")

@@ -21,6 +21,13 @@ We detect this at runtime and set PROJECT_ROOT accordingly.
 """
 
 import sys
+
+# Ensure stdout can print Unicode (like ✓) on Windows consoles
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
 import os
 import subprocess
 import threading

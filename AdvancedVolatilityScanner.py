@@ -219,6 +219,7 @@ class AdvancedVolatilityScanner:
         
         # Fit Cubic Spline
         try:
+            CubicSpline = None
             cs = CubicSpline(s_sorted, iv_sorted)
             model_ivs = cs(s_sorted)
         except Exception as e:

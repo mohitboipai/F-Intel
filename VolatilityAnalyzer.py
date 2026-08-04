@@ -21,7 +21,7 @@ from SharedDataCache import SharedDataCache
 from NiftyHestonMC import HestonMath
 from DataClient import DataHubClient
 from RealizedVolEngine import RealizedVolEngine
-from ConfluenceEngine import ConfluenceEngine
+from MasterSignalEngine import MasterSignalEngine
 from OptionBuyerEngine import OptionBuyerEngine
 
 # ────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ class VolatilityAnalyzer:
         self.cache  = SharedDataCache(self.fyers, symbol=self.symbol)
         
         self.regime_engine = RealizedVolEngine()
-        self.confluence_engine = ConfluenceEngine()
+        self.master_engine = MasterSignalEngine()
         self.buyer_engine = OptionBuyerEngine()
 
     def _authenticate(self):
@@ -2888,8 +2888,26 @@ class VolatilityAnalyzer:
                     momentum_vwap = momentum_data.get('vwap', 0) if 'momentum_data' in locals() else 0
                     regime_snapshot = self.regime_engine.get_regime_snapshot(spot, df_daily, _pd_iv, momentum_vwap, rv_intra)
 
-                    # ── CONFLUENCE VERDICT ──
-                    verdict_data = self.confluence_engine.evaluate(regime_snapshot, pred, seller, momentum_data if 'momentum_data' in locals() else None)
+                    # ── FETCH GREEK FLOWS (GEX / DEALER) ──
+                    import urllib.request, json
+                    gex_data, dealer_data = None, None
+                    try:
+                        gex_req = urllib.request.urlopen("http://127.0.0.1:8082/api/gex", timeout=1.0)
+                        gex_data = json.loads(gex_req.read().decode())
+                        dealer_req = urllib.request.urlopen("http://127.0.0.1:8082/api/dealer", timeout=1.0)
+                        dealer_data = json.loads(dealer_req.read().decode())
+                    except Exception as _e:
+                        pass
+                        
+                    # ── MASTER SIGNAL VERDICT ──
+                    verdict_data = self.master_engine.evaluate(
+                        regime_data=regime_snapshot, 
+                        iv_surface_pred=pred, 
+                        seller_data=seller, 
+                        momentum_data=momentum_data if 'momentum_data' in locals() else None,
+                        gex_data=gex_data,
+                        dealer_data=dealer_data
+                    )
 
                     # ── BUYER SETUP ──
                     gex_accel = 0.0 # Will compute if needed, or default
@@ -4573,6 +4591,7 @@ class VolatilityAnalyzer:
         <div class="tab-btn" onclick="switchTab('chain')">Option Chain Analyser</div>
         <div class="tab-btn" onclick="switchTab('prob')">Prob Density</div>
         <div class="tab-btn" onclick="switchTab('strat')">Strategy Engine</div>
+        <div class="tab-btn" onclick="switchTab('mm')">Market Maker Positioning</div>
     </div>
 
     <div id="tab-regime" class="tab-content active">{regime_tab_html}</div>
@@ -4580,10 +4599,36 @@ class VolatilityAnalyzer:
     <div id="tab-vol" class="tab-content">{vol_tab_html}</div>
     <div id="tab-chain" class="tab-content">{chain_tab_html}</div>
     <div id="tab-prob" class="tab-content">{prob_tab_html}</div>
-    <div id="tab-strat" class="tab-content">{strategy_tab_html}</div>
+    <div id="tab-mm" class="tab-content">
+        <div style="display:flex; flex-direction:column; gap:16px;">
+            <!-- Institutional Signal Panel -->
+            <div id="mm-signal-container" style="display:none; padding:20px; background:#12122a; border-radius:12px; border-left: 6px solid #4FC3F7; border: 1px solid #2a2a4a; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
+                <div style="font-size:11px; color:{MUTED}; font-weight:700; letter-spacing:1.5px; margin-bottom:6px; text-transform:uppercase;">INSTITUTIONAL POSITIONING SIGNAL</div>
+                <div id="mm-signal-title" style="font-size:26px; font-weight:900; color:{WHITE}; margin-bottom:12px; letter-spacing:0.5px;">ANALYZING GREEKS...</div>
+                <div id="mm-signal-desc" style="font-size:14px; color:#e0e0e0; line-height:1.6;">Waiting for telemetry...</div>
+            </div>
+            
+            <!-- Raw Metrics Grid -->
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                <div class="card" style="border-left: 4px solid {ACCENT}; height:100%;">
+                    <div class="header">
+                        <div class="title">MARKET GAMMA EXPOSURE (GEX)</div>
+                    </div>
+                    <div id="gex-content" style="padding: 20px; text-align: center; color: {MUTED};">Loading real-time GEX data...</div>
+                </div>
+                
+                <div class="card" style="border-left: 4px solid {ACCENT}; height:100%;">
+                    <div class="header">
+                        <div class="title">DEALER GREEK POSITIONING</div>
+                    </div>
+                    <div id="dealer-content" style="padding: 20px; text-align: center; color: {MUTED};">Loading real-time Dealer data...</div>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <script>
-    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'strat':5}};
+    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'strat':5, 'mm':6}};
     var activeTab = localStorage.getItem('volDashActiveTab') || 'regime';
 
     function switchTab(id) {{
@@ -4629,13 +4674,14 @@ class VolatilityAnalyzer:
                         executeScripts(tabEl);
                     }}
                 }});
-                // Update header spot + time
+                // Update header spot + time from fragment metadata
                 var meta = tmp.querySelector('#frag-spot');
                 if (meta) {{
                     var sVal = meta.getAttribute('data-spot');
                     var tVal = meta.getAttribute('data-time');
-                    document.getElementById('spot-display').innerHTML = 'Spot: ' + Number(sVal).toLocaleString();
-                    document.getElementById('time-display').innerHTML = tVal + ' | 15s refresh';
+                    document.getElementById('spot-display').innerHTML = 'SPOT: ' + Number(sVal).toLocaleString(undefined, {{minimumFractionDigits: 2}});
+                    var timeEl = document.getElementById('time-display');
+                    if (timeEl && tVal) timeEl.innerHTML = '&#128339; ' + tVal + ' &nbsp;|&nbsp; &#8635; Updated';
                 }}
                 // Re-activate current tab (restores button highlight after DOM swap)
                 switchTab(activeTab);
@@ -4731,10 +4777,15 @@ class VolatilityAnalyzer:
             var msg = JSON.parse(event.data);
             if (msg.type === 'tick') {{
                 // Update Spot Price instantly
-                document.getElementById('spot-display').innerHTML = 'SPOT: ' + Number(msg.spot).toLocaleString(undefined, {{minimumFractionDigits: 2}});
-                document.getElementById('spot-display').style.transition = 'color 0.2s';
-                document.getElementById('spot-display').style.color = '{WHITE}';
-                setTimeout(() => {{ document.getElementById('spot-display').style.color = '{ACCENT}'; }}, 200);
+                var spotEl = document.getElementById('spot-display');
+                spotEl.innerHTML = 'SPOT: ' + Number(msg.spot).toLocaleString(undefined, {{minimumFractionDigits: 2}});
+                spotEl.style.transition = 'color 0.2s';
+                spotEl.style.color = '{WHITE}';
+                setTimeout(function() {{ spotEl.style.color = '{ACCENT}'; }}, 200);
+                // ── Live timestamp from tick ──────────────────────────────────
+                var tickTime = msg.time || new Date().toLocaleTimeString('en-IN', {{hour12: false}});
+                var timeEl = document.getElementById('time-display');
+                if (timeEl) timeEl.innerHTML = '&#128339; ' + tickTime + ' &nbsp;|&nbsp; &#9679; LIVE TICK';
             }} else if (msg.type === 'chain' || msg.type === 'init') {{
                 // Refresh full dashboard content when option chain updates (or on init)
                 if (!window.isScrubbing) refreshContent();
@@ -4751,6 +4802,114 @@ class VolatilityAnalyzer:
 
     // Start WebSocket connection
     connectDataHub();
+
+    // ──────────────── GEX & DEALER POLLING (15s) ────────────────
+    function pollGexAndDealer() {{
+        Promise.all([
+            fetch('http://127.0.0.1:8082/api/gex').then(function(r) {{ return r.ok ? r.json() : null; }}),
+            fetch('http://127.0.0.1:8082/api/dealer').then(function(r) {{ return r.ok ? r.json() : null; }})
+        ]).then(function(results) {{
+            var gexData = results[0];
+            var dealerData = results[1];
+            if (!gexData || !dealerData) return;
+            
+            var gexVal = gexData.net_gex || 0;
+            var vannaVal = dealerData.net_vanna || 0;
+            var charmVal = dealerData.net_charm || 0;
+            
+            // --- Render Raw Metrics ---
+            var gColor = gexVal > 0 ? '{GREEN}' : '{RED}';
+            document.getElementById('gex-content').innerHTML = `
+                <div style="display:flex; flex-wrap:wrap; gap:10px;">
+                    <div class="metric-box">
+                        <div style="color:{MUTED};font-size:11px;">NET GEX</div>
+                        <div style="font-size:24px;font-weight:700;color:${{gColor}}">${{(gexVal/1e7).toFixed(2)}} Cr</div>
+                    </div>
+                    <div class="metric-box">
+                        <div style="color:{MUTED};font-size:11px;">ZERO GAMMA STRIKE (APPROX)</div>
+                        <div style="font-size:20px;font-weight:700;">${{gexData.zero_gamma_level ? gexData.zero_gamma_level.toFixed(2) : '--'}}</div>
+                    </div>
+                </div>
+            `;
+            
+            var vColor = vannaVal > 0 ? '{GREEN}' : '{RED}';
+            var cColor = charmVal > 0 ? '{GREEN}' : '{RED}';
+            document.getElementById('dealer-content').innerHTML = `
+                <div style="display:flex; flex-wrap:wrap; gap:10px;">
+                    <div class="metric-box">
+                        <div style="color:{MUTED};font-size:11px;">NET VANNA EXPOSURE</div>
+                        <div style="font-size:24px;font-weight:700;color:${{vColor}}">${{(vannaVal/1e7).toFixed(2)}} Cr</div>
+                    </div>
+                    <div class="metric-box">
+                        <div style="color:{MUTED};font-size:11px;">NET CHARM EXPOSURE</div>
+                        <div style="font-size:24px;font-weight:700;color:${{cColor}}">${{(charmVal/1e7).toFixed(2)}} Cr</div>
+                    </div>
+                </div>
+            `;
+            
+            // --- Institutional Signal Synthesis ---
+            var sigTitle = "";
+            var sigDesc = "";
+            var borderColor = "";
+            
+            if (gexVal > 0) {{
+                sigTitle = "MEAN REVERSION / PINNING EXPECTED";
+                borderColor = "{GREEN}";
+                sigDesc = "Dealers are currently <strong style='color:{GREEN};'>Long Gamma</strong>. They are structurally positioned to hedge by <em>selling rips</em> and <em>buying dips</em> against the prevailing trend. <br><br><strong>EXPECTATION:</strong> Volatility compression, choppy price action, and a strong gravitational pull towards the Zero Gamma Level (" + (gexData.zero_gamma_level ? gexData.zero_gamma_level.toFixed(0) : "N/A") + "). Iron Condors and Short Straddles are favored.";
+            }} else if (gexVal < 0) {{
+                sigTitle = "VOLATILITY EXPANSION / TREND ACCELERATION";
+                borderColor = "{RED}";
+                sigDesc = "Dealers are currently <strong style='color:{RED};'>Short Gamma</strong>. They are structurally positioned to hedge by <em>buying rips</em> and <em>selling dips</em> alongside the prevailing trend. <br><br><strong>EXPECTATION:</strong> Violent price swings, volatility expansion, and trending environments. The market will slip freely away from the Zero Gamma Level. Directional setups and Long Straddles are favored.";
+            }} else {{
+                sigTitle = "NEUTRAL GAMMA REGIME";
+                borderColor = "{YELLOW}";
+                sigDesc = "Dealer Gamma exposure is flat. Market makers are not exerting significant hedging pressure on the index. Look to Vanna and Charm flows for directional bias.";
+            }}
+            
+            if (vannaVal > 0 && charmVal > 0) {{
+                sigDesc += "<br><br><span style='color:{GREEN};font-weight:700;'>BULLISH TAILWIND (Vanna & Charm):</span> Both Vanna and Charm are significantly positive. As time decays (Charm) and IV drops (Vanna), market makers must buy delta to remain delta-neutral, creating an invisible bid under the market. This structurally supports upward drift.";
+            }} else if (vannaVal < 0 && charmVal < 0) {{
+                sigDesc += "<br><br><span style='color:{RED};font-weight:700;'>BEARISH HEADWIND (Vanna & Charm):</span> Both Vanna and Charm are significantly negative. As time decays and IV drops, market makers must sell delta to remain delta-neutral, creating a persistent drag on the index.";
+            }}
+            
+            var sigCont = document.getElementById('mm-signal-container');
+            sigCont.style.display = 'block';
+            sigCont.style.borderLeftColor = borderColor;
+            
+            var sigTitleEl = document.getElementById('mm-signal-title');
+            sigTitleEl.innerHTML = sigTitle;
+            sigTitleEl.style.color = borderColor;
+            
+            document.getElementById('mm-signal-desc').innerHTML = sigDesc;
+            
+        }}).catch(function(err) {{ console.log('MM Fetch Error:', err); }});
+    }}
+    setInterval(pollGexAndDealer, 15000);
+    pollGexAndDealer();
+
+    // ── /health heartbeat (30s) — keeps timestamp alive even when WS is quiet ──
+    function pollHealth() {{
+        fetch('/health')
+        .then(function(r) {{ return r.ok ? r.json() : null; }})
+        .then(function(d) {{
+            if (!d) return;
+            var timeEl = document.getElementById('time-display');
+            if (!timeEl) return;
+            var wsLive = ws && ws.readyState === WebSocket.OPEN;
+            if (!wsLive) {{
+                var srvTime = d.server_time || '--:--:--';
+                var status  = d.status || 'Polling';
+                timeEl.innerHTML = '&#128339; ' + srvTime + ' &nbsp;|&nbsp; ' + status;
+            }}
+            if (d.spot && d.spot > 0 && !wsLive) {{
+                var spotEl = document.getElementById('spot-display');
+                if (spotEl) spotEl.innerHTML = 'SPOT: ' + Number(d.spot).toLocaleString(undefined, {{minimumFractionDigits: 2}});
+            }}
+        }})
+        .catch(function() {{}});
+    }}
+    setInterval(pollHealth, 30000);
+    pollHealth();
     
     if ('serviceWorker' in navigator) {{
         window.addEventListener('load', function() {{
