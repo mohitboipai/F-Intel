@@ -12,7 +12,8 @@
         "scripts",
         "logs",
         "historical_data",
-        "data"
+        "data",
+        "**/__pyrefly_virtual__/**"
     ],
     "reportMissingModuleSource": "none"
 }

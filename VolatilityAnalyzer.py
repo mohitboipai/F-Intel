@@ -12,7 +12,7 @@ import numpy as np # Math support for arrays
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 if sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8') # type: ignore
 
 from FyersAuth import FyersAuthenticator
 from OptionAnalytics import OptionAnalytics
@@ -79,7 +79,7 @@ def generate_tracked_html(tracked, df_chain):
         
         # Re-price legs
         for leg in t.get('legs', []):
-            live_p = chain_prices.get((leg['type'], leg['strike']), leg['price'])
+            live_p = float(chain_prices.get((leg['type'], leg['strike']), leg.get('price', 0)) or 0)
             mult = 1 if leg['action'] == 'SELL' else -1
             current_val += live_p * mult
         
@@ -1093,7 +1093,7 @@ class VolatilityAnalyzer:
                 if far_exp:
                     fx, fy, fatm = get_curve(far_exp)
                 
-                if nx is None:
+                if nx is None or ny is None or natm is None:
                     print("Waiting for data...")
                     time.sleep(2)
                     continue
@@ -1106,21 +1106,21 @@ class VolatilityAnalyzer:
                 
                 # Far Curve & Convergence
                 nav_msg = ""
-                if fx is not None:
+                if fx is not None and fy is not None and fatm is not None:
                     ax.plot(fx, fy, color='purple', linewidth=2, label=f"Far ({far_exp})")
                     
                     # Convergence Logic
                     # Compare ATM difference
                     spread = fatm - natm
-                    ax.fill_between(nx, ny, np.interp(nx, fx, fy), color='gray', alpha=0.1)
+                    ax.fill_between(nx, ny, np.interp(nx, fx, fy), color='gray', alpha=0.1) # type: ignore
                     
                     nav_msg = f" | Term Spread: {spread:.2f}%"
                     if spread < 0: nav_msg += " (BACKWARDATION)"
                     else: nav_msg += " (CONTANGO)"
                 
                 # Ghost (Near only)
-                if previous_curve_near is not None:
-                     ax.plot(previous_curve_near[0], previous_curve_near[1], color='gray', linestyle='--', alpha=0.5, label='5m Ago')
+                if previous_curve_near is not None and previous_curve_near[0] is not None:
+                     ax.plot(previous_curve_near[0], previous_curve_near[1], color='gray', linestyle='--', alpha=0.5, label='5m Ago') # type: ignore
 
                 ax.axvline(self.spot_price, color='orange', linestyle=':', label='Spot')
                 ax.set_title(f"LIVE VOLATILITY CONVERGENCE | Spot: {self.spot_price}{nav_msg}")
@@ -1280,7 +1280,7 @@ class VolatilityAnalyzer:
             hv_vals = rolling_hv.dropna().values
             if len(hv_vals) > 20:
                 # Autocorrelation at lag-1
-                hv_centered = hv_vals - np.mean(hv_vals)
+                hv_centered = hv_vals - hv_vals.mean() # type: ignore
                 autocorr = np.correlate(hv_centered[:-1], hv_centered[1:], mode='valid')[0]
                 autocorr /= np.correlate(hv_centered[:-1], hv_centered[:-1], mode='valid')[0]
                 
@@ -1385,7 +1385,7 @@ class VolatilityAnalyzer:
                 
                 pcts = [10, 25, 50, 75, 90]
                 for p in pcts:
-                    val = np.percentile(bucket_moves, p)
+                    val = float(np.percentile(list(bucket_moves.values), p)) # type: ignore
                     pts = abs(val / 100 * spot)
                     print(f"  {p:>3}th percentile:  {val:+.2f}%  ({pts:+.0f} pts)")
                 
@@ -1399,10 +1399,10 @@ class VolatilityAnalyzer:
                 print(f"  P(up in 5d):           {prob_up:.0f}%")
                 
                 # Expected range
-                p10 = np.percentile(bucket_moves, 10)
-                p90 = np.percentile(bucket_moves, 90)
+                p10 = float(np.percentile(list(bucket_moves.values), 10)) # type: ignore
+                p90 = float(np.percentile(list(bucket_moves.values), 90)) # type: ignore
                 print(f"\n  Expected 5-Day Range (80% confidence):")
-                print(f"  [{spot * (1 + p10/100):.0f}] ─── [{spot:.0f}] ─── [{spot * (1 + p90/100):.0f}]")
+                print(f"  [{spot * (1 + p10/100):.0f}] ─── [{spot:.0f}] ─── [{spot * (p90/100 + 1):.0f}]")
                 print(f"  ({p10:+.1f}%)          (spot)          ({p90:+.1f}%)")
             else:
                 print(f"Not enough samples in bucket '{current_bucket}'.")
@@ -1463,7 +1463,7 @@ class VolatilityAnalyzer:
             'vrp': round(vrp, 2),
             'spot': round(spot, 2),
             'iv_velocity_5d': round(iv_velocity_5d, 2),
-            'composite_score': round(signal_result['composite'], 1),
+            'composite_score': round(float(signal_result.get('composite', 0)), 1), # type: ignore
             'prev_regime': prev_regime
         }
         
@@ -1858,7 +1858,7 @@ class VolatilityAnalyzer:
                 # ============================================================
                 # 3. HISTORICAL BREACH ANALYSIS (Calculated once outside loop is better, but reusing var is fine)
                 # ============================================================
-                if r.get('s') == 'ok' and total_samples > 0:
+                if total_samples > 0:
                      print(f"  Hist Breach Rate: {breach_pct:.1f}% (EM held {100-breach_pct:.1f}% safe)")
                 
                 # ============================================================
@@ -2022,20 +2022,20 @@ class VolatilityAnalyzer:
                         seller_payload = {
                             'direction':    'NEUTRAL',
                             'action':       f"SELL CE>{safe_ce:.0f} / SELL PE<{safe_pe:.0f}",
-                            'sell_ce_above':round(float(safe_ce), 1),
-                            'sell_pe_below':round(float(safe_pe), 1),
-                            'em':           round(float(em_straddle), 1),
+                            'sell_ce_above':round(float(safe_ce), 1), # type: ignore
+                            'sell_pe_below':round(float(safe_pe), 1), # type: ignore
+                            'em':           round(float(em_straddle), 1), # type: ignore
                             'atm_iv':       round(float(atm_iv if 'atm_iv' in dir() else 0), 2),
                             'call_wall':    float(call_wall),
                             'put_wall':     float(put_wall),
                             'max_pain':     float(max_pain if 'max_pain' in dir() else 0),
                             'oi_pressure':  oi_pressure,
-                            'oi_pressure_score': round(float(oi_pressure_score), 1),
+                            'oi_pressure_score': round(oi_pressure_score, 1),
                         }
                         if self._seller_signal_id is None:
                             self._seller_signal_id = self.memory.log_signal(
                                 'OptionSellerAdvisor', seller_payload,
-                                spot=spot, expiry=exp)
+                                spot=spot, expiry=exp or "")
                         else:
                             self.memory.update_signal(self._seller_signal_id, seller_payload)
                         self.memory.update_context({
@@ -2115,8 +2115,8 @@ class VolatilityAnalyzer:
 
         class _QuietHandler(_handler):
             """Suppress request log spam, and handle POST for backtesting."""
-            def log_message(self, *args): pass
-            def log_request(self, *args): pass
+            def log_message(self, *args): pass # type: ignore
+            def log_request(self, *args): pass # type: ignore
             
             def do_POST(self):
                 if self.path == '/bt_run':
@@ -2166,7 +2166,7 @@ class VolatilityAnalyzer:
         breach_cache = None
         intra_closes = []
         baseline_oi = None
-        heston_cache = {'params': None, 'ts': 0, 'ttl': 300}  # 5-min TTL
+        heston_cache: dict = {'params': None, 'ts': 0, 'ttl': 300}  # 5-min TTL
         prev_oi = None
         oi_time_series = []            # [(timestamp_str, net_ce_chg, net_pe_chg)]
         oi_velocity_history = []       # List of (timestamp, snapshot) for 15-min sliding window
@@ -2361,7 +2361,7 @@ class VolatilityAnalyzer:
             try:
                 hv_vals = rolling_hv.dropna().values
                 if len(hv_vals) > 20:
-                    hv_centered = hv_vals - np.mean(hv_vals)
+                    hv_centered = hv_vals - np.mean(hv_vals) # type: ignore
                     autocorr = np.correlate(hv_centered[:-1], hv_centered[1:], mode='valid')[0]
                     autocorr /= np.correlate(hv_centered[:-1], hv_centered[:-1], mode='valid')[0]
                     if 0 < autocorr < 1:
@@ -2684,18 +2684,18 @@ class VolatilityAnalyzer:
             N_PATHS = 50000
             results = []
             for h in horizons:
-                T = h['days'] / 365.0
+                T = float(h['days']) / 365.0
                 if T <= 0:
                     continue
                 steps = max(10, h['days'] * 2)
-                dt = T / steps
+                dt = T / float(steps)
                 # Vectorized Heston MC
-                Z1 = np.random.normal(size=(N_PATHS, steps))
-                Z3 = np.random.normal(size=(N_PATHS, steps))
+                Z1 = np.random.normal(size=(N_PATHS, int(steps)))
+                Z3 = np.random.normal(size=(N_PATHS, int(steps)))
                 Z2 = rho * Z1 + np.sqrt(1 - rho**2) * Z3
                 S = np.full(N_PATHS, spot)
                 v = np.full(N_PATHS, v0)
-                for t in range(steps):
+                for t in range(int(steps)):
                     v_pos = np.maximum(v, 0)
                     dS = (r - 0.5 * v_pos) * dt + np.sqrt(v_pos) * np.sqrt(dt) * Z1[:, t]
                     S = S * np.exp(dS)
@@ -2713,8 +2713,8 @@ class VolatilityAnalyzer:
                 one_sigma_hi = np.percentile(terminal, 84.13)  # ~+1σ
                 expected_move = (one_sigma_hi - one_sigma_lo) / 2
                 prob_above = (terminal > spot).mean() * 100
-                skewness = float(pd.Series(terminal).skew())
-                kurtosis_val = float(pd.Series(terminal).kurtosis())
+                skewness = float(pd.Series(list(terminal)).skew()) # type: ignore
+                kurtosis_val = float(pd.Series(list(terminal)).kurtosis()) # type: ignore
                 results.append({
                     'label': h['label'], 'days': h['days'], 'color': h['color'],
                     'prices': bin_centers, 'pdf': counts,
@@ -2742,7 +2742,7 @@ class VolatilityAnalyzer:
             ]
             results = []
             for h in horizons:
-                T = h['days'] / 365.0
+                T = float(h['days']) / 365.0
                 if T <= 0:
                     continue
                 sigma_t = sigma_ann * np.sqrt(T)
@@ -2916,7 +2916,7 @@ class VolatilityAnalyzer:
                         buyer_setup = self.buyer_engine.generate_trade_setup(
                             confluence_verdict=verdict_data,
                             spot=spot,
-                            vwap=momentum_vwap,
+                            vwap=float(momentum_vwap) if momentum_vwap else spot,
                             df_chain=df_chain,
                             gex_acceleration=gex_accel,
                             intraday_regime=regime_snapshot.get('regime', {}).get('name', '')
@@ -2963,8 +2963,8 @@ class VolatilityAnalyzer:
                         fig.add_vline(x=spot, line_dash="dash", line_color=YELLOW, line_width=2,
                             annotation_text=f"Spot:{spot:.0f}", annotation_font_color=YELLOW,
                             annotation_position="top right", row=1, col=1)
-                        if pred['expected_move'] > 0:
-                            fig.add_vrect(x0=spot - pred['expected_move'], x1=spot + pred['expected_move'],
+                        if float(pred.get('expected_move', 0)) > 0: # type: ignore
+                            fig.add_vrect(x0=spot - float(pred.get('expected_move', 0)), x1=spot + float(pred.get('expected_move', 0)), # type: ignore
                                 fillcolor="rgba(255,213,79,0.08)", line_width=0, row=1, col=1)
 
                         # 3D surface
@@ -3007,7 +3007,10 @@ class VolatilityAnalyzer:
                         iv_plotly = fig.to_html(include_plotlyjs=False, full_html=False)
 
                         # Prediction panel
-                        dir_color = GREEN if 'BULL' in pred['direction'] else RED if 'BEAR' in pred['direction'] else YELLOW
+                        dir_color = GREEN if 'BULL' in str(pred.get('direction', '')) else RED if 'BEAR' in str(pred.get('direction', '')) else YELLOW
+                        _ts = pred.get('term_spread', 0)
+                        ts_val = float(_ts[0]) if isinstance(_ts, list) else float(_ts) # type: ignore
+                        ts_color = RED if ts_val < -1 else GREEN if ts_val > 1 else WHITE
                         iv_tab_html = f'''
                         {iv_plotly}
                         <div class="card" style="margin-top:10px;">
@@ -3016,7 +3019,7 @@ class VolatilityAnalyzer:
                                 <div class="metric-box"><div class="metric-label">DIRECTION</div><div style="font-size:22px;font-weight:700;color:{dir_color};">{pred['direction']}</div><div class="metric-sub">Confidence: {pred['confidence']:.0%}</div></div>
                                 <div class="metric-box"><div class="metric-label">EXPECTED 1-DAY MOVE</div><div style="font-size:22px;font-weight:700;color:{WHITE};">±{pred['expected_move']:.0f} pts</div><div class="metric-sub">±{pred['expected_move_pct']:.2f}%</div></div>
                                 <div class="metric-box"><div class="metric-label">SKEW RATIO</div><div style="font-size:22px;font-weight:700;color:{WHITE};">{pred['skew_ratio']:.3f}</div><div class="metric-sub">{pred['skew_signal']}</div></div>
-                                <div class="metric-box"><div class="metric-label">TERM SPREAD</div><div style="font-size:22px;font-weight:700;color:{RED if pred['term_spread']<-1 else GREEN if pred['term_spread']>1 else WHITE};">{pred['term_spread']:+.2f}%</div><div class="metric-sub">{pred['term_signal']}</div></div>
+                                <div class="metric-box"><div class="metric-label">TERM SPREAD</div><div style="font-size:22px;font-weight:700;color:{ts_color};">{pred['term_spread']:+.2f}%</div><div class="metric-sub">{pred['term_signal']}</div></div>
                                 <div class="metric-box"><div class="metric-label">ATM IV</div><div style="font-size:22px;font-weight:700;color:{WHITE};">{pred['atm_iv']:.2f}%</div><div class="metric-sub">Put:{pred['put_iv_avg']:.1f}% Call:{pred['call_iv_avg']:.1f}%</div></div>
                             </div>
                         </div>'''
@@ -3341,8 +3344,8 @@ class VolatilityAnalyzer:
                                 _gex_regime_color = GREEN if _net_gex > 0 else RED
                                 _max_call_strike = _df_gex[_df_gex['type']=='CE'].groupby('strike')['oi'].sum().idxmax() if not _df_gex[_df_gex['type']=='CE'].empty else 0
                                 _max_put_strike = _df_gex[_df_gex['type']=='PE'].groupby('strike')['oi'].sum().idxmax() if not _df_gex[_df_gex['type']=='PE'].empty else 0
-                                _dist_call = abs(spot - _max_call_strike) if _max_call_strike else 0
-                                _dist_put = abs(spot - _max_put_strike) if _max_put_strike else 0
+                                _dist_call = abs(spot - float(_max_call_strike)) if _max_call_strike else 0
+                                _dist_put = abs(spot - float(_max_put_strike)) if _max_put_strike else 0
                                 # Find flip strike (where cumulative GEX changes sign)
                                 _cum_gex = _gex_by_strike.sort_values('strike')['gex'].cumsum()
                                 _flip_strike = 0
@@ -3563,8 +3566,8 @@ class VolatilityAnalyzer:
                                 _p_breach_ce = _p_above(_safe_ce) if _safe_ce > 0 else None
                                 _p_breach_pe = _p_below(_safe_pe) if _safe_pe > 0 else None
                                 
-                                _d_high = momentum_data.get('day_high', 0)
-                                _d_low  = momentum_data.get('day_low', 0)
+                                _d_high = float(momentum_data.get('day_high', 0))
+                                _d_low  = float(momentum_data.get('day_low', 0))
                                 _p_breach_high = _p_above(_d_high) if _d_high > 0 else None
                                 _p_breach_low  = _p_below(_d_low)  if _d_low  > 0 else None
 
@@ -3634,12 +3637,12 @@ class VolatilityAnalyzer:
                         _bias_clr   = GREEN if _bias_lbl == 'SELL PREMIUM' else RED if 'AVOID' in _bias_lbl else YELLOW
 
                         # ── Generate strategies ──────────────────────────────────
-                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp)
+                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp or "")
                         _strategies = gen.generate()
 
                         # ── Build per-strategy data: payoff chart + metrics ──────
                         _strat_data  = []   # list of dicts with name/score/html/metrics
-                        _iv_dec = _iv_strat / 100.0
+                        _iv_dec = float(_iv_strat) / 100.0 # type: ignore
                         for _si, _so in enumerate(_strategies[:5]):
                             _pe    = PayoffEngine(_so, spot, _T_strat, _iv_dec,
                                                   call_wall=_cw, put_wall=_pw)
@@ -4132,7 +4135,8 @@ class VolatilityAnalyzer:
                         _bias_clr   = GREEN if _intra_bias == 'SELL-PREMIUM' else RED if 'AVOID' in _intra_bias else YELLOW
 
                         # ── Strategy generation with payoff charts ──
-                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp)
+                        from StrategyEngine import SmartStrategyGenerator, build_strategy_card_html
+                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp or "")
                         _strategies = gen.generate()
 
                         strat_cards_html = ''
@@ -4958,13 +4962,29 @@ class VolatilityAnalyzer:
         default_near = (today + pd.Timedelta(days=days_to_thu)).strftime("%Y-%m-%d")
         default_far = (today + pd.Timedelta(days=days_to_thu + 28)).strftime("%Y-%m-%d")
 
-        print(f"  Format: YYYY-MM-DD (Press Enter to use defaults)")
-        print()
+        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fintel_session.json")
+        near, far, extras = None, None, []
+        if os.path.exists(session_file):
+            for _ in range(5):
+                try:
+                    with open(session_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        near = data.get("near_expiry")
+                        far = data.get("far_expiry")
+                        if near and far:
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
-        near = input(f"  Near Expiry (weekly)  [{default_near}]: ").strip() or default_near
-        far  = input(f"  Far Expiry  (monthly) [{default_far}]: ").strip() or default_far
-        extras_raw = input("  Extra Expiries (optional, comma-sep): ").strip()
-        extras = [x.strip() for x in extras_raw.split(',') if x.strip()] if extras_raw else []
+        if near and far:
+            print(f"  Loaded expiries from fintel_session.json")
+        else:
+            print(f"  Format: YYYY-MM-DD (Press Enter to use defaults)\n")
+            near = input(f"  Near Expiry (weekly)  [{default_near}]: ").strip() or default_near
+            far  = input(f"  Far Expiry  (monthly) [{default_far}]: ").strip() or default_far
+            extras_raw = input("  Extra Expiries (optional, comma-sep): ").strip()
+            extras = [x.strip() for x in extras_raw.split(',') if x.strip()] if extras_raw else []
 
         # Validate dates are future
         for exp_str in [near, far] + extras:

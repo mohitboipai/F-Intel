@@ -25,7 +25,7 @@ import sys
 # Ensure stdout can print Unicode (like ✓) on Windows consoles
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding='utf-8')  # type: ignore
     except AttributeError:
         pass
 import os
@@ -90,7 +90,7 @@ def _bright_yellow(text: str) -> str:
 def _popen(script_name: str) -> subprocess.Popen:
     """Launch a script with piped stdout/stderr, UTF-8, line-buffered."""
     return subprocess.Popen(
-        [str(PYTHON_EXE), script_name],
+        [str(PYTHON_EXE), "-u", script_name],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=str(PROJECT_ROOT),
@@ -117,8 +117,8 @@ def _start_stream_thread(process: subprocess.Popen, source: str,
 # STEP 1 — SPLASH SCREEN
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _step1_splash(session_ts: str) -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+def _step1_splash(session_ts: str):
+    subprocess.run(["cls" if os.name == "nt" else "clear"], shell=True)
 
     banner = (
         "╔═══════════════════════════════════════════════════╗\n"
@@ -234,7 +234,7 @@ def _step3_dataserver(launcher_log) -> subprocess.Popen:
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Module-level mutable container for the discovered tunnel URL
-_TUNNEL_URL_HOLDER: list[str] = [None]
+_TUNNEL_URL_HOLDER: list[str | None] = [None]
 
 
 def _step4_tunnel(launcher_log) -> subprocess.Popen:

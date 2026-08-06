@@ -3,7 +3,7 @@ import sys
 # Ensure stdout can print Unicode (like ✓) on Windows consoles
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding='utf-8')  # type: ignore
     except AttributeError:
         pass
         
@@ -29,7 +29,7 @@ PORT = 8082
 CHAIN_REFRESH_INTERVAL = 60 # Seconds (Option chain rate limits are strict, 1 per min)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # type: ignore
 sock = Sock(app)
 
 class DataHub:
@@ -39,7 +39,7 @@ class DataHub:
         self.latest_data = {
             "spot": 0,
             "chain": {},
-            "last_update": None,
+            "last_update": "",
             "status": "Initializing",
             "tick_count": 0
         }
@@ -177,7 +177,7 @@ class _DataHubCacheAdapter:
 
     # ── T (DTE in years) ───────────────────────────────────────────────
     def set_T(self, T: float):
-        self._T = max(0.0, float(T))
+        self._T = max(0.0, T)
 
     def get_T(self) -> float:
         return self._T
@@ -258,364 +258,12 @@ from flask import request
 _bt_cache = {}          # strategy_type → latest BacktestReport
 _bt_running = {}        # strategy_type → True/False
 
-@app.route('/api/track_strategy', methods=['POST'])
-def api_track_strategy():
-    """Save a strategy to the DB for live tracking."""
-    try:
-        from StrategyManager import StrategyManager
-        data = request.get_json(force=True)
-        mgr  = StrategyManager()
-        sid  = mgr.track_strategy(data, entry_spot=data.get('entry_spot', 0))
-        return jsonify({'ok': True, 'id': sid})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-@app.route('/api/close_strategy', methods=['POST'])
-def api_close_strategy():
-    """Mark a tracked strategy as closed and record P&L."""
-    try:
-        from StrategyManager import StrategyManager
-        data       = request.get_json(force=True)
-        strategy_id = data.get('id')
-        exit_prem  = float(data.get('exit_premium', 0))
-        exit_spot  = float(data.get('exit_spot', 0))
-        mgr  = StrategyManager()
-        pnl  = mgr.close_strategy(strategy_id, exit_prem, exit_spot)
-        return jsonify({'ok': True, 'pnl': pnl})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-@app.route('/api/delete_strategy', methods=['POST'])
-def api_delete_strategy():
-    """Delete a tracked strategy (alias used by the inline strategy tab)."""
-    try:
-        from StrategyManager import StrategyManager
-        data = request.get_json(force=True)
-        sid  = data.get('id')
-        mgr  = StrategyManager()
-        if hasattr(mgr, 'delete_strategy'):
-            mgr.delete_strategy(sid)
-        else:
-            mgr.close_strategy(sid, 0, 0)
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-@app.route('/api/strategy_pnl_at', methods=['GET'])
-def api_strategy_pnl_at():
-    """Return historical P&L HTML for a given intraday time (P&L scrubber)."""
-    try:
-        from StrategyManager import StrategyManager
-        from TickDatabase import IntradayTickDB
-        target_time = request.args.get('time', '')
-        if not target_time:
-            from datetime import datetime as _dt
-            target_time = _dt.now().strftime('%H:%M')
-        tick_db = IntradayTickDB()
-        hist_chain = tick_db.get_chain_at_time('NSE:NIFTY50-INDEX', target_time)
-        mgr = StrategyManager()
-        tracked = mgr.get_all_active_strategies()
-        if not tracked:
-            html = '<div style="color:#666;font-size:12px;text-align:center;padding:20px;">No strategies tracked.</div>'
-        else:
-            rows = []
-            chain_prices = {}
-            if not hist_chain.empty:
-                for _, r in hist_chain.iterrows():
-                    chain_prices[(r['type'], r['strike'])] = r['price']
-            for t in tracked:
-                entry_val = t.get('premium', 0)
-                current_val = sum(
-                    chain_prices.get((lg['type'], lg['strike']), lg['price']) * (1 if lg['action'] == 'SELL' else -1)
-                    for lg in t.get('legs', [])
-                )
-                pnl = entry_val - current_val if t.get('type') == 'CREDIT' else current_val - abs(entry_val)
-                c = '#66bb6a' if pnl > 0 else '#ff4444'
-                rows.append(f'<div style="padding:6px 0;border-bottom:1px solid #333;">'
-                            f'<b style="color:#4fc3f7">{t["name"]}</b> '
-                            f'<span style="color:{c};font-weight:700">P&L: &#8377;{pnl:+.2f}</span></div>')
-            html = ''.join(rows)
-        return html, 200, {'Content-Type': 'text/html'}
-    except Exception as e:
-        return f'<div style="color:#ff4444">Error: {e}</div>', 500, {'Content-Type': 'text/html'}
-
-
-
-@app.route('/api/strategies', methods=['GET'])
-def api_strategies():
-    """Return all active tracked strategies."""
-    try:
-        from StrategyManager import StrategyManager
-        mgr = StrategyManager()
-        active = mgr.get_all_active_strategies()
-        closed = mgr.get_closed_strategies(limit=10)
-        summary = mgr.get_summary()
-        return jsonify({'ok': True, 'active': active, 'closed': closed, 'summary': summary})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-@app.route('/api/backtest', methods=['POST'])
-def api_backtest():
-    """
-    Launch an async backtest. Returns immediately with a job token.
-    Poll /api/backtest_status?type=<strategy_type> for completion.
-    """
-    try:
-        data          = request.get_json(force=True)
-        strategy_type = data.get('strategy_type', 'SHORT_STRADDLE')
-        days          = int(data.get('days', 365))
-        stop_loss     = float(data.get('stop_loss_mult', 2.0))
-        atm_iv        = float(data.get('atm_iv_pct', 14.0))
-        wing_width    = int(data.get('wing_width', 150))
-
-        if _bt_running.get(strategy_type):
-            return jsonify({'ok': True, 'status': 'RUNNING', 'type': strategy_type})
-
-        def _run():
-            from StrategyBacktester import OptionStrategyBacktester
-            from StrategyManager import StrategyManager
-            _bt_running[strategy_type] = True
-            try:
-                bt = OptionStrategyBacktester()
-                report = bt.run(strategy_type, days=days, stop_loss_mult=stop_loss,
-                                atm_iv_pct=atm_iv, wing_width=wing_width)
-                _bt_cache[strategy_type] = report
-                # Persist to DB
-                try:
-                    mgr = StrategyManager()
-                    mgr.save_backtest(strategy_type, report.to_json(), report.stats,
-                                      report.start_date, report.end_date)
-                except Exception:
-                    pass
-            finally:
-                _bt_running[strategy_type] = False
-
-        threading.Thread(target=_run, daemon=True).start()
-        return jsonify({'ok': True, 'status': 'STARTED', 'type': strategy_type})
-
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-@app.route('/api/backtest_status', methods=['GET'])
-def api_backtest_status():
-    """Return cached backtest HTML result for a strategy type."""
-    strategy_type = request.args.get('type', 'SHORT_STRADDLE')
-    if _bt_running.get(strategy_type):
-        return jsonify({'ok': True, 'status': 'RUNNING'})
-    report = _bt_cache.get(strategy_type)
-    if not report:
-        return jsonify({'ok': True, 'status': 'NONE'})
-    return jsonify({
-        'ok': True,
-        'status': 'DONE',
-        'html': report.to_html(),
-        'stats': report.stats,
-    })
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy Wizard API  (Enhancement 3)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.route('/api/wizard', methods=['POST'])
-def api_wizard():
-    """
-    POST /api/wizard
-    View-driven strategy recommendations.
-
-    Body JSON:
-      view       : BULLISH | BEARISH | NEUTRAL | VOLATILE | NON-VOLATILE
-      risk       : CONSERVATIVE | MODERATE | AGGRESSIVE
-      capital    : float (INR)
-      conviction : LOW | MODERATE | HIGH
-    """
-    try:
-        from StrategyWizard import StrategyWizard
-        from StrategyEngine import PayoffEngine, OptionAnalytics as _OA
-        import pandas as pd
-        import numpy as np
-
-        body = request.get_json(force=True) or {}
-        view       = body.get('view', 'NEUTRAL').upper()
-        risk       = body.get('risk', 'MODERATE').upper()
-        capital    = float(body.get('capital', 100000))
-        conviction = body.get('conviction', 'MODERATE').upper()
-
-        # Pull live data from DataHub
-        spot  = hub.latest_data.get('spot', 0.0)
-        chain = hub.latest_data.get('chain', {})
-        if spot <= 0:
-            return jsonify({'ok': False, 'error': 'Spot price not available'}), 503
-
-        # Parse chain to DataFrame
-        df_chain = pd.DataFrame([
-            {
-                'strike': float(o.get('strike_price', 0)),
-                'type':   'CE' if o.get('option_type', '') in ('CE', 'CALL') else 'PE',
-                'price':  float(o.get('ltp', 0) or 0),
-                'iv':     float(o.get('iv', 0) or 0),
-                'oi':     int(o.get('oi', 0) or 0),
-            }
-            for o in chain.get('optionsChain', [])
-        ])
-
-        # Derive context scalars from chain
-        atm_iv = 15.0
-        skew_ratio = 1.0
-        T = hub_cache.get_T()
-        if not df_chain.empty:
-            dist = abs(df_chain['strike'] - spot)
-            atm_row = df_chain.loc[dist.idxmin()]
-            atm_iv  = float(atm_row.get('iv', 15.0) or 15.0)
-            # Skew ratio: median put IV / ATM IV
-            pe_ivs = df_chain[df_chain['type'] == 'PE']['iv'].replace(0, np.nan).dropna()
-            skew_ratio = float(pe_ivs.median() / atm_iv) if atm_iv > 0 and not pe_ivs.empty else 1.0
-
-        expiry = chain.get('expiry', '')
-        if not expiry:
-            # Guess near expiry from chain row data
-            for o in chain.get('optionsChain', []):
-                e = o.get('expiry', '')
-                if e:
-                    expiry = e
-                    break
-
-        market_context = {
-            'T':              T,
-            'iv':             atm_iv,
-            'atm_iv':         atm_iv,
-            'vrp':            0.0,
-            'regime':         'COMPRESSION',
-            'call_wall':      0,
-            'put_wall':       0,
-            'em':             spot * (atm_iv / 100) * np.sqrt(T),
-            'oi_pressure':    'NEUTRAL',
-            'DTE':            max(1, int(T * 365)),
-            'skew_ratio':     skew_ratio,
-            'explosion_score': 0,
-            'term_spread':    0,
-            'heston_params':  hub_cache.get_heston_params(),
-        }
-
-        wizard = StrategyWizard(spot, df_chain, market_context, expiry)
-        recs   = wizard.recommend(view, risk, capital, conviction)
-
-        results = []
-        for rec in recs:
-            strat = rec['strategy']
-            d     = strat.to_dict()
-
-            # POP
-            sigma = atm_iv / 100.0
-            pop   = strat.pop(spot, T, sigma) * 100
-
-            # Risk dials
-            engine     = PayoffEngine(strat, spot, T, sigma)
-            risk_dials = engine.build_risk_dial_data()
-
-            results.append({
-                'name':          strat.name,
-                'score':         rec['score'],
-                'view_match':    rec['view_match'],
-                'max_loss_inr':  round(rec['max_loss_inr'], 0),
-                'lots_possible': rec['lots_possible'],
-                'reasoning':     rec['reasoning'],
-                'legs':          d['legs'],
-                'net_premium':   round(strat.net_premium, 2),
-                'pop':           round(pop, 1),
-                'risk_dials':    risk_dials,
-            })
-
-        return jsonify({'ok': True, 'strategies': results})
-
-    except Exception as e:
-        import traceback
-        return jsonify({'ok': False, 'error': str(e),
-                        'trace': traceback.format_exc()}), 500
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Scenario Engine API  (Enhancement 3B)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.route('/api/scenario', methods=['POST'])
-def api_scenario():
-    """
-    POST /api/scenario
-    Compute P&L scenario grid and spot ladder for a given strategy.
-
-    Body JSON:
-      strategy        : dict as returned by /api/wizard (legs, net_premium, etc.)
-      spot_range_pct  : int (default 10 → ±10%)
-      n_spot          : int (default 21)
-    """
-    try:
-        from ScenarioEngine import ScenarioEngine
-        from StrategyEngine import OptionLeg, Strategy
-        import numpy as np
-
-        body         = request.get_json(force=True) or {}
-        strat_dict   = body.get('strategy', {})
-        range_pct    = float(body.get('spot_range_pct', 10)) / 100.0
-        n_spot       = int(body.get('n_spot', 21))
-
-        # Reconstruct Strategy from JSON legs
-        legs_raw = strat_dict.get('legs', [])
-        if not legs_raw:
-            return jsonify({'ok': False, 'error': 'No legs provided'}), 400
-
-        legs = []
-        for lg in legs_raw:
-            iv_raw = lg.get('iv', 15.0)
-            iv_dec = (iv_raw / 100.0) if iv_raw > 1 else float(iv_raw)
-            legs.append(OptionLeg(
-                opt_type    = lg.get('type', 'CE'),
-                action      = lg.get('action', 'SELL'),
-                strike      = float(lg.get('strike', 0)),
-                entry_price = float(lg.get('price', 0)),
-                iv          = iv_dec,
-                lots        = int(lg.get('lots', 1)),
-                expiry      = lg.get('expiry', ''),
-            ))
-        strat_type = strat_dict.get('type', 'CREDIT')
-        strat_name = strat_dict.get('name', 'Custom')
-        strategy   = Strategy(strat_name, legs, strat_type)
-
-        # Market state
-        spot  = hub.latest_data.get('spot', 0.0)
-        T     = hub_cache.get_T()
-        sigma = float(strat_dict.get('net_premium', 0)) / max(spot, 1) if spot > 0 else 0.15
-        # Use ATM IV from chain as sigma if available
-        chain = hub.latest_data.get('chain', {})
-        if chain.get('optionsChain'):
-            import pandas as pd
-            df_c = pd.DataFrame(chain.get('optionsChain', []))
-            if not df_c.empty and 'iv' in df_c.columns and 'strike_price' in df_c.columns:
-                df_c['dist'] = abs(df_c['strike_price'].astype(float) - spot)
-                atm_iv = float(df_c.loc[df_c['dist'].idxmin(), 'iv'] or 15.0)
-                sigma  = atm_iv / 100.0
-
-        engine = ScenarioEngine(strategy, spot, T, max(0.01, sigma))
-        grid   = engine.compute_grid(spot_pct_range=(-range_pct, range_pct),
-                                     n_spot=n_spot)
-        ladder = engine.spot_ladder(spot_pct_range=(-range_pct, range_pct),
-                                    n=n_spot)
-
-        return jsonify({'ok': True, 'grid': grid, 'ladder': ladder})
-
-    except Exception as e:
-        import traceback
-        return jsonify({'ok': False, 'error': str(e),
-                        'trace': traceback.format_exc()}), 500
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # GEX / Signals / Regime / Dealer API
 # ─────────────────────────────────────────────────────────────────────────────
 
 _gex_snapshot: dict = {
     "score": 0, "regime": "UNKNOWN", "net_gex": 0,
-    "strikes": [], "direction": "NEUTRAL", "last_update": None,
+    "strikes": [], "direction": "NEUTRAL", "last_update": "",
     # New fields from calculations/GexEngine
     "zero_gamma_level": 0, "dealer_long_pct": 0, "dealer_short_pct": 0,
     "spot_gamma": 0, "forward_gex": 0,
@@ -626,7 +274,7 @@ _gex_lock = threading.Lock()
 _dealer_snapshot: dict = {
     "net_dex": 0, "net_gex_shares": 0, "net_vanna": 0, "net_charm": 0,
     "hedge_spot_up": 0, "hedge_iv_up": 0, "hedge_1day": 0,
-    "strike_dex": [], "strike_gex": [], "last_update": None,
+    "strike_dex": [], "strike_gex": [], "last_update": "",
 }
 _dealer_lock = threading.Lock()
 
@@ -640,11 +288,11 @@ def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
     return pd.DataFrame([{
         "strike": float(r.get("strike_price", 0)),
         "type":   r.get("option_type", "CE"),
-        "oi":     float(r.get("oi", 0) or 0),
-        "volume": float(r.get("volume", 0) or 0),
-        "iv":     float(r.get("iv", 0) or 0),
-        "price":  float(r.get("ltp", 0) or 0),
-        "dte":    float(r.get("dte", 1) or 1),
+        "oi":     float(r.get("oi", 0) or 0),  # type: ignore
+        "volume": float(r.get("volume", 0) or 0),  # type: ignore
+        "iv":     float(r.get("iv", 0) or 0),  # type: ignore
+        "price":  float(r.get("ltp", 0) or 0),  # type: ignore
+        "dte":    float(r.get("dte", 1) or 1),  # type: ignore
     } for r in rows])
 
 
@@ -687,7 +335,7 @@ def _gex_refresh_loop(interval: int = 60):
                         gm.spot_price = spot
                         gm_df = gm.parse_chain(chain) if hasattr(gm, "parse_chain") else pd.DataFrame()
                         if not gm_df.empty:
-                            gm_res = gm.run_analysis(gm_df)
+                            gm_res = gm.run_analysis(gm_df)  # type: ignore
                             regime = gm_res.get("regime", regime)
                             score  = gm_res.get("composite_score", score)
                     except Exception:
@@ -820,7 +468,10 @@ def api_regime():
             if not df_c.empty and "iv" in df_c.columns and "strike_price" in df_c.columns:
                 df_c["dist"] = abs(df_c["strike_price"].astype(float) - spot)
                 row = df_c.loc[df_c["dist"].idxmin()]
-                atm_iv = float(row.get("iv", 0) or 0)
+                iv_val = row.get("iv", 0)
+                if isinstance(iv_val, pd.Series):
+                    iv_val = iv_val.iloc[0]
+                atm_iv = float(iv_val or 0)
 
         # ── RV estimates from SignalMemory context ─────────────────────
         rv_5d = rv_20d = vrp = 0.0
@@ -870,62 +521,6 @@ def api_regime():
 # /bt_run  →  triggers async backtest (same logic as /api/backtest)
 # /bt_<type>.html  →  polls and serves the HTML result
 # ─────────────────────────────────────────────────────────────────────────────
-
-@app.route('/bt_run', methods=['POST'])
-def bt_run():
-    """Legacy backtest trigger used by unified_dashboard.html."""
-    try:
-        data          = request.get_json(force=True) or {}
-        strategy_type = data.get('type', 'SHORT_STRADDLE').upper()
-        days          = int(data.get('days', 365))
-        stop_loss     = float(data.get('sl', 2.0))
-
-        if _bt_running.get(strategy_type):
-            return 'RUNNING', 200
-
-        def _run():
-            from StrategyBacktester import OptionStrategyBacktester
-            _bt_running[strategy_type] = True
-            try:
-                bt     = OptionStrategyBacktester()
-                report = bt.run(strategy_type, days=days, stop_loss_mult=stop_loss)
-                _bt_cache[strategy_type] = report
-                # Also persist static HTML file so /bt_<type>.html can serve it
-                html_path = f'bt_{strategy_type}.html'
-                with open(html_path, 'w', encoding='utf-8') as _f:
-                    _f.write(report.to_html())
-            except Exception as _e:
-                print(f'[bt_run] backtest error: {_e}')
-            finally:
-                _bt_running[strategy_type] = False
-
-        threading.Thread(target=_run, daemon=True).start()
-        return 'STARTED', 200
-    except Exception as e:
-        return str(e), 500
-
-
-@app.route('/bt_<path:fname>.html', methods=['GET'])
-def bt_serve_html(fname):
-    """Legacy backtest result poller: serves the pre-rendered HTML file."""
-    import os
-    strategy_type = fname.upper()
-    # If a cached report exists in memory, serve that
-    report = _bt_cache.get(strategy_type)
-    if report:
-        try:
-            return report.to_html(), 200, {'Content-Type': 'text/html; charset=utf-8'}
-        except Exception:
-            pass
-    # Otherwise try the static file on disk
-    html_path = f'bt_{strategy_type}.html'
-    if os.path.exists(html_path):
-        return send_file(html_path)
-    # Still running or not started yet
-    if _bt_running.get(strategy_type):
-        return '', 202   # 202 = not ready, dashboard keeps polling
-    return '', 404
-
 
 @app.route('/health', methods=['GET'])
 def health():

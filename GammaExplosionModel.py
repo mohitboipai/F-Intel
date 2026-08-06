@@ -92,6 +92,7 @@ class GammaExplosionModel:
             dt = datetime.strptime(self.expiry_date, "%Y-%m-%d")
             ts = int(dt.timestamp())
         except Exception:
+            dt = None
             ts = ""
 
         try:
@@ -111,8 +112,7 @@ class GammaExplosionModel:
                 for item in r['data']['expiryData']:
                     try:
                         a_date = datetime.strptime(item['date'], "%d-%m-%Y").date()
-                        u_date = dt.date()
-                        if a_date == u_date:
+                        if dt and a_date == dt.date():
                             ts = item['expiry']
                             r = self.fyers.optionchain(data={
                                 "symbol": self.symbol, "strikecount": 500, "timestamp": ts
@@ -216,7 +216,7 @@ class GammaExplosionModel:
             profile[strike] = gex
 
         if not profile:
-            return {}, 0, 0, 0
+            return {}, 0, 0, 0, 0
 
         net_gex = sum(profile.values())
         total_abs = sum(abs(v) for v in profile.values()) or 1
@@ -281,7 +281,7 @@ class GammaExplosionModel:
 
         for key, cur_oi in current_snap.items():
             prev_oi = self._prev_oi_snapshot.get(key, cur_oi)
-            if prev_oi > 0:
+            if prev_oi is not None and prev_oi > 0:
                 pct = (cur_oi - prev_oi) / prev_oi * 100
                 surges[key] = pct
                 if '_CE' in key:
