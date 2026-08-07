@@ -13,6 +13,7 @@ Usage:
 
 import sys
 import os
+import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -31,6 +32,9 @@ class KeyLevelsEngine:
         self.expiry_date = None
         self.chain_df = None
         
+        self._walls_cache = None
+        self._walls_cache_time = 0.0
+        
     def _authenticate(self):
         print("Authenticating with Fyers...")
         try:
@@ -45,6 +49,8 @@ class KeyLevelsEngine:
     
     def get_spot_price(self):
         try:
+            if self.fyers is None:
+                return 0
             r = self.fyers.quotes({"symbols": self.symbol})
             if r.get('s') == 'ok':
                 self.spot_price = r['d'][0]['v']['lp']
@@ -56,6 +62,8 @@ class KeyLevelsEngine:
     def get_option_chain(self, expiry_ts=""):
         """Fetch option chain from Fyers API"""
         try:
+            if self.fyers is None:
+                return {}
             data = {"symbol": self.symbol, "strikecount": 500, "timestamp": expiry_ts}
             r = self.fyers.optionchain(data=data)
             # print(f"Debug: Option Chain Response: {r.get('s')}") # Too verbose to print whole thing
@@ -170,6 +178,10 @@ class KeyLevelsEngine:
         Put Wall (Support): Highest OI Put strike BELOW spot (within range)
         Returns top-2 walls for each side.
         """
+        now = time.time()
+        if self._walls_cache is not None and (now - self._walls_cache_time) < 60:
+            return self._walls_cache
+
         if df.empty:
             return {'call_wall': 0, 'put_wall': 0, 'call_wall_2': 0, 'put_wall_2': 0}
 
@@ -205,36 +217,20 @@ class KeyLevelsEngine:
             put_wall   = int(top_puts.index[0]) if len(top_puts) >= 1 else 0
             put_wall_2 = int(top_puts.index[1]) if len(top_puts) >= 2 else 0
 
-        return {
+        self._walls_cache = {
             'call_wall':   call_wall,
             'call_wall_2': call_wall_2,
             'put_wall':    put_wall,
             'put_wall_2':  put_wall_2,
         }
+        self._walls_cache_time = now
+        
+        return self._walls_cache
     
     def calculate_net_gex(self, df, spot):
         """
         Net Gamma Exposure (GEX)
-        
-        Dealer Position Assumption:
-        - Dealers are NET SHORT options (customers buy, dealers sell)
-        - Short Call = Negative Gamma (dealer accelerates losses on up-move)
-        - Short Put = Negative Gamma (dealer accelerates losses on down-move)
-        
-        WAIT - This is where the confusion happens. Let me clarify:
-        
-        Gamma is ALWAYS positive for both calls and puts.
-        
-        Dealer GEX Sign:
-        - If dealers are SHORT Calls: They have NEGATIVE Gamma exposure
-        - If dealers are SHORT Puts: They have POSITIVE Gamma exposure
-          (Because short put = long stock as price goes down, which is stabilizing)
-        
-        Standard SpotGamma Convention:
-          GEX = Sum[ (Call Gamma * Call OI) - (Put Gamma * Put OI) ] * Spot * 100
-        
-        If GEX > 0: Dealers need to SELL when price rises, BUY when price falls (Stabilizing)
-        If GEX < 0: Dealers need to BUY when price rises, SELL when price falls (Destabilizing)
+        Calculated using unified GEXEngine.
         """
         if df.empty:
             return 0
@@ -244,29 +240,13 @@ class KeyLevelsEngine:
             T = self.analytics.get_time_to_expiry(self.expiry_date)
             if T < 0.001: T = 0.001
         
-        net_gex = 0
-        
-        for _, row in df.iterrows():
-            strike = row['strike']
-            oi = row['oi']
-            o_type = row['type']
-            iv = row['iv'] / 100 if row['iv'] > 1 else row['iv']
-            if iv < 0.01: iv = 0.15
-            
-            # Calculate gamma using BSM
-            greeks = self.analytics.calculate_greeks(spot, strike, T, 0.10, iv, o_type)
-            gamma = greeks.get('gamma', 0)
-            
-            # GEX contribution (per SpotGamma convention)
-            # Multiply by spot to get dollar gamma, by 100 for contract size
-            contribution = gamma * oi * spot * 100
-            
-            if o_type == 'CE':
-                net_gex += contribution  # Calls add to GEX
-            else:
-                net_gex -= contribution  # Puts subtract from GEX
-        
-        return net_gex
+        try:
+            from GEXEngine import GEXEngine
+            res = GEXEngine.compute_gex(df, spot, T, lot_size=75) # NIFTY lot size
+            return res['net_gex']
+        except Exception as e:
+            print(f"Error computing GEX: {e}")
+            return 0
     
     def get_gamma_regime(self, gex):
         """Interpret Net GEX into regime"""

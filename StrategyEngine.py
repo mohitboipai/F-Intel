@@ -48,14 +48,37 @@ def _d1d2(S, K, T, r, sigma):
 
 
 def bsm_price(S, K, T, r, sigma, opt_type='CE'):
-    if T <= 0:
-        if opt_type == 'CE':
-            return max(0.0, S - K)
-        return max(0.0, K - S)
+    """Black-Scholes-Merton option price."""
+    if T <= 0 or sigma <= 0:
+        return max(0, S - K) if opt_type == 'CE' else max(0, K - S)
     d1, d2 = _d1d2(S, K, T, r, sigma)
     if opt_type == 'CE':
         return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+def bsm_implied_volatility(price, S, K, T, r, opt_type='CE', max_iter=100, tol=1e-5):
+    """Calculate implied volatility using Newton-Raphson method."""
+    if price <= 0 or T <= 0:
+        return 0.0
+    
+    # Check intrinsic value violations (arbitrage)
+    intrinsic = max(0, S - K) if opt_type == 'CE' else max(0, K - S)
+    if price < intrinsic:
+        return 0.0
+        
+    sigma = 0.5 # initial guess
+    for _ in range(max_iter):
+        p = bsm_price(S, K, T, r, sigma, opt_type)
+        vega = S * norm.pdf(_d1d2(S, K, T, r, sigma)[0]) * np.sqrt(T)
+        if vega == 0.0:
+            break
+        diff = price - p
+        if abs(diff) < tol:
+            return sigma
+        sigma += diff / vega
+        
+    return max(0.0, sigma)
 
 
 def bsm_greeks(S, K, T, r, sigma, opt_type='CE'):
@@ -207,10 +230,23 @@ class Strategy:
 
     def max_profit(self, spot_range: np.ndarray) -> float:
         pnl = self.payoff_at_expiry(spot_range)
+        
+        # Check for unbounded profit on upside
+        slope_up = pnl[-1] - pnl[-2]
+        if slope_up > 0.01:
+            return float('inf')
+            
+        # Check for unbounded profit on downside (if it goes to 0 it's technically bounded by 0, but usually we don't call it 'Unlimited' on downside because stock can't go below 0. We'll return max.)
         return float(np.max(pnl))
 
     def max_loss(self, spot_range: np.ndarray) -> float:
         pnl = self.payoff_at_expiry(spot_range)
+        
+        # Check for unbounded loss on upside
+        slope_up = pnl[-1] - pnl[-2]
+        if slope_up < -0.01:
+            return float('-inf')
+            
         return float(np.min(pnl))
 
     def pop(self, spot: float, T: float, sigma: float,

@@ -44,6 +44,8 @@ class AdvancedVolatilityScanner:
 
     def get_spot_price(self):
         try:
+            if self.fyers is None:
+                return 0
             r = self.fyers.quotes(data={"symbols": self.symbol})
             if r.get('s') == 'ok':
                 self.spot_price = r['d'][0]['v'].get('lp', 0)
@@ -67,6 +69,8 @@ class AdvancedVolatilityScanner:
         }
         
         try:
+            if self.fyers is None:
+                return pd.DataFrame()
             r = self.fyers.history(data=data)
             if r.get('s') == 'ok':
                 candles = r.get('candles', [])
@@ -104,8 +108,8 @@ class AdvancedVolatilityScanner:
         hv_close = hv_close_series.loc[common]
         hv_park = hv_park_series.loc[common]
         
-        current_hv_close = hv_close.iloc[-1]
-        current_hv_park = hv_park.iloc[-1]
+        current_hv_close = float(hv_close.iloc[-1])
+        current_hv_park = float(hv_park.iloc[-1])
         
         # 2. Efficiency Ratio (VER)
         # Trend Efficiency: High/Low range vs Close-Close change.
@@ -150,7 +154,7 @@ class AdvancedVolatilityScanner:
         if not regime_data:
             return {'signal': 'INSUFFICIENT DATA'}
 
-        hv = regime_data['hv_close']
+        hv = float(regime_data.get('hv_close', 0.0))
         vrp_raw = atm_iv - hv
         vrp_ratio = atm_iv / hv if hv > 0 else 1.0
         
@@ -167,7 +171,7 @@ class AdvancedVolatilityScanner:
             confidence = 0.8
         
         # Refine with Efficiency Ratio
-        ver = regime_data['efficiency_ratio']
+        ver = float(regime_data.get('efficiency_ratio', 1.0))
         if "SELL" in signal:
             # Selling is better if market is Mean Reverting (High VER)
             if ver > 1.1: confidence += 0.1
@@ -219,12 +223,13 @@ class AdvancedVolatilityScanner:
         
         # Fit Cubic Spline
         try:
-            CubicSpline = None
+            from scipy.interpolate import CubicSpline
             cs = CubicSpline(s_sorted, iv_sorted)
-            model_ivs = cs(s_sorted)
-        except Exception as e:
-            print(f"Spline Error: {e}")
+        except ImportError:
+            print("scipy not installed. Skipping kink detection.")
             return []
+            
+        model_ivs = cs(s_sorted)
             
         kinks = []
         threshold = 1.5 # 1.5% IV deviation threshold

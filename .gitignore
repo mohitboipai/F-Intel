@@ -58,3 +58,8 @@ check_fragment.py
 quick_check.log
 diagnose.py
 calculations/__init__.py
+
+# Builder App Data
+portfolio.json
+wizard_history.json
+strategy_builder.html

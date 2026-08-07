@@ -103,18 +103,17 @@ class DataHub:
         while not self._stop_event.is_set():
             try:
                 if self.fyers:
-                    # REST Fallback for Spot Price if WebSocket is silent
-                    if self.latest_data["spot"] == 0:
-                        try:
-                            q_res = self.fyers.quotes({"symbols": SYMBOL})
-                            if q_res and q_res.get('s') == 'ok' and q_res.get('d'):
-                                lp = q_res['d'][0]['v']['lp']
-                                with self.lock:
-                                    self.latest_data["spot"] = lp
-                                    self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
-                                self.broadcast({"type": "tick", "spot": lp, "time": self.latest_data["last_update"]})
-                        except Exception as e:
-                            print(f"DataHub: Spot Fallback Error: {e}")
+                    # REST Fallback for Spot Price if WebSocket is silent or as a backup
+                    try:
+                        q_res = self.fyers.quotes({"symbols": SYMBOL})
+                        if q_res and q_res.get('s') == 'ok' and q_res.get('d'):
+                            lp = q_res['d'][0]['v']['lp']
+                            with self.lock:
+                                self.latest_data["spot"] = lp
+                                self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+                            self.broadcast({"type": "tick", "spot": lp, "time": self.latest_data["last_update"]})
+                    except Exception as e:
+                        print(f"DataHub: Spot Fallback Error: {e}")
 
                     c_res = self.fyers.optionchain({"symbol": SYMBOL, "strikecount": 50})
                     if c_res and c_res.get('s') == 'ok':
@@ -258,6 +257,381 @@ from flask import request
 _bt_cache = {}          # strategy_type → latest BacktestReport
 _bt_running = {}        # strategy_type → True/False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy Wizard API  (Enhancement 3A)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SENSIBULL BUILDER API (Enhancement 4)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/api/chain/live', methods=['GET'])
+def api_chain_live():
+    """
+    Returns the live option chain enriched with BSM Greeks.
+    """
+    try:
+        from StrategyEngine import bsm_greeks, bsm_implied_volatility
+        
+        spot = hub.latest_data.get('spot', 0.0)
+        chain_raw = hub.latest_data.get('chain', {})
+        options = chain_raw.get('optionsChain', [])
+        T = hub_cache.get_T()
+
+        enriched_options = []
+        for o in options:
+            strike = float(o.get('strike_price', 0))
+            opt_type = 'CE' if o.get('option_type', '') in ('CE', 'CALL') else 'PE'
+            ltp = float(o.get('ltp', 0) or 0)
+            iv = float(o.get('iv', 0) or 0)
+            oi = int(o.get('oi', 0) or 0)
+            
+            if iv == 0 and ltp > 0 and spot > 0:
+                iv = bsm_implied_volatility(ltp, spot, strike, T, 0.07, opt_type) * 100.0
+
+            # Calculate Greeks if IV > 0
+            greeks = {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
+            if iv > 0 and spot > 0:
+                greeks = bsm_greeks(spot, strike, T, 0.07, iv/100.0, opt_type)
+                
+            enriched_options.append({
+                'strike': strike,
+                'type': opt_type,
+                'ltp': ltp,
+                'iv': iv,
+                'oi': oi,
+                'greeks': greeks
+            })
+
+        return jsonify({
+            'ok': True,
+            'spot': spot,
+            'T': T,
+            'expiry': chain_raw.get('expiry', 'Current'),
+            'options': enriched_options
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/api/builder/analyze', methods=['POST'])
+def api_builder_analyze():
+    """
+    Analyzes an arbitrary basket of option legs.
+    Returns: Payload for chart (T+0, Expiry), Greeks, Summary Stats.
+    """
+    try:
+        from StrategyEngine import OptionLeg, Strategy
+        import numpy as np
+
+        body = request.get_json(force=True) or {}
+        legs_raw = body.get('legs', [])
+        target_date_offset = float(body.get('target_date_offset', 0)) # days from now
+        target_spot_offset = float(body.get('target_spot_offset', 0)) # percent (e.g. 2 for +2%)
+        
+        spot = hub.latest_data.get('spot', 0.0)
+        T_now = hub_cache.get_T()
+        
+        if spot <= 0:
+            return jsonify({'ok': False, 'error': 'Spot not available'}), 503
+
+        # Parse Legs
+        legs = []
+        for lg in legs_raw:
+            iv_raw = lg.get('iv', 15.0)
+            # No IV bump anymore, just use actual IV
+            adjusted_iv = max(0.01, iv_raw) / 100.0
+            
+            legs.append(OptionLeg(
+                opt_type    = lg.get('type', 'CE'),
+                action      = lg.get('action', 'SELL'),
+                strike      = float(lg.get('strike', 0)),
+                entry_price = float(lg.get('price', 0)),
+                iv          = adjusted_iv,
+                lots        = int(lg.get('lots', 1)),
+                expiry      = lg.get('expiry', ''),
+            ))
+            
+        strategy = Strategy("Custom Builder", legs, "CUSTOM")
+        
+        if not legs:
+            return jsonify({'ok': True, 'empty': True})
+
+        # Base Analysis
+        T_target = max(0.0, T_now - (target_date_offset / 365.0))
+        
+        # Spot Range (±10%) around the targeted offset
+        grid_center = spot * (1 + target_spot_offset / 100.0)
+        range_pct = 0.10
+        spot_range = np.linspace(grid_center * (1 - range_pct), grid_center * (1 + range_pct), 50)
+        
+        # Payoffs
+        pnl_expiry = strategy.payoff_at_expiry(spot_range)
+        pnl_target = strategy.payoff_now_bsm(spot_range, T=T_target)
+        
+        # Stats
+        max_profit = strategy.max_profit(spot_range)
+        max_loss = strategy.max_loss(spot_range)
+        breakevens = strategy.breakevens(spot_range)
+        
+        # Target Stats
+        projected_pnl = float(strategy.payoff_now_bsm(np.array([grid_center]), T=T_target)[0])
+        
+        # Calculate target breakevens (roots of pnl_target)
+        target_breakevens = []
+        for i in range(len(spot_range) - 1):
+            if pnl_target[i] * pnl_target[i+1] < 0:
+                # Linear interpolation
+                x0, y0 = spot_range[i], pnl_target[i]
+                x1, y1 = spot_range[i+1], pnl_target[i+1]
+                be = x0 - y0 * (x1 - x0) / (y1 - y0)
+                target_breakevens.append(float(be))
+        
+        # Find ATM IV for POP
+        atm_iv = 15.0
+        if legs:
+            atm_iv = sum(l.iv for l in legs) / len(legs)
+            
+        pop = strategy.pop(spot, T_now, atm_iv) * 100
+        net_premium = strategy.net_premium_lots
+        
+        # Serialize infinities to strings to prevent JS JSON.parse errors
+        import math
+        if math.isinf(max_profit): max_profit = "Infinity" if max_profit > 0 else "-Infinity"
+        if math.isinf(max_loss): max_loss = "Infinity" if max_loss > 0 else "-Infinity"
+        
+        # Greeks
+        net_greeks = strategy.net_greeks(spot, T_target)
+
+        return jsonify({
+            'ok': True,
+            'atm_iv': atm_iv,
+            'summary': {
+                'max_profit': max_profit,
+                'max_loss': max_loss,
+                'breakevens': breakevens,
+                'target_breakevens': target_breakevens,
+                'projected_pnl': projected_pnl,
+                'pop': pop,
+                'net_premium': net_premium
+            },
+            'greeks': net_greeks,
+            'chart': {
+                'spot_prices': spot_range.tolist(),
+                'pnl_expiry': pnl_expiry.tolist(),
+                'pnl_target': pnl_target.tolist(),
+                'T_target': T_target
+            }
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/api/wizard', methods=['POST'])
+def api_wizard():
+    """
+    POST /api/wizard
+    """
+    try:
+        from StrategyWizard import StrategyWizard
+        from StrategyEngine import OptionLeg, Strategy, PayoffEngine
+        from WizardHistoryManager import WizardHistoryManager
+        history_mgr = WizardHistoryManager()
+        import numpy as np
+        
+        body = request.get_json(force=True) or {}
+        view       = body.get('view', 'NEUTRAL').upper()
+        risk       = body.get('risk', 'MODERATE').upper()
+        capital    = float(body.get('capital', 100000))
+        conviction = body.get('conviction', 'MODERATE').upper()
+
+        spot  = hub.latest_data.get('spot', 0.0)
+        chain = hub.latest_data.get('chain', {})
+        if spot <= 0:
+            return jsonify({'ok': False, 'error': 'Spot price not available'}), 503
+
+        import pandas as pd
+        df_chain = pd.DataFrame([
+            {
+                'strike': float(o.get('strike_price', 0)),
+                'type':   'CE' if o.get('option_type', '') in ('CE', 'CALL') else 'PE',
+                'price':  float(o.get('ltp', 0) or 0),
+                'iv':     float(o.get('iv', 0) or 0),
+                'oi':     int(o.get('oi', 0) or 0),
+            }
+            for o in chain.get('optionsChain', [])
+        ])
+
+        atm_iv = 15.0
+        skew_ratio = 1.0
+        T = hub_cache.get_T()
+        if not df_chain.empty:
+            dist = abs(df_chain['strike'] - spot)
+            atm_row = df_chain.loc[dist.idxmin()]
+            atm_val = atm_row.get('iv')
+            if hasattr(atm_val, 'iloc'): atm_val = atm_val.iloc[0]
+            atm_iv  = float(str(atm_val)) if atm_val is not None else 15.0
+            pe_ivs = df_chain[df_chain['type'] == 'PE']['iv'].replace(0, np.nan).dropna()
+            skew_ratio = (pe_ivs.median() / atm_iv) if atm_iv > 0 and not pe_ivs.empty else 1.0
+
+        expiry = chain.get('expiry', '')
+        if not expiry:
+            for o in chain.get('optionsChain', []):
+                e = o.get('expiry', '')
+                if e:
+                    expiry = e
+                    break
+        
+        from KeyLevelsEngine import KeyLevelsEngine
+        kle = KeyLevelsEngine()
+        walls = kle.calculate_oi_walls(df_chain, spot)
+        
+        gex_snap = _gex_snapshot
+        oi_bias = gex_snap.get('oi_surge', {}).get('bias', 0.0)
+        if oi_bias > 0.1:
+            oi_pressure = 'BULLISH'
+        elif oi_bias < -0.1:
+            oi_pressure = 'BEARISH'
+        else:
+            oi_pressure = 'NEUTRAL'
+            
+        term_spread = 0.0 # TODO: compute from front vs next-expiry ATM IV
+
+        market_context = {
+            'T':              T,
+            'iv':             atm_iv,
+            'atm_iv':         atm_iv,
+            'vrp':            0.0,
+            'regime':         gex_snap.get('regime', 'COMPRESSION'),
+            'call_wall':      walls.get('call_wall', 0),
+            'put_wall':       walls.get('put_wall', 0),
+            'em':             spot * (atm_iv / 100) * np.sqrt(T),
+            'oi_pressure':    oi_pressure,
+            'DTE':            max(1, int(T * 365)),
+            'skew_ratio':     skew_ratio,
+            'explosion_score': gex_snap.get('score', 0),
+            'term_spread':    term_spread,
+            'heston_params':  hub_cache.get_heston_params(),
+        }
+
+        wizard = StrategyWizard(spot, df_chain, market_context, expiry)
+        recs   = wizard.recommend(view, risk, capital, conviction)
+
+        results = []
+        for rec in recs:
+            strat = rec['strategy']
+            d     = strat.to_dict()
+
+            sigma = atm_iv / 100.0
+            pop   = strat.pop(spot, T, sigma) * 100
+
+            engine     = PayoffEngine(strat, spot, T, sigma)
+            risk_dials = engine.build_risk_dial_data()
+
+            results.append({
+                'name':          strat.name,
+                'score':         rec['score'],
+                'view_match':    rec['view_match'],
+                'max_loss_inr':  round(rec['max_loss_inr'], 0),
+                'lots_possible': rec['lots_possible'],
+                'reasoning':     rec['reasoning'],
+                'legs':          d['legs'],
+                'net_premium':   round(strat.net_premium, 2),
+                'pop':           round(pop, 1),
+                'risk_dials':    risk_dials,
+            })
+
+        # Add top recommendation to history if we have any
+        if results:
+            top = results[0]
+            # rationale is a list of strings, join it
+            rationale_str = " ".join(top['reasoning']) if isinstance(top['reasoning'], list) else str(top['reasoning'])
+            # Create a more contextual rationale string based on the dashboard metrics
+            regime_str = market_context.get('regime', 'UNKNOWN')
+            cw = market_context.get('call_wall', 0)
+            pw = market_context.get('put_wall', 0)
+            full_rationale = f"Dashboard shows {regime_str} regime. Spot at {spot:.0f} (CW: {cw}, PW: {pw}). {rationale_str}"
+            
+            history_mgr.add_recommendation(top['name'], top['legs'], full_rationale, top['score'])
+
+        return jsonify({'ok': True, 'strategies': results})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e),
+                        'trace': traceback.format_exc()}), 500
+
+@app.route('/api/wizard/history', methods=['GET'])
+def api_wizard_history():
+    try:
+        from WizardHistoryManager import WizardHistoryManager
+        mgr = WizardHistoryManager()
+        return jsonify({'ok': True, 'history': mgr.get_today_history()})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/api/scenario', methods=['POST'])
+def api_scenario():
+    try:
+        from ScenarioEngine import ScenarioEngine
+        from StrategyEngine import OptionLeg, Strategy
+        import numpy as np
+
+        body         = request.get_json(force=True) or {}
+        strat_dict   = body.get('strategy', {})
+        range_pct    = float(body.get('spot_range_pct', 10)) / 100.0
+        n_spot       = int(body.get('n_spot', 21))
+
+        legs_raw = strat_dict.get('legs', [])
+        if not legs_raw:
+            return jsonify({'ok': False, 'error': 'No legs provided'}), 400
+
+        legs = []
+        for lg in legs_raw:
+            iv_raw = lg.get('iv', 15.0)
+            iv_dec = (iv_raw / 100.0) if iv_raw > 1 else float(iv_raw)
+            legs.append(OptionLeg(
+                opt_type    = lg.get('type', 'CE'),
+                action      = lg.get('action', 'SELL'),
+                strike      = float(lg.get('strike', 0)),
+                entry_price = float(lg.get('price', 0)),
+                iv          = iv_dec,
+                lots        = int(lg.get('lots', 1)),
+                expiry      = lg.get('expiry', ''),
+            ))
+        strat_type = strat_dict.get('type', 'CREDIT')
+        strat_name = strat_dict.get('name', 'Custom')
+        strategy   = Strategy(strat_name, legs, strat_type)
+
+        spot  = hub.latest_data.get('spot', 0.0)
+        T     = hub_cache.get_T()
+        sigma = float(strat_dict.get('net_premium', 0)) / max(spot, 1) if spot > 0 else 0.15
+        
+        chain = hub.latest_data.get('chain', {})
+        if chain.get('optionsChain'):
+            import pandas as pd
+            df_c = pd.DataFrame(chain.get('optionsChain', []))
+            if not df_c.empty and 'iv' in df_c.columns and 'strike_price' in df_c.columns:
+                df_c['dist'] = abs(df_c['strike_price'].astype(float) - spot)
+                atm_val = df_c.loc[df_c['dist'].idxmin(), 'iv']
+                if hasattr(atm_val, 'iloc'): atm_val = atm_val.iloc[0]
+                atm_iv = float(str(atm_val)) if atm_val is not None else 15.0
+                sigma  = atm_iv / 100.0
+
+        engine = ScenarioEngine(strategy, spot, T, max(0.01, sigma))
+        grid   = engine.compute_grid(spot_pct_range=(-range_pct, range_pct),
+                                     n_spot=n_spot)
+        ladder = engine.spot_ladder(spot_pct_range=(-range_pct, range_pct),
+                                    n=n_spot)
+
+        return jsonify({'ok': True, 'grid': grid, 'ladder': ladder})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e),
+                        'trace': traceback.format_exc()}), 500
+
 # GEX / Signals / Regime / Dealer API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -314,7 +688,7 @@ def _gex_refresh_loop(interval: int = 60):
                 df = _parse_chain_to_df(chain)
                 if not df.empty:
                     # ── GEX via calculations/GexEngine ──────────────────────
-                    gex_eng = GexEngine(lot_size=75, positioning_model='standard')
+                    gex_eng = GexEngine(lot_size=65, positioning_model='standard')
                     gex_res = gex_eng.calculate_gex(df, spot)
 
                     profile   = gex_res.get("profile")
@@ -326,28 +700,34 @@ def _gex_refresh_loop(interval: int = 60):
                         for strike, gex_val in profile.items():
                             strike_list.append({"strike": float(strike), "gex": float(gex_val)})
 
-                    # Try GammaExplosionModel for regime label + composite score (non-fatal)
                     regime = "POSITIVE GEX" if net_gex > 0 else "NEGATIVE GEX"
                     score  = round(abs(net_gex) / 1e9, 2)
+                    # Try GammaExplosionModel for full context (non-fatal)
                     try:
                         from GammaExplosionModel import GammaExplosionModel
-                        gm = GammaExplosionModel(fyers_instance=hub.fyers)
+                        gm = GammaExplosionModel()
+                        gm.fyers = hub.fyers
                         gm.spot_price = spot
-                        gm_df = gm.parse_chain(chain) if hasattr(gm, "parse_chain") else pd.DataFrame()
+                        gm_df = gm.parse_chain(chain)
                         if not gm_df.empty:
-                            gm_res = gm.run_analysis(gm_df)  # type: ignore
-                            regime = gm_res.get("regime", regime)
-                            score  = gm_res.get("composite_score", score)
-                    except Exception:
-                        pass
+                            T = hub_cache.get_T()
+                            gm_res = gm.analyze(gm_df, spot, T)
+                            
+                            with _gex_lock:
+                                _gex_snapshot.update(gm_res)
+                    except Exception as e:
+                        print(f"[GEX] GammaExplosionModel error: {e}")
 
                     with _gex_lock:
+                        # Keep calculations/GexEngine fields as fallback/additions
+                        if "score" not in _gex_snapshot:
+                            _gex_snapshot["score"] = score
+                        if "regime" not in _gex_snapshot:
+                            _gex_snapshot["regime"] = regime
+                        if "net_gex" not in _gex_snapshot:
+                            _gex_snapshot["net_gex"] = float(net_gex)
+                        
                         _gex_snapshot.update({
-                            "score":            score,
-                            "regime":           regime,
-                            "net_gex":          float(net_gex),
-                            "direction":        direction,
-                            "strikes":          strike_list,
                             "zero_gamma_level": gex_res.get("zero_gamma_level", 0),
                             "dealer_long_pct":  round(gex_res.get("dealer_long_pct", 0), 1),
                             "dealer_short_pct": round(gex_res.get("dealer_short_pct", 0), 1),
@@ -355,11 +735,11 @@ def _gex_refresh_loop(interval: int = 60):
                             "forward_gex":      gex_res.get("forward_gex", 0),
                             "last_update":      datetime.now().strftime("%H:%M:%S"),
                         })
-                    print(f"[GEX] net={net_gex:.0f}, flip={gex_res.get('zero_gamma_level',0):.0f}, regime={regime}")
+                    print(f"[GEX] net={_gex_snapshot.get('net_gex', 0):.0f}, flip={_gex_snapshot.get('gex_flip_point', gex_res.get('zero_gamma_level', 0)):.0f}")
 
                     # ── Dealer Inventory via DealerPositionEngine ──────────
                     try:
-                        dep   = DealerPositionEngine(lot_size=75)
+                        dep   = DealerPositionEngine(lot_size=65)
                         d_res = dep.calculate_dealer_inventory(df, spot)
                         sp    = d_res.get("strike_profile", {})
 
@@ -521,6 +901,139 @@ def api_regime():
 # /bt_run  →  triggers async backtest (same logic as /api/backtest)
 # /bt_<type>.html  →  polls and serves the HTML result
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.route('/api/confluence', methods=['GET'])
+def api_confluence():
+    try:
+        from MasterSignalEngine import MasterSignalEngine
+        from SignalMemory import SignalMemory
+        
+        mem = SignalMemory()
+        mse = MasterSignalEngine()
+        verdict = mse.evaluate(mem)
+        
+        return jsonify({'ok': True, 'confluence': verdict})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/api/health/engines', methods=['GET'])
+def health_engines():
+    try:
+        from SignalMemory import SignalMemory
+        mem = SignalMemory()
+        context = mem.get_context()
+        
+        chain = hub.latest_data.get('chain', {})
+        chain_update = chain.get('last_update', 'Never')
+        
+        return jsonify({
+            'ok': True,
+            'gex_engine': _gex_snapshot.get('last_update', 'Never'),
+            'dealer_engine': _dealer_snapshot.get('last_update', 'Never'),
+            'signal_memory': context.get('last_updated', 'Never'),
+            'chain_cache': chain_update
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO MANAGER API (Paper Trading)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from PortfolioManager import PortfolioManager
+    portfolio_mgr = PortfolioManager()
+except ImportError:
+    portfolio_mgr = None
+
+@app.route('/api/portfolio/deploy', methods=['POST'])
+def api_portfolio_deploy():
+    if not portfolio_mgr:
+        return jsonify({'ok': False, 'error': 'PortfolioManager not loaded'}), 500
+    try:
+        body = request.get_json(force=True) or {}
+        legs = body.get('legs', [])
+        name = body.get('name', 'Custom Strategy')
+        spot = hub.latest_data.get('spot', 0.0)
+        
+        if not legs:
+            return jsonify({'ok': False, 'error': 'No legs provided'}), 400
+            
+        pos = portfolio_mgr.deploy(name, legs, spot)
+        return jsonify({'ok': True, 'position': pos})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/api/portfolio/status', methods=['GET'])
+def api_portfolio_status():
+    if not portfolio_mgr:
+        return jsonify({'ok': False, 'error': 'PortfolioManager not loaded'}), 500
+    try:
+        # Build live chain map: { 'CE': {strike: ltp}, 'PE': {strike: ltp} }
+        chain_raw = hub.latest_data.get('chain', {})
+        options = chain_raw.get('optionsChain', [])
+        live_chain = {'CE': {}, 'PE': {}}
+        for o in options:
+            strike = float(o.get('strike_price', 0))
+            opt_type = 'CE' if o.get('option_type', '') in ('CE', 'CALL') else 'PE'
+            ltp = float(o.get('ltp', 0) or 0)
+            live_chain[opt_type][strike] = ltp
+            
+        spot = hub.latest_data.get('spot', 0.0)
+        T_now = hub_cache.get_T()
+        atm_iv = 15.0
+        
+        # Approximate ATM IV
+        if options:
+            import pandas as pd
+            df_c = pd.DataFrame(options)
+            if not df_c.empty and 'iv' in df_c.columns and 'strike_price' in df_c.columns:
+                df_c['dist'] = abs(df_c['strike_price'].astype(float) - spot)
+                atm_val = df_c.loc[df_c['dist'].idxmin(), 'iv']
+                if hasattr(atm_val, 'iloc'): atm_val = atm_val.iloc[0]
+                atm_iv = float(str(atm_val)) if atm_val is not None else 15.0
+                
+        status = portfolio_mgr.get_status(live_chain, spot, T_now, atm_iv/100.0)
+        return jsonify({'ok': True, 'portfolio': status})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/api/portfolio/exit', methods=['POST'])
+def api_portfolio_exit():
+    if not portfolio_mgr:
+        return jsonify({'ok': False, 'error': 'PortfolioManager not loaded'}), 500
+    try:
+        body = request.get_json(force=True) or {}
+        pos_id = body.get('id')
+        if not pos_id:
+            return jsonify({'ok': False, 'error': 'No position ID provided'}), 400
+            
+        chain_raw = hub.latest_data.get('chain', {})
+        options = chain_raw.get('optionsChain', [])
+        live_chain = {'CE': {}, 'PE': {}}
+        for o in options:
+            strike = float(o.get('strike_price', 0))
+            opt_type = 'CE' if o.get('option_type', '') in ('CE', 'CALL') else 'PE'
+            ltp = float(o.get('ltp', 0) or 0)
+            live_chain[opt_type][strike] = ltp
+            
+        pos = portfolio_mgr.exit_position(pos_id, live_chain)
+        if pos:
+            return jsonify({'ok': True, 'position': pos})
+        return jsonify({'ok': False, 'error': 'Position not found'}), 404
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/builder')
+def builder_page():
+    return send_file('strategy_builder.html')
 
 @app.route('/health', methods=['GET'])
 def health():

@@ -122,21 +122,36 @@ class GammaExplosionModel:
                         continue
 
             if r.get('s') == 'ok':
-                records = []
-                for item in r['data'].get('optionsChain', []):
-                    records.append({
-                        'strike': float(item.get('strike_price', 0)),
-                        'type':   'CE' if item.get('option_type', '') in ('CE', 'CALL') else 'PE',
-                        'price':  float(item.get('ltp', 0) or 0),
-                        'iv':     float(item.get('iv', 0) or 0),
-                        'oi':     int(item.get('oi', 0) or 0),
-                        'delta':  float(item.get('delta', 0) or 0),
-                        'gamma':  float(item.get('gamma', 0) or 0),
-                    })
-                return pd.DataFrame(records)
+                return self.parse_chain(r['data'])
         except Exception as e:
             print(f"  Chain fetch error: {e}")
         return pd.DataFrame()
+
+    def parse_chain(self, data):
+        """Parse option chain into structured DataFrame"""
+        if not data:
+            return pd.DataFrame()
+        
+        options = data.get('optionsChain', [])
+        if not options:
+            return pd.DataFrame()
+        
+        records = []
+        for item in options:
+            strike = float(item.get('strike_price', 0))
+            if strike <= 0: continue
+            
+            records.append({
+                'strike': strike,
+                'type':   'CE' if item.get('option_type', '') in ('CE', 'CALL') else 'PE',
+                'ltp':    float(item.get('ltp', 0) or 0),
+                'price':  float(item.get('ltp', 0) or 0), # alias
+                'iv':     float(item.get('iv', 0) or 0),
+                'oi':     int(item.get('oi', 0) or 0),
+                'delta':  float(item.get('delta', 0) or 0),
+                'gamma':  float(item.get('gamma', 0) or 0),
+            })
+        return pd.DataFrame(records)
 
     def _fetch_rv_baseline(self):
         """Fetch 1-year daily data and compute RV baseline (once)."""
@@ -171,60 +186,23 @@ class GammaExplosionModel:
 
     def _compute_gex_profile(self, df, spot, T):
         """
-        Build per-strike GEX and return:
+        Build per-strike GEX using unified GEXEngine and return:
           - profile dict {strike: gex}
           - net_gex (aggregate)
           - gex_flip_point (zero crossing strike)
           - concentration (fraction of |GEX| within ±1% of spot)
+          - gex_acceleration (local historical delta)
         """
-        profile = {}
-        r_rate = 0.07
-
-        for strike in df['strike'].unique():
-            ce_row = df[(df['strike'] == strike) & (df['type'] == 'CE')]
-            pe_row = df[(df['strike'] == strike) & (df['type'] == 'PE')]
-
-            ce_gamma = pe_gamma = 0.0
-            ce_oi    = pe_oi    = 0
-
-            if not ce_row.empty:
-                row = ce_row.iloc[0]
-                iv = row['iv'] / 100 if row['iv'] > 1 else row['iv']
-                if iv < 0.01: iv = 0.15
-                try:
-                    g = self.analytics.calculate_greeks(spot, strike, T, r_rate, iv, 'CE')
-                    ce_gamma = g.get('gamma', 0)
-                except Exception:
-                    ce_gamma = row.get('gamma', 0)
-                ce_oi = row['oi']
-
-            if not pe_row.empty:
-                row = pe_row.iloc[0]
-                iv = row['iv'] / 100 if row['iv'] > 1 else row['iv']
-                if iv < 0.01: iv = 0.15
-                try:
-                    g = self.analytics.calculate_greeks(spot, strike, T, r_rate, iv, 'PE')
-                    pe_gamma = g.get('gamma', 0)
-                except Exception:
-                    pe_gamma = row.get('gamma', 0)
-                pe_oi = row['oi']
-
-            # Institutional GEX Formula: Rupee Value per 1% move in underlying
-            # Assuming Dealers are long calls, short puts (Standard Baseline)
-            # GEX = Gamma * OI * (Spot * 0.01) * Lot_Size * Spot
-            gex = (ce_gamma * ce_oi - pe_gamma * pe_oi) * (spot * spot * 0.01) * self.LOT_SIZE
-            profile[strike] = gex
-
-        if not profile:
+        try:
+            from GEXEngine import GEXEngine
+            res = GEXEngine.compute_gex(df, spot, T, lot_size=self.LOT_SIZE)
+            profile = res['profile']
+            net_gex = res['net_gex']
+            concentration = res['atm_concentration']
+            flip_point = res['gex_flip_point']
+        except Exception as e:
+            print(f"Error computing GEX: {e}")
             return {}, 0, 0, 0, 0
-
-        net_gex = sum(profile.values())
-        total_abs = sum(abs(v) for v in profile.values()) or 1
-
-        # ATM ±1% concentration
-        atm_band_gex = sum(abs(v) for k, v in profile.items()
-                           if spot * 0.99 <= k <= spot * 1.01)
-        concentration = atm_band_gex / total_abs * 100
 
         # GEX Acceleration Calculation (Ddelta / Dtime)
         now_epoch = time.time()
@@ -236,17 +214,6 @@ class GammaExplosionModel:
         if len(self._gex_history) > 1:
             oldest_gex = self._gex_history[0][1]
             gex_acceleration = net_gex - oldest_gex
-
-        # GEX flip point: sorted strikes, find sign change
-        sorted_strikes = sorted(profile.keys())
-        flip_point = 0
-        for i in range(len(sorted_strikes) - 1):
-            g1 = profile[sorted_strikes[i]]
-            g2 = profile[sorted_strikes[i + 1]]
-            if g1 * g2 < 0:  # sign change
-                # Interpolate — pick the one closer to zero
-                flip_point = sorted_strikes[i] if abs(g1) < abs(g2) else sorted_strikes[i + 1]
-                break
 
         return profile, net_gex, flip_point, concentration, gex_acceleration
 
@@ -534,6 +501,49 @@ class GammaExplosionModel:
     # MAIN ENTRY
     # ──────────────────────────────────────────────────────────────────────────
 
+    def analyze(self, df: pd.DataFrame, spot: float, T: float) -> dict:
+        """Analyze chain data to compute composite GEX signals and return structured output."""
+        profile, net_gex, flip_point, concentration, gex_acceleration = \
+            self._compute_gex_profile(df, spot, T)
+
+        oi_surge  = self._compute_oi_surge(df, spot)
+        iv_rv     = self._compute_iv_rv(df, spot, T)
+        skew_vel  = self._compute_skew_velocity(df, spot)
+        score_res = self._compute_score(concentration, net_gex, iv_rv, oi_surge)
+        direction, dir_score = self._explosion_direction(
+            oi_surge, skew_vel, net_gex, spot, flip_point)
+
+        # Trigger zone
+        if direction == "UPSIDE" and flip_point > spot:
+            trigger = f"Break above {flip_point:.0f} → cascade UP"
+        elif direction == "DOWNSIDE" and flip_point > 0 and flip_point < spot:
+            trigger = f"Break below {flip_point:.0f} → cascade DOWN"
+        elif flip_point > 0:
+            trigger = f"GEX flip at {flip_point:.0f}"
+        else:
+            trigger = "No clear flip point"
+
+        profile_list = [{"strike": float(k), "gex": float(v)} for k, v in profile.items()]
+
+        return {
+            "composite_score": score_res['composite'],
+            "status": score_res['status'],
+            "alert": score_res['alert'],
+            "net_gex": net_gex,
+            "gex_flip_point": flip_point,
+            "concentration": concentration,
+            "gex_acceleration": gex_acceleration,
+            "direction": direction,
+            "dir_score": dir_score,
+            "trigger": trigger,
+            "iv_rv": iv_rv,
+            "oi_surge": oi_surge,
+            "skew_vel": skew_vel,
+            "profile": profile_list,
+            "timestamp": datetime.now().isoformat(),
+            "score_breakdown": score_res.get('breakdown', {})
+        }
+
     def run(self):
         print("\n" + "═" * 70)
         print("  GAMMA EXPLOSION MONITOR")
@@ -608,25 +618,26 @@ class GammaExplosionModel:
                 if T < 0.001: T = 0.001
 
                 # ── Compute all signals ────────────────────────────────────
-                profile, net_gex, flip_point, concentration, gex_acceleration = \
-                    self._compute_gex_profile(df, spot, T)
+                res = self.analyze(df, spot, T)
 
-                oi_surge  = self._compute_oi_surge(df, spot)
-                iv_rv     = self._compute_iv_rv(df, spot, T)
-                skew_vel  = self._compute_skew_velocity(df, spot)
-                score_res = self._compute_score(concentration, net_gex, iv_rv, oi_surge)
-                direction, dir_score = self._explosion_direction(
-                    oi_surge, skew_vel, net_gex, spot, flip_point)
-
-                # Trigger zone
-                if direction == "UPSIDE" and flip_point > spot:
-                    trigger = f"Break above {flip_point:.0f} → cascade UP"
-                elif direction == "DOWNSIDE" and flip_point > 0 and flip_point < spot:
-                    trigger = f"Break below {flip_point:.0f} → cascade DOWN"
-                elif flip_point > 0:
-                    trigger = f"GEX flip at {flip_point:.0f}"
-                else:
-                    trigger = "No clear flip point"
+                net_gex = res['net_gex']
+                flip_point = res['gex_flip_point']
+                concentration = res['concentration']
+                gex_acceleration = res['gex_acceleration']
+                direction = res['direction']
+                dir_score = res['dir_score']
+                trigger = res['trigger']
+                iv_rv = res['iv_rv']
+                oi_surge = res['oi_surge']
+                skew_vel = res['skew_vel']
+                profile = {p['strike']: p['gex'] for p in res['profile']}
+                
+                score_res = {
+                    'composite': res['composite_score'],
+                    'status': res['status'],
+                    'alert': res['alert'],
+                    'breakdown': res.get('score_breakdown', {})
+                }
 
                 # ── Print Dashboard ────────────────────────────────────────
                 now = datetime.now().strftime('%H:%M:%S')
@@ -765,3 +776,7 @@ class GammaExplosionModel:
 
         except KeyboardInterrupt:
             print("\nExiting Gamma Explosion Monitor...")
+
+if __name__ == "__main__":
+    gm = GammaExplosionModel()
+    gm.run()

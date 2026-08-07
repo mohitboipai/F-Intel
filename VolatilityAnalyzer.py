@@ -2900,14 +2900,7 @@ class VolatilityAnalyzer:
                         pass
                         
                     # ── MASTER SIGNAL VERDICT ──
-                    verdict_data = self.master_engine.evaluate(
-                        regime_data=regime_snapshot, 
-                        iv_surface_pred=pred, 
-                        seller_data=seller, 
-                        momentum_data=momentum_data if 'momentum_data' in locals() else None,
-                        gex_data=gex_data,
-                        dealer_data=dealer_data
-                    )
+                    verdict_data = self.master_engine.evaluate(self.memory)
 
                     # ── BUYER SETUP ──
                     gex_accel = 0.0 # Will compute if needed, or default

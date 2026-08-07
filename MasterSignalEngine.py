@@ -10,11 +10,13 @@ class MasterSignalEngine:
     def __init__(self):
         pass
 
-    def evaluate(self, regime_data, iv_surface_pred, seller_data, momentum_data, gex_data, dealer_data) -> dict:
+    def evaluate(self, memory) -> dict:
         """
         Generates the absolute final verdict using the Decision Matrix.
+        Pulls all required data directly from SignalMemory context.
         """
-        if not regime_data or not gex_data or not dealer_data:
+        context = memory.get_context() if memory else {}
+        if not context:
             return {'verdict': 'NEUTRAL', 'score': 0.0, 'confidence': 0.0, 'rationale': ['Insufficient Data for Synthesis']}
 
         rationale = []
@@ -22,16 +24,16 @@ class MasterSignalEngine:
         # 1. Extract Core Telemetry
         # -------------------------
         # Regime & VRP
-        regime_name = regime_data.get('regime', {}).get('name', 'UNKNOWN')
-        vrp_iv_rv   = regime_data.get('vrp', {}).get('iv_rv', 0)
+        regime_name = context.get('regime', 'UNKNOWN')
+        vrp_iv_rv   = context.get('vrp', 0)
         
         # Gamma & Flows
-        net_gex   = gex_data.get('net_gex', 0)
-        net_vanna = dealer_data.get('net_vanna', 0)
-        net_charm = dealer_data.get('net_charm', 0)
+        net_gex   = context.get('net_gex', 0)
+        net_vanna = context.get('net_vanna', 0)
+        net_charm = context.get('net_charm', 0)
         
         # Momentum
-        m_stat = momentum_data.get('status', 'NEUTRAL') if momentum_data else 'NEUTRAL'
+        m_stat = context.get('momentum_status', 'NEUTRAL')
 
         # 2. Structural Analysis Matrix
         # -----------------------------
@@ -73,14 +75,13 @@ class MasterSignalEngine:
             score -= 0.6
 
         # --- C. OPTION ANALYTICS (OI) FILTER ---
-        if seller_data:
-            oi_p = seller_data.get('oi_pressure', 'NEUTRAL')
-            if oi_p == 'BULLISH' and score >= 0:
-                rationale.append("Retail OI Put Writing aligns with bullish bias.")
-                score += 0.3
-            elif oi_p == 'BEARISH' and score <= 0:
-                rationale.append("Retail OI Call Writing aligns with bearish bias.")
-                score -= 0.3
+        oi_p = context.get('oi_pressure', 'NEUTRAL')
+        if oi_p == 'BULLISH' and score >= 0:
+            rationale.append("Retail OI Put Writing aligns with bullish bias.")
+            score += 0.3
+        elif oi_p == 'BEARISH' and score <= 0:
+            rationale.append("Retail OI Call Writing aligns with bearish bias.")
+            score -= 0.3
 
         # 3. Final Verdict Mapping
         # ------------------------
@@ -97,9 +98,15 @@ class MasterSignalEngine:
         else:
             confidence = min(abs(score), 1.0)
             
-        return {
+        result = {
             'verdict': verdict,
-            'score': round(score, 3),
-            'confidence': round(confidence, 3),
+            'score': round(score, 2),
+            'confidence': round(confidence, 2),
             'rationale': rationale
         }
+        
+        # Write verdict back into SignalMemory
+        if memory:
+            memory.update_context({'confluence_verdict': result})
+            
+        return result
