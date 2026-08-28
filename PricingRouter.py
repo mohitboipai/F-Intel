@@ -93,7 +93,7 @@ class PricingRouter:
         if model == 'BSM' or T <= 0:
             return bsm_price(S, K, T, r, iv, opt_type)
 
-        params = self._resolve_heston_params(context, S, T, r)
+        params = self._resolve_heston_params(context if context is not None else {}, S, T, r)
         if params is None:
             return bsm_price(S, K, T, r, iv, opt_type)
 

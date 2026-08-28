@@ -127,19 +127,12 @@ class RealizedVolEngine:
 
     # ── Auth ──────────────────────────────────────────────────────────────
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        APP_ID = "QUTT4YYMIG-100"
-        SECRET_ID = "ZG0WN2NL1B"
-        REDIRECT_URI = "http://127.0.0.1:3000/callback"
-        auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-        fyers = auth.get_fyers_instance()
-        if not fyers:
-            print("Authentication Failed!")
-            sys.exit(1)
-        print("Authentication Successful.")
-        return fyers
 
-    # ── Spot ──────────────────────────────────────────────────────────────
+        from fyers_auth_manager import get_fyers_instance
+
+        return get_fyers_instance()
+
+# ── Spot ──────────────────────────────────────────────────────────────
     def _get_spot(self):
         data = {"symbols": self.symbol}
         try:

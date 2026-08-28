@@ -20,12 +20,13 @@ Usage:
 import os
 import sys
 import time
+import json
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from fyers_auth_manager import get_fyers_instance
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from FyersAuth import FyersAuthenticator
 
 # ── constants ─────────────────────────────────────────────────────────────────
 SAVE_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'minute')
@@ -36,11 +37,7 @@ IST_OFFSET  = timedelta(hours=5, minutes=30)   # UTC → IST without pytz
 MARKET_OPEN = '09:15'
 MARKET_CLOSE = '15:30'
 
-# Fyers credentials — same pattern as OIBacktester
-_APP_ID   = 'QUTT4YYMIG-100'
-_SECRET   = 'ZG0WN2NL1B'
-_REDIR    = 'http://127.0.0.1:3000/callback'
-
+# Fyers credentials moved to .env
 
 # ── MinuteDataFetcher ─────────────────────────────────────────────────────────
 class MinuteDataFetcher:
@@ -57,8 +54,7 @@ class MinuteDataFetcher:
 
     def _get_fyers(self):
         if self._fyers is None:
-            auth = FyersAuthenticator(_APP_ID, _SECRET, _REDIR)
-            self._fyers = auth.get_fyers_instance()
+            self._fyers = get_fyers_instance()
         return self._fyers
 
     # ── parquet helpers ─────────────────────────────────────────────────────
@@ -208,6 +204,5 @@ class MinuteDataFetcher:
         if df.empty:
             return pd.Series()
         # Last bar of each calendar date
-        daily = df.groupby(df.index.date)['close'].last()
-        daily.index = pd.to_datetime([str(d) for d in daily.index])
+        daily = df['close'].resample('D').last().dropna()
         return daily

@@ -36,17 +36,12 @@ class KeyLevelsEngine:
         self._walls_cache_time = 0.0
         
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        try:
-            auth = FyersAuthenticator("QUTT4YYMIG-100", "ZG0WN2NL1B", "http://127.0.0.1:3000/callback")
-            fyers = auth.get_fyers_instance()
-            if fyers:
-                print("Authentication Successful.")
-                return fyers
-        except Exception as e:
-            print(f"Auth Failed: {e}")
-        return None
-    
+
+        
+        from fyers_auth_manager import get_fyers_instance
+
+        
+        return get_fyers_instance()
     def get_spot_price(self):
         try:
             if self.fyers is None:

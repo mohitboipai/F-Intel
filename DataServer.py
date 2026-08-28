@@ -16,14 +16,16 @@ from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 from flask_sock import Sock
 from datetime import datetime
-from FyersAuth import FyersAuthenticator
+from fyers_auth_manager import get_fyers_instance, get_access_token
 from fyers_apiv3.FyersWebsocket import data_ws
 from OptionAnalytics import OptionAnalytics
 
 # --- CONFIG ---
-APP_ID = "QUTT4YYMIG-100"
-SECRET_ID = "ZG0WN2NL1B"
-REDIRECT_URI = "http://127.0.0.1:3000/callback"
+from dotenv import load_dotenv
+load_dotenv()
+
+# Hardcoded secrets removed to .env
+APP_ID = os.getenv("FYERS_APP_ID")
 SYMBOL = "NSE:NIFTY50-INDEX"
 PORT = 8082
 CHAIN_REFRESH_INTERVAL = 60 # Seconds (Option chain rate limits are strict, 1 per min)
@@ -49,10 +51,9 @@ class DataHub:
 
     def authenticate(self):
         print("DataHub: Authenticating...")
-        auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-        self.fyers = auth.get_fyers_instance()
+        self.fyers = get_fyers_instance()
         if self.fyers:
-            self.access_token = open("access_token.txt", "r").read().strip()
+            self.access_token = get_access_token()
             print("DataHub: Authentication Successful.")
             return True
         return False

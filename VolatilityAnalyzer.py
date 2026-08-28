@@ -201,7 +201,8 @@ class VolatilityAnalyzer:
         self.api_thread = threading.Thread(target=run_strategy_server, daemon=True)
         self.api_thread.start()
         
-        self.fyers = self._authenticate()
+        from typing import Any
+        self.fyers: Any = self._authenticate()
         self.analytics = OptionAnalytics()
         self.symbol = "NSE:NIFTY50-INDEX"
         self.spot_price = 0
@@ -224,18 +225,8 @@ class VolatilityAnalyzer:
         self.buyer_engine = OptionBuyerEngine()
 
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        APP_ID = "QUTT4YYMIG-100"
-        SECRET_ID = "ZG0WN2NL1B"
-        REDIRECT_URI = "http://127.0.0.1:3000/callback"
-        
-        auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-        fyers = auth.get_fyers_instance()
-        if not fyers:
-            print("Authentication Failed!")
-            sys.exit(1)
-        print("Authentication Successful.")
-        return fyers
+        from fyers_auth_manager import get_fyers_instance
+        return get_fyers_instance()
 
     def get_spot_price(self, verbose=True):
         # 1. Try Data Hub first
@@ -253,7 +244,7 @@ class VolatilityAnalyzer:
             if response.get('code') == -15 or "token" in response.get('message', '').lower():
                 print("Token expired during spot check. Re-authenticating...")
                 self.fyers = self._authenticate()
-                response = self.fyers.quotes(data=data)
+                response = self.fyers.quotes(data=data)  # type: ignore
             
             if response.get('s') == "ok":
                 d = response['d'][0]['v']
@@ -845,18 +836,18 @@ class VolatilityAnalyzer:
                     # ── LAYOUT ──
                     fig.update_layout(
                         height=550, width=1400,
-                        paper_bgcolor=DARK_BG, plot_bgcolor='rgba(20,20,35,0.8)',
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                         font=dict(color=WHITE, family='Inter, Segoe UI, sans-serif', size=11),
                         legend=dict(bgcolor='rgba(30,30,50,0.8)', font=dict(size=10, color=WHITE),
                                    x=0.01, y=0.99),
                         margin=dict(l=50, r=20, t=50, b=30),
                         hovermode='closest',
                         scene=dict(
-                            xaxis=dict(title='Strike', backgroundcolor=DARK_BG, gridcolor='#333', color=MUTED),
-                            yaxis=dict(title='Days', backgroundcolor=DARK_BG, gridcolor='#333', color=MUTED),
-                            zaxis=dict(title='IV%', backgroundcolor=DARK_BG, gridcolor='#333', color=MUTED),
+                            xaxis=dict(title='Strike', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333', color=MUTED),
+                            yaxis=dict(title='Days', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333', color=MUTED),
+                            zaxis=dict(title='IV%', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333', color=MUTED),
                             camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)),
-                            bgcolor=DARK_BG
+                            bgcolor='rgba(0,0,0,0)'
                         ),
                     )
                     fig.update_xaxes(gridcolor='rgba(100,100,100,0.15)', zeroline=False, title='Strike', row=1, col=1)
@@ -2177,6 +2168,7 @@ class VolatilityAnalyzer:
         regime_history = []  # [(timestamp_str, regime, ml_prob), ...] — regime transition tracking
         _last_regime = None  # track previous regime for change detection
         _regime_changed_at = ''  # timestamp string of last regime change
+        _iv_history = []  # [(timestamp_str, atm_iv), ...] — rolling ATM IV cache for historical chart
 
 
         def _fetch_history_once():
@@ -2254,77 +2246,133 @@ class VolatilityAnalyzer:
                 pass
 
         def _compute_vol_intelligence(spot, momentum_data):
-            """Compute vol cone / regime / VRP data. Returns dict."""
-            nonlocal _last_regime, _regime_changed_at
+            """Compute vol cone / regime / VRP data across multiple timeframes. Returns dict."""
+            nonlocal _last_regime, _regime_changed_at, _iv_history
             hist = _fetch_history_once()
             if not hist or len(hist['closes']) < 40:
                 return None
             closes = hist['closes']
-            highs = hist['highs']
-            lows = hist['lows']
+            highs  = hist['highs']
+            lows   = hist['lows']
+            opens  = hist['opens']
 
-            rolling_hv = self.analytics.calculate_rolling_historical_volatility(closes, window=20)
-            parkinson_hv = self.analytics.calculate_parkinson_volatility(highs, lows, window=20)
+            # ── Multi-timeframe Close-to-Close HV ──
+            hv_series = {}
+            for _w in [5, 10, 20, 60]:
+                _s = self.analytics.calculate_rolling_historical_volatility(closes, window=_w)
+                hv_series[_w] = _s
+
+            rolling_hv = hv_series[20]  # primary 20d series
             if rolling_hv.empty or len(rolling_hv) < 40:
                 return None
 
-            current_hv = rolling_hv.iloc[-1]
-            current_park = parkinson_hv.iloc[-1] if not parkinson_hv.empty else 0
-            mean_hv = rolling_hv.mean()
-            min_hv = rolling_hv.min()
-            max_hv = rolling_hv.max()
-            hv_percentile = (rolling_hv < current_hv).mean() * 100
+            # ── Parkinson (H/L) at multiple windows ──
+            def _parkinson_hv(highs, lows, window):
+                h = pd.Series(highs); l = pd.Series(lows)
+                log_hl = (np.log(h / l) ** 2)
+                pk = np.sqrt(log_hl.rolling(window).mean() / (4 * np.log(2))) * np.sqrt(252) * 100
+                return pk
 
+            # ── Garman-Klass (OHLC) at multiple windows ──
+            def _garman_klass_hv(opens, highs, lows, closes, window):
+                o = pd.Series(opens); h = pd.Series(highs); l = pd.Series(lows); c = pd.Series(closes)
+                gk = (0.5 * (np.log(h/l)**2) - (2*np.log(2)-1) * (np.log(c/o)**2))
+                return np.sqrt(gk.rolling(window).mean() * 252) * 100
+
+            # ── Yang-Zhang (Gap + OHLC) at multiple windows ──
+            def _yang_zhang_hv(opens, highs, lows, closes, window):
+                o = pd.Series(opens); h = pd.Series(highs); l = pd.Series(lows); c = pd.Series(closes)
+                k = 0.34 / (1.34 + (window + 1) / (window - 1))
+                cc  = np.log(c / c.shift(1))
+                oo  = np.log(o / o.shift(1))
+                co  = np.log(c / o)
+                oc  = np.log(o / c.shift(1))
+                yz  = oo.rolling(window).var() + k * co.rolling(window).var() + (1 - k) * cc.rolling(window).var()
+                return np.sqrt(yz * 252) * 100
+
+            pk_20 = _parkinson_hv(highs, lows, 20)
+            pk_60 = _parkinson_hv(highs, lows, 60)
+            gk_20 = _garman_klass_hv(opens, highs, lows, closes, 20)
+            gk_60 = _garman_klass_hv(opens, highs, lows, closes, 60)
+            yz_20 = _yang_zhang_hv(opens, highs, lows, closes, 20)
+            yz_60 = _yang_zhang_hv(opens, highs, lows, closes, 60)
+
+            def _last(s): return float(s.iloc[-1]) if not s.empty and not pd.isna(s.iloc[-1]) else 0.0
+
+            hv_vals = {
+                'c2c_5':  _last(hv_series[5]),
+                'c2c_10': _last(hv_series[10]),
+                'c2c_20': _last(hv_series[20]),
+                'c2c_60': _last(hv_series[60]),
+                'pk_20':  _last(pk_20),
+                'pk_60':  _last(pk_60),
+                'gk_20':  _last(gk_20),
+                'gk_60':  _last(gk_60),
+                'yz_20':  _last(yz_20),
+                'yz_60':  _last(yz_60),
+            }
+            # Parkinson at 5d / 10d
+            hv_vals['pk_5']  = _last(_parkinson_hv(highs, lows, 5))
+            hv_vals['pk_10'] = _last(_parkinson_hv(highs, lows, 10))
+
+            current_hv  = hv_vals['c2c_20']
+            current_park = hv_vals['pk_20']
+            mean_hv = float(rolling_hv.mean())
+            min_hv  = float(rolling_hv.min())
+            max_hv  = float(rolling_hv.max())
+            hv_percentile = float((rolling_hv < current_hv).mean() * 100)
+
+            # Short-term vs medium-term regime comparison
+            st_regime = 'RISING' if hv_vals['c2c_5'] > hv_vals['c2c_20'] else 'FALLING'
+            mt_regime = 'ABOVE_MEAN' if hv_vals['c2c_20'] > mean_hv else 'BELOW_MEAN'
+
+            # Bollinger Bands on 20d HV
             bb_window = 20
-            hv_sma = rolling_hv.rolling(bb_window).mean()
-            hv_std = rolling_hv.rolling(bb_window).std()
+            hv_sma  = rolling_hv.rolling(bb_window).mean()
+            hv_std  = rolling_hv.rolling(bb_window).std()
             bb_upper = hv_sma + 2 * hv_std
             bb_lower = hv_sma - 2 * hv_std
             bandwidth = ((bb_upper - bb_lower) / hv_sma * 100).dropna()
-            current_bw = bandwidth.iloc[-1] if not bandwidth.empty else 0
+            current_bw   = float(bandwidth.iloc[-1]) if not bandwidth.empty else 0
+            bw_percentile = float((bandwidth < current_bw).mean() * 100) if not bandwidth.empty else 50
 
-            hv_slope = 0
+            hv_slope = 0.0
             if len(rolling_hv) >= 5:
                 recent_5 = rolling_hv.iloc[-5:].values
-                hv_slope = recent_5[-1] - recent_5[0]
+                hv_slope = float(recent_5[-1] - recent_5[0])
 
-            iv_velocity_5d = rolling_hv.diff(5).iloc[-1] if len(rolling_hv) >= 6 else 0
-            iv_velocity_10d = rolling_hv.diff(10).iloc[-1] if len(rolling_hv) >= 11 else 0
+            iv_velocity_5d  = float(rolling_hv.diff(5).iloc[-1])  if len(rolling_hv) >= 6  else 0.0
+            iv_velocity_10d = float(rolling_hv.diff(10).iloc[-1]) if len(rolling_hv) >= 11 else 0.0
             iv_accel = iv_velocity_5d - (iv_velocity_10d / 2)
 
             hv_changes = rolling_hv.diff().dropna()
-            vov = hv_changes.tail(20).std() if len(hv_changes) >= 20 else 0
+            vov = float(hv_changes.tail(20).std()) if len(hv_changes) >= 20 else 0.0
 
-            bw_percentile = (bandwidth < current_bw).mean() * 100 if not bandwidth.empty else 50
+            ml_prob = 0.50  # kept for backward compat
 
-            # --- NEW STATISTICAL REGIME SYSTEM ---
-            # Uses Bandwidth Percentile (coiling) and HV Trend + INTRADAY OVERLAY
-            ml_prob = 0.50  # Kept for compatibility with return dict
-            
-            # Intraday momentum override
+            # ── Intraday momentum override ──
             m_stat = momentum_data.get('status', 'NEUTRAL') if momentum_data else 'NEUTRAL'
-            
-            # If intraday trend is strong and volume/slope matches
+
             if m_stat in ['LONG', 'SHORT'] and (iv_accel > 0 or hv_slope > 0):
                 regime = "EXPANSION (LIVE)"
                 regime_desc = f"Vol exploding intraday! Spot > VWAP/EMA. (BBw: {bw_percentile:.0f}th)"
             elif m_stat != 'NEUTRAL' and bw_percentile < 30:
                 regime = "MOMENTUM / TRENDING"
-                regime_desc = f"Trending directional breakout in progress."
+                regime_desc = "Trending directional breakout in progress."
             elif bw_percentile < 25:
                 regime = "COMPRESSION"
                 regime_desc = f"Vol tightly coiled (BBw: {bw_percentile:.0f}th) — Breakout likely"
             elif bw_percentile > 75 and hv_slope > 0:
                 regime = "EXPANSION"
-                regime_desc = f"Vol exploding (HV rising, BBw expanding)"
+                regime_desc = "Vol exploding (HV rising, BBw expanding)"
             elif hv_slope < -0.5:
                 regime = "MEAN_REVERSION"
-                regime_desc = f"Vol exhaustion (HV slope dropping)"
+                regime_desc = "Vol exhaustion (HV slope dropping)"
             else:
                 regime = "NORMAL"
                 regime_desc = "Standard vol flow — No extreme edge"
 
-            # Track regime history for transition detection
+            # ── Regime transition log ──
             _now_ts = datetime.now().strftime('%H:%M:%S')
             if _last_regime is not None and regime != _last_regime:
                 _regime_changed_at = _now_ts
@@ -2334,8 +2382,24 @@ class VolatilityAnalyzer:
             _prev_regime = _last_regime or regime
             _last_regime = regime
 
-            # ATM IV from option chain
-            iv = 0
+            # ── Regime transition log HTML (last 8 changes) ──
+            _transition_log = []
+            _last_seen = None
+            for _ts, _rg, _ in regime_history:
+                if _rg != _last_seen:
+                    _transition_log.append((_ts, _rg))
+                    _last_seen = _rg
+            _recent_transitions = _transition_log[-8:]
+            _trans_rows_html = ''
+            for _ts, _rg in reversed(_recent_transitions):
+                _rc = YELLOW if 'COMPRESS' in _rg else RED if 'EXPAND' in _rg else '#64b5f6' if 'MOMENT' in _rg else MUTED
+                _trans_rows_html += (f'<tr><td style="padding:3px 8px;color:#888;font-size:10px;">{_ts}</td>'
+                                     f'<td style="padding:3px 8px;font-weight:700;font-size:11px;color:{_rc};">{_rg}</td></tr>')
+            if not _trans_rows_html:
+                _trans_rows_html = '<tr><td colspan="2" style="padding:4px 8px;color:#555;">Building history...</td></tr>'
+
+            # ── ATM IV from option chain (with caching) ──
+            iv = 0.0
             old_exp = self.expiry_date
             self.expiry_date = near_exp
             try:
@@ -2350,26 +2414,38 @@ class VolatilityAnalyzer:
                 T_iv = self.analytics.get_time_to_expiry(near_exp)
                 iv = self._ensure_iv(row['iv'], row['price'], row['strike'], T_iv, row['type'])
 
-            vrp = iv - current_hv if iv > 0 else 0
-            z_score = self.analytics.calculate_z_score(iv, rolling_hv) if iv > 0 else 0
-            # Signal scoring
+            # Cache IV history
+            if iv > 0:
+                _iv_history.append((_now_ts, iv))
+                if len(_iv_history) > 252:
+                    _iv_history.pop(0)
+
+            vrp = iv - current_hv if iv > 0 else 0.0
+            z_score = self.analytics.calculate_z_score(iv, rolling_hv) if iv > 0 else 0.0
+
+            # ── VRP percentile vs 1-year ──
+            vrp_series = pd.Series([float(i) - float(rolling_hv.iloc[max(0, j-1)])
+                                    for j, i in enumerate(rolling_hv.values)
+                                    if j > 0], dtype=float).dropna()
+            vrp_percentile = float((vrp_series < vrp).mean() * 100) if len(vrp_series) > 10 else 50.0
+
             signal_metrics = {'vrp': vrp, 'regime': regime}
             signal_result = self._score_signal(signal_metrics)
 
-            # Half-life
-            half_life = 0
+            # ── Half-life (mean-reversion speed) ──
+            half_life = 0.0
             try:
-                hv_vals = rolling_hv.dropna().values
-                if len(hv_vals) > 20:
-                    hv_centered = hv_vals - np.mean(hv_vals) # type: ignore
-                    autocorr = np.correlate(hv_centered[:-1], hv_centered[1:], mode='valid')[0]
-                    autocorr /= np.correlate(hv_centered[:-1], hv_centered[:-1], mode='valid')[0]
-                    if 0 < autocorr < 1:
-                        half_life = np.log(2) / (-np.log(autocorr))
+                hv_vals_arr = rolling_hv.dropna().values
+                if len(hv_vals_arr) > 20:
+                    hv_centered = hv_vals_arr - np.mean(hv_vals_arr) # type: ignore
+                    ac = np.correlate(hv_centered[:-1], hv_centered[1:], mode='valid')[0]
+                    ac /= np.correlate(hv_centered[:-1], hv_centered[:-1], mode='valid')[0]
+                    if 0 < ac < 1:
+                        half_life = np.log(2) / (-np.log(ac))
             except:
                 pass
 
-            # Build forecast rows from regime_history trend
+            # ── Regime forecast rows ──
             forecast_rows_html = ''
             if len(regime_history) >= 3:
                 _recent_probs = [x[2] for x in regime_history[-10:]]
@@ -2390,12 +2466,16 @@ class VolatilityAnalyzer:
             return {
                 'current_hv': current_hv, 'parkinson': current_park, 'mean_hv': mean_hv,
                 'min_hv': min_hv, 'max_hv': max_hv, 'hv_percentile': hv_percentile,
-                'regime': regime, 'regime_desc': regime_desc, 'ml_prob': ml_prob, 'bandwidth': current_bw,
-                'bw_percentile': bw_percentile, 'hv_slope': hv_slope,
+                'regime': regime, 'regime_desc': regime_desc, 'ml_prob': ml_prob,
+                'bandwidth': current_bw, 'bw_percentile': bw_percentile, 'hv_slope': hv_slope,
+                'st_regime': st_regime, 'mt_regime': mt_regime,
+                'hv_vals': hv_vals,
                 'prev_regime': _prev_regime, 'regime_changed_at': _regime_changed_at,
+                'trans_rows': _trans_rows_html,
                 'forecast_rows': forecast_rows_html,
                 'iv_velocity_5d': iv_velocity_5d, 'iv_accel': iv_accel, 'vov': vov,
                 'iv': iv, 'vrp': vrp, 'z_score': z_score, 'half_life': half_life,
+                'vrp_percentile': vrp_percentile,
                 'signal': signal_result, 'rolling_hv': rolling_hv
             }
 
@@ -2899,6 +2979,22 @@ class VolatilityAnalyzer:
                     except Exception as _e:
                         pass
                         
+                    # ── UPDATE SIGNAL MEMORY WITH CONTEXT ──
+                    if self.memory:
+                        ctx = {}
+                        if regime_snapshot:
+                            ctx['regime'] = regime_snapshot.get('regime', {}).get('name', 'UNKNOWN')
+                        if gex_data:
+                            ctx['net_gex'] = gex_data.get('net_gex', 0)
+                            ctx['net_vanna'] = gex_data.get('net_vanna', 0)
+                            ctx['net_charm'] = gex_data.get('net_charm', 0)
+                        if 'vol_intel' in locals() and vol_intel:
+                            ctx['vrp'] = vol_intel.get('vrp', 0) if 'vrp' in vol_intel else (vol_intel.get('iv', 0) - vol_intel.get('current_hv', 0))
+                        if 'momentum_data' in locals() and momentum_data:
+                            ctx['momentum_status'] = momentum_data.get('status', 'NEUTRAL')
+                            
+                        self.memory.update_context(ctx)
+
                     # ── MASTER SIGNAL VERDICT ──
                     verdict_data = self.master_engine.evaluate(self.memory)
 
@@ -2914,6 +3010,10 @@ class VolatilityAnalyzer:
                             gex_acceleration=gex_accel,
                             intraday_regime=regime_snapshot.get('regime', {}).get('name', '')
                         )
+                        
+                        if buyer_setup:
+                            from signal_broadcaster import SignalBroadcaster
+                            SignalBroadcaster.broadcast_trade(buyer_setup)
 
                     # ══════════════════════════════════════════
                     #  BUILD HTML
@@ -2985,16 +3085,16 @@ class VolatilityAnalyzer:
                         fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode='markers',
                             marker=dict(size=3, color=mc, opacity=0.85), name='Points'), row=1, col=2)
 
-                        fig.update_layout(height=480, width=1380, paper_bgcolor=DARK_BG,
-                            plot_bgcolor='rgba(20,20,35,0.8)',
+                        fig.update_layout(height=480, width=1380, paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
                             font=dict(color=WHITE, family='Inter, sans-serif', size=11),
                             legend=dict(bgcolor='rgba(30,30,50,0.8)', font=dict(size=10), x=0.01, y=0.99),
                             margin=dict(l=50, r=20, t=50, b=30), hovermode='closest',
                             scene=dict(
-                                xaxis=dict(title='Strike', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                yaxis=dict(title='Days', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                zaxis=dict(title='IV%', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)), bgcolor=DARK_BG))
+                                xaxis=dict(title='Strike', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                yaxis=dict(title='Days', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                zaxis=dict(title='IV%', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)), bgcolor='rgba(0,0,0,0)'))
                         fig.update_xaxes(gridcolor='rgba(100,100,100,0.15)', title='Strike', row=1, col=1)
                         fig.update_yaxes(gridcolor='rgba(100,100,100,0.15)', title='IV (%)', row=1, col=1)
                         iv_plotly = fig.to_html(include_plotlyjs=False, full_html=False)
@@ -3089,47 +3189,82 @@ class VolatilityAnalyzer:
                         _dte_note  = 'EXPIRY DAY — Extreme gamma risk!' if _dte_now == 0 \
                             else f'{_dte_now}d to weekly expiry'
 
+                        # ── VRP percentile for display ──
+                        _vrp_pct = v.get('vrp_percentile', 50)
+                        _vrp_pct_color = GREEN if _vrp_pct > 65 else RED if _vrp_pct < 35 else YELLOW
+                        _hv = v.get('hv_vals', {})
+
+                        # ── Short/medium-term regime colors ──
+                        _st_rg = v.get('st_regime', 'STABLE')
+                        _mt_rg = v.get('mt_regime', 'BELOW_MEAN')
+                        _st_color = RED if _st_rg == 'RISING' else GREEN
+                        _mt_color = RED if _mt_rg == 'ABOVE_MEAN' else GREEN
+
                         vol_tab_html = f'''
                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                             <div class="card">
                                 <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:14px;">HV STATISTICS (1-Year)</div>
                                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
-                                    <div class="metric-box"><div class="metric-label">20d HV</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{v['current_hv']:.2f}%</div><div class="metric-sub">Parkinson: {v['parkinson']:.2f}%</div></div>
+                                    <div class="metric-box"><div class="metric-label">20d HV (C2C)</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{v['current_hv']:.2f}%</div><div class="metric-sub">Parkinson: {v['parkinson']:.2f}%</div></div>
                                     <div class="metric-box"><div class="metric-label">1-Yr Mean</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{v['mean_hv']:.2f}%</div><div class="metric-sub">{v['min_hv']:.1f}% — {v['max_hv']:.1f}%</div></div>
                                     <div class="metric-box"><div class="metric-label">HV Percentile</div><div style="font-size:20px;font-weight:700;color:{YELLOW};">{v['hv_percentile']:.0f}%</div></div>
                                 </div>
                                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:12px;">
                                     <div class="metric-box"><div class="metric-label">ATM IV</div><div style="font-size:18px;font-weight:700;color:{WHITE};">{v['iv']:.2f}%</div></div>
                                     <div class="metric-box"><div class="metric-label">VRP</div><div style="font-size:18px;font-weight:700;color:{GREEN if v['vrp']>2 else RED if v['vrp']<-2 else WHITE};">{v['vrp']:+.2f}%</div></div>
-                                    <div class="metric-box"><div class="metric-label">Z-Score</div><div style="font-size:18px;font-weight:700;color:{WHITE};">{v['z_score']:.2f}</div></div>
+                                    <div class="metric-box"><div class="metric-label">VRP Rank</div><div style="font-size:18px;font-weight:700;color:{_vrp_pct_color};">{_vrp_pct:.0f}%ile</div><div class="metric-sub">vs 1yr window</div></div>
                                     <div class="metric-box"><div class="metric-label">Half-Life</div><div style="font-size:18px;font-weight:700;color:{WHITE};">{v['half_life']:.0f}d</div></div>
+                                </div>
+                                <div style="margin-top:14px;">
+                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:8px;">REALIZED VOL CONE — ALL ESTIMATORS</div>
+                                    <table class="data-table" style="font-size:11px;">
+                                        <thead><tr><th style="text-align:left;">Estimator</th><th>5d</th><th>10d</th><th>20d</th><th>60d</th></tr></thead>
+                                        <tbody>
+                                            <tr><td style="text-align:left;color:{WHITE};">Close-to-Close</td><td>{_hv.get('c2c_5',0):.2f}%</td><td>{_hv.get('c2c_10',0):.2f}%</td><td>{_hv.get('c2c_20',0):.2f}%</td><td>{_hv.get('c2c_60',0):.2f}%</td></tr>
+                                            <tr><td style="text-align:left;color:{WHITE};">Parkinson (H/L)</td><td>{_hv.get('pk_5',0):.2f}%</td><td>{_hv.get('pk_10',0):.2f}%</td><td>{_hv.get('pk_20',0):.2f}%</td><td>{_hv.get('pk_60',0):.2f}%</td></tr>
+                                            <tr><td style="text-align:left;color:{WHITE};">Garman-Klass</td><td>-</td><td>-</td><td>{_hv.get('gk_20',0):.2f}%</td><td>{_hv.get('gk_60',0):.2f}%</td></tr>
+                                            <tr><td style="text-align:left;color:{WHITE};">Yang-Zhang</td><td>-</td><td>-</td><td>{_hv.get('yz_20',0):.2f}%</td><td>{_hv.get('yz_60',0):.2f}%</td></tr>
+                                            <tr style="background:rgba(79,195,247,0.08);"><td style="text-align:left;font-weight:700;color:{ACCENT};">ATM IV</td><td colspan="4" style="text-align:center;font-weight:700;color:{ACCENT};">{v['iv']:.2f}% (VRP: {v['vrp']:+.2f}% | {_vrp_pct:.0f}th pct)</td></tr>
+                                        </tbody>
+                                    </table>
                                 </div>
                             </div>
                             <div class="card">
-                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:14px;">ML REGIME ENGINE (LSTM)</div>
-                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
-                                    <div class="metric-box"><div class="metric-label">CURRENT REGIME</div><div style="font-size:20px;font-weight:700;color:{regime_color};">{v['regime']}</div><div class="metric-sub">{v['regime_desc']}</div></div>
-                                    <div class="metric-box"><div class="metric-label">PRICE MOMENTUM</div><div style="font-size:20px;font-weight:700;color:{GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">{momentum_data['status']}</div><div class="metric-sub">VWAP: {momentum_data['vwap']} | EMA: {momentum_data['ema']}</div></div>
-                                </div>
-                                <div style="margin:12px 0 8px;color:{MUTED};font-size:11px;font-weight:600;">EXPANSION PROBABILITY</div>
-                                <div style="display:flex;align-items:center;gap:10px;margin:4px 0;">
-                                    <span style="color:{MUTED};width:100px;font-size:12px;">P(Expansion)</span>
-                                    <div style="flex:1;height:14px;background:#222;border-radius:4px;">
-                                        <div style="width:{v.get('ml_prob', 0.5)*100}%;height:100%;background:{RED if v.get('ml_prob', 0.5) > 0.65 else YELLOW if v.get('ml_prob', 0.5) > 0.35 else GREEN};border-radius:4px;transition:width 0.5s;"></div>
+                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:12px;">MULTI-TIMEFRAME REGIME MATRIX</div>
+                                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px;">
+                                    <div class="metric-box" style="border-top:3px solid {GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">
+                                        <div class="metric-label">INTRADAY</div>
+                                        <div style="font-size:16px;font-weight:800;color:{GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">{momentum_data['status']}</div>
+                                        <div class="metric-sub">VWAP/EMA momentum</div>
                                     </div>
-                                    <span style="color:{WHITE};font-size:16px;font-weight:700;width:50px;text-align:right;">{v.get('ml_prob', 0.5):.0%}</span>
+                                    <div class="metric-box" style="border-top:3px solid {_st_color};">
+                                        <div class="metric-label">SHORT-TERM (5d vs 20d)</div>
+                                        <div style="font-size:16px;font-weight:800;color:{_st_color};">{_st_rg}</div>
+                                        <div class="metric-sub">5d: {_hv.get('c2c_5',0):.2f}% vs 20d: {_hv.get('c2c_20',0):.2f}%</div>
+                                    </div>
+                                    <div class="metric-box" style="border-top:3px solid {_mt_color};">
+                                        <div class="metric-label">MEDIUM-TERM (vs mean)</div>
+                                        <div style="font-size:16px;font-weight:800;color:{_mt_color};">{_mt_rg}</div>
+                                        <div class="metric-sub">20d: {_hv.get('c2c_20',0):.2f}% | Mean: {v['mean_hv']:.2f}%</div>
+                                    </div>
                                 </div>
-                                <div style="margin-top:14px;color:{MUTED};font-size:11px;font-weight:600;">REGIME FORECAST (extrapolated from trend)</div>
-                                <table style="width:100%;margin-top:6px;border-collapse:collapse;font-size:12px;">
-                                    <tr style="color:{MUTED};border-bottom:1px solid #333;">
-                                        <th style="text-align:left;padding:4px 8px;">Horizon</th>
-                                        <th style="text-align:center;padding:4px 8px;">Est. P(Exp)</th>
-                                        <th style="text-align:center;padding:4px 8px;">Expected Regime</th>
-                                    </tr>
-                                    {v.get('forecast_rows', '<tr><td colspan="3" style="padding:4px 8px;color:#555;">Collecting data...</td></tr>')}
-                                </table>
-                                <div style="margin-top:10px;color:{MUTED};font-size:10px;border-top:1px solid #333;padding-top:6px;">
-                                    HV Slope: {v['hv_slope']:+.2f}% | BW Percentile: {v['bw_percentile']:.0f} | Samples: {len(regime_history)}
+                                <div style="margin-bottom:10px;">
+                                    <div class="metric-box" style="text-align:left;padding:10px 14px;">
+                                        <div class="metric-label">CURRENT REGIME</div>
+                                        <div style="font-size:18px;font-weight:800;color:{regime_color};margin:4px 0;">{v['regime']}</div>
+                                        <div style="font-size:11px;color:#aaa;">{v['regime_desc']}</div>
+                                        <div style="font-size:10px;color:{MUTED};margin-top:4px;">BBw: {v['bw_percentile']:.0f}th pct | HV Slope: {v['hv_slope']:+.2f}% | Changed: {v.get('regime_changed_at','—')}</div>
+                                    </div>
+                                </div>
+                                <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:6px;">REGIME TRANSITION LOG</div>
+                                <div style="max-height:140px;overflow-y:auto;background:#0a0a18;border-radius:6px;padding:4px;">
+                                    <table style="width:100%;border-collapse:collapse;font-size:11px;">
+                                        {v.get('trans_rows', '<tr><td colspan="2" style="padding:4px 8px;color:#555;">Building...</td></tr>')}
+                                    </table>
+                                </div>
+                                <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                                    <div class="metric-box"><div class="metric-label">Z-Score (IV)</div><div style="font-size:16px;font-weight:700;color:{WHITE};">{v['z_score']:.2f}×</div></div>
+                                    <div class="metric-box"><div class="metric-label">Samples</div><div style="font-size:16px;font-weight:700;color:{MUTED};">{len(regime_history)}</div></div>
                                 </div>
                             </div>
                         </div>
@@ -3147,10 +3282,11 @@ class VolatilityAnalyzer:
                                     <div class="metric-label">INTRADAY BIAS</div>
                                     <div style="font-size:20px;font-weight:900;color:{_intra_color};margin:6px 0;">{_intra_signal}</div>
                                 </div>
-                                <div style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                                <div style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;">
                                     <div class="metric-box"><div class="metric-label">IV Velocity (5d)</div><div style="font-size:18px;font-weight:700;color:{RED if _iv_velocity > 0.5 else GREEN if _iv_velocity < -0.5 else WHITE};">{_iv_velocity:+.2f}%</div><div class="metric-sub">IV drift trend</div></div>
                                     <div class="metric-box"><div class="metric-label">IV Z-Score</div><div style="font-size:18px;font-weight:700;color:{RED if _iv_zscore > 2 else GREEN if _iv_zscore < 0 else WHITE};">{_iv_zscore:.2f}×</div><div class="metric-sub">vs 1yr mean</div></div>
                                     <div class="metric-box"><div class="metric-label">VRP Edge</div><div style="font-size:18px;font-weight:700;color:{GREEN if _vrp_now > 2 else RED if _vrp_now < -2 else WHITE};">{_vrp_now:+.1f}%</div><div class="metric-sub">IV – HV</div></div>
+                                    <div class="metric-box"><div class="metric-label">VRP Rank</div><div style="font-size:18px;font-weight:700;color:{_vrp_pct_color};">{_vrp_pct:.0f}th pct</div><div class="metric-sub">1-year window</div></div>
                                 </div>
                             </div>
                             <div style="margin-top:10px;padding:8px 12px;background:#0d0d1e;border-radius:6px;color:{MUTED};font-size:11px;">
@@ -3321,7 +3457,7 @@ class VolatilityAnalyzer:
                                 _pin_txt = "PINNING \u2194" if abs(_net_gex)<5e6 else "TRENDING \u2195" if _net_gex<0 else "STABILITY \u2194"
                                 fig_gex.update_layout(
                                     height=max(350, len(_gex_by_strike) * 20),
-                                    paper_bgcolor=DARK_BG, plot_bgcolor='rgba(15,15,25,0.7)',
+                                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                                     font=dict(color=WHITE, family='Inter, sans-serif', size=11),
                                     margin=dict(l=60, r=60, t=50, b=40),
                                     title=dict(
@@ -3346,6 +3482,8 @@ class VolatilityAnalyzer:
                                     if _cum_gex.iloc[_idx-1] * _cum_gex.iloc[_idx] < 0:
                                         _flip_strike = int(_gex_by_strike.sort_values('strike').iloc[_idx]['strike'])
                                         break
+                                _flip_dist_txt = f'{abs(spot - _flip_strike):.0f} pts {"above" if spot > _flip_strike else "below"}' if _flip_strike else 'N/A'
+                                _flip_dist_c = GREEN if _flip_strike and spot > _flip_strike else RED if _flip_strike else MUTED
                                 gex_analysis_html = f'''
                                 <div style="margin-top:12px;padding:10px;background:rgba(15,15,25,0.5);border-radius:6px;">
                                     <div style="color:{ACCENT};font-size:12px;font-weight:700;margin-bottom:8px;">GEX ANALYSIS</div>
@@ -3354,12 +3492,96 @@ class VolatilityAnalyzer:
                                         <div class="metric-box"><div class="metric-label">Call Wall (Resistance)</div><div style="font-size:15px;font-weight:700;color:{WHITE};">{_max_call_strike:.0f}</div><div class="metric-sub">{_dist_call:.0f} pts from spot</div></div>
                                         <div class="metric-box"><div class="metric-label">Put Wall (Support)</div><div style="font-size:15px;font-weight:700;color:{WHITE};">{_max_put_strike:.0f}</div><div class="metric-sub">{_dist_put:.0f} pts from spot</div></div>
                                     </div>
-                                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+                                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px;">
                                         <div class="metric-box"><div class="metric-label">Net GEX</div><div style="font-size:15px;font-weight:700;color:{GREEN if _net_gex > 0 else RED};">{_net_gex/1e6:+.2f}M</div><div class="metric-sub">{_pin_txt}</div></div>
                                         <div class="metric-box"><div class="metric-label">GEX Flip Strike</div><div style="font-size:15px;font-weight:700;color:{YELLOW};">{_flip_strike if _flip_strike else 'N/A'}</div><div class="metric-sub">{'Above spot' if _flip_strike > spot else 'Below spot' if _flip_strike else ''}</div></div>
+                                        <div class="metric-box"><div class="metric-label">Spot vs Flip</div><div style="font-size:15px;font-weight:700;color:{_flip_dist_c};">{_flip_dist_txt}</div><div class="metric-sub">dealer flip boundary</div></div>
                                     </div>
                                 </div>'''
-                                chain_tab_html += f'<div class="card" style="margin-top:12px;padding:8px 16px;">{gex_html}{gex_analysis_html}</div>'
+
+                                # ── Per-strike GEX Trade Management Table ──
+                                _gex_mgmt_rows = ''
+                                _sorted_gex = _gex_by_strike.sort_values('strike', ascending=False)
+                                _gex_abs_max = _sorted_gex['gex'].abs().max() if not _sorted_gex.empty else 1
+                                for _, _gr in _sorted_gex.iterrows():
+                                    _sk = int(_gr['strike'])
+                                    _gx = _gr['gex']
+                                    _bar_w = int(abs(_gx) / _gex_abs_max * 100)
+                                    _is_atm = abs(_sk - spot) < 100
+                                    _is_call_w = (_sk == int(_max_call_strike))
+                                    _is_put_w  = (_sk == int(_max_put_strike))
+                                    _is_flip   = (_sk == _flip_strike)
+                                    # Role
+                                    if _is_flip:
+                                        _role = 'GEX FLIP'
+                                        _role_c = YELLOW
+                                    elif _is_call_w:
+                                        _role = 'CALL WALL'
+                                        _role_c = RED
+                                    elif _is_put_w:
+                                        _role = 'PUT WALL'
+                                        _role_c = GREEN
+                                    elif _is_atm:
+                                        _role = 'ATM ANCHOR'
+                                        _role_c = ACCENT
+                                    elif _gx > 0:
+                                        _role = 'DEALER LONG Γ'
+                                        _role_c = GREEN
+                                    else:
+                                        _role = 'DEALER SHORT Γ'
+                                        _role_c = RED
+                                    # Signal
+                                    if _is_call_w:
+                                        _sig = 'SELL CE above'
+                                        _stop = f'Break > {_sk+50} → exit'
+                                    elif _is_put_w:
+                                        _sig = 'SELL PE below'
+                                        _stop = f'Break < {_sk-50} → exit'
+                                    elif _is_flip:
+                                        _sig = 'Direction pivot'
+                                        _stop = 'Spot crosses = bias shift'
+                                    elif _gx < -2e6:
+                                        _sig = 'Resistance zone'
+                                        _stop = 'Close above = trend'
+                                    elif _gx > 2e6:
+                                        _sig = 'Support / bounce'
+                                        _stop = 'Close below = weak'
+                                    else:
+                                        _sig = 'Watch'
+                                        _stop = '—'
+                                    _sk_color = _role_c
+                                    _gex_str = f'{_gx/1e6:+.2f}M' if abs(_gx) >= 1e6 else f'{_gx/1e3:+.0f}K'
+                                    _arrow = '↑' if _gx > 0 else '↓'
+                                    _gex_mgmt_rows += (
+                                        f'<tr style="background:{"rgba(79,195,247,0.07)" if _is_atm else "rgba(255,68,68,0.05)" if _is_call_w else "rgba(102,187,106,0.05)" if _is_put_w else "rgba(255,200,0,0.04)" if _is_flip else "transparent"};border-bottom:1px solid #1a1a2e;">'
+                                        f'<td style="padding:5px 8px;font-weight:700;color:{_sk_color};">{_sk}{" ◄" if _is_atm else ""}</td>'
+                                        f'<td style="padding:5px 8px;font-size:10px;color:{"#ff4444" if _gx < 0 else "#66bb6a"};">{_arrow} {_gex_str}</td>'
+                                        f'<td style="padding:5px 8px;">'
+                                        f'  <span style="font-size:9px;font-weight:700;color:{_role_c};background:{_role_c}22;padding:2px 6px;border-radius:8px;">{_role}</span>'
+                                        f'</td>'
+                                        f'<td style="padding:5px 8px;font-size:10px;color:#aaa;">{_sig}</td>'
+                                        f'<td style="padding:5px 8px;font-size:10px;color:{MUTED};">{_stop}</td>'
+                                        f'</tr>'
+                                    )
+
+                                gex_mgmt_html = f'''
+                                <div style="margin-top:12px;">
+                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:8px;">GEX TRADE MANAGEMENT — PER STRIKE</div>
+                                    <div style="max-height:300px;overflow-y:auto;">
+                                        <table style="width:100%;border-collapse:collapse;font-size:11px;">
+                                            <thead><tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;position:sticky;top:0;background:#0f0f19;">
+                                                <th style="padding:5px 8px;text-align:left;">Strike</th>
+                                                <th style="padding:5px 8px;text-align:left;">Net GEX</th>
+                                                <th style="padding:5px 8px;text-align:left;">Role</th>
+                                                <th style="padding:5px 8px;text-align:left;">Signal</th>
+                                                <th style="padding:5px 8px;text-align:left;">Stop Zone</th>
+                                            </tr></thead>
+                                            <tbody>{_gex_mgmt_rows}</tbody>
+                                        </table>
+                                    </div>
+                                </div>'''
+
+                                chain_tab_html += f'<div class="card" style="margin-top:12px;padding:8px 16px;">{gex_html}{gex_analysis_html}{gex_mgmt_html}</div>'
                             except Exception as e:
                                 print(f"GEX Error: {e}")
                                 pass
@@ -3486,16 +3708,16 @@ class VolatilityAnalyzer:
                             ), row=1, col=2)
 
                         fig_pd.update_layout(
-                            height=480, width=1380, paper_bgcolor=DARK_BG,
-                            plot_bgcolor='rgba(20,20,35,0.8)',
+                            height=480, width=1380, paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
                             font=dict(color=WHITE, family='Inter, sans-serif', size=11),
                             legend=dict(bgcolor='rgba(30,30,50,0.8)', font=dict(size=10), x=0.01, y=0.99),
                             margin=dict(l=50, r=20, t=50, b=30), hovermode='closest',
                             scene=dict(
-                                xaxis=dict(title='Price', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                yaxis=dict(title='Days', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                zaxis=dict(title='PDF', backgroundcolor=DARK_BG, gridcolor='#333'),
-                                camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)), bgcolor=DARK_BG),
+                                xaxis=dict(title='Price', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                yaxis=dict(title='Days', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                zaxis=dict(title='PDF', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
+                                camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)), bgcolor='rgba(0,0,0,0)'),
                         )
                         fig_pd.update_xaxes(gridcolor='rgba(100,100,100,0.15)', title='NIFTY Price', row=1, col=1)
                         fig_pd.update_yaxes(gridcolor='rgba(100,100,100,0.15)', title='Probability Density', row=1, col=1)
@@ -3596,815 +3818,144 @@ class VolatilityAnalyzer:
                             except Exception:
                                 pass
 
-                    # ── TAB 5: STRATEGY ENGINE & LIVE P&L TRACKER ──
-                    strategy_tab_html = '<div class="card"><p style="color:#888;">Initializing Strategy Engine...</p></div>'
+                    # ── Strategy Engine tab removed from dashboard ──
+                    # StrategyManager / trackStrategy() / /api/track_strategy endpoint
+                    # remain active for strategy_builder.html standalone page.
+
+                    # ── MARKET MAKER POSITIONING TAB ──
+                    mm_tab_html = '<div class="card"><p style="color:#888;">Loading dealer positioning...</p></div>'
                     try:
-                        from StrategyEngine import (SmartStrategyGenerator, PayoffEngine,
-                                                     build_strategy_card_html,
-                                                     NIFTY_LOT, DARK_BG as _SE_BG)
+                        if not df_chain.empty and spot > 0:
+                            _lot_mm  = 75
+                            _T_mm = self.analytics.get_time_to_expiry(near_exp) or (1 / 365)
+                            _df_mm = df_chain.copy()
 
-                        # ── Market context ──────────────────────────────────────
-                        _T_strat   = self.analytics.get_time_to_expiry(near_exp)
-                        _iv_strat  = (vol_intel.get('iv', 15) if vol_intel else (pred.get('atm_iv', 15) if pred else 15))
-                        _market_ctx = {
-                            'T': _T_strat, 'iv': _iv_strat, 'atm_iv': _iv_strat,
-                            'vrp':     vol_intel.get('vrp', 0) if vol_intel else 0,
-                            'regime':  vol_intel.get('regime', 'NORMAL') if vol_intel else 'NORMAL',
-                            'call_wall': float(seller.get('call_wall', 0)) if seller else 0,
-                            'put_wall':  float(seller.get('put_wall', 0)) if seller else 0,
-                            'em':   float(seller.get('em', spot * 0.015)) if seller else spot * 0.015,
-                            'oi_pressure': oi_pressure,
-                            'DTE': seller.get('DTE', 7) if seller else 7,
-                        }
-                        _cw = _market_ctx['call_wall']
-                        _pw = _market_ctx['put_wall']
-                        _dte_s  = _market_ctx['DTE']
-                        _vrp_s  = _market_ctx['vrp']
-                        _reg_s  = _market_ctx['regime']
+                            # Compute gamma + delta via BSM per leg
+                            def _bsm_greeks(row):
+                                try:
+                                    calc_iv = self._ensure_iv(row['iv'], row['price'], row['strike'], _T_mm, row['type'])
+                                    sigma = max(calc_iv / 100.0, 0.01)
+                                    K = row['strike']; S = spot; r = 0.07
+                                    if K <= 0 or S <= 0:
+                                        return pd.Series({'gamma': 0.0, 'delta': 0.0, 'vega': 0.0})
+                                    sqT = np.sqrt(max(_T_mm, 1e-6))
+                                    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * _T_mm) / (sigma * sqT)
+                                    d2 = d1 - sigma * sqT
+                                    from scipy.stats import norm
+                                    phi = np.exp(-0.5 * d1**2) / np.sqrt(2 * np.pi)
+                                    gamma = phi / (S * sigma * sqT)
+                                    delta = norm.cdf(d1) if row['type'] == 'CE' else norm.cdf(d1) - 1
+                                    vega  = S * phi * sqT / 100.0  # vega per 1% IV move
+                                    return pd.Series({'gamma': gamma, 'delta': delta, 'vega': vega})
+                                except:
+                                    return pd.Series({'gamma': 0.0, 'delta': 0.0, 'vega': 0.0})
 
-                        # ── Context badge colors ──
-                        _dte_clr    = RED if _dte_s <= 1 else YELLOW if _dte_s <= 3 else GREEN
-                        _reg_clr    = YELLOW if _reg_s == 'COMPRESSION' else RED if _reg_s == 'EXPANSION' else '#64b5f6'
-                        _vrp_clr    = GREEN if _vrp_s > 2 else RED if _vrp_s < -2 else YELLOW
-                        _bias_lbl   = 'SELL PREMIUM' if _vrp_s > 3 else 'AVOID SELL' if _vrp_s < -2 else 'NEUTRAL'
-                        _bias_clr   = GREEN if _bias_lbl == 'SELL PREMIUM' else RED if 'AVOID' in _bias_lbl else YELLOW
+                            _greeks = _df_mm.apply(_bsm_greeks, axis=1)
+                            _df_mm[['gamma_mm', 'delta_mm', 'vega_mm']] = _greeks
 
-                        # ── Generate strategies ──────────────────────────────────
-                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp or "")
-                        _strategies = gen.generate()
+                            # Dealer exposure: dealer is counterparty to buyers (short calls, long puts roughly)
+                            # DEX: -(CE_delta * CE_OI - PE_delta * PE_OI) * lot
+                            # GEX: CE_gamma * CE_OI * lot * S^2 / 1e4 (positive) - same for PE (negative)
+                            # Vega exposure: CE_vega * CE_OI - PE_vega * PE_OI
+                            _df_mm['dex'] = _df_mm.apply(
+                                lambda r: -(r['delta_mm'] * r['oi'] * _lot_mm) if r['type'] == 'CE'
+                                else (abs(r['delta_mm']) * r['oi'] * _lot_mm), axis=1)
+                            _df_mm['gex_mm'] = _df_mm.apply(
+                                lambda r: r['gamma_mm'] * r['oi'] * _lot_mm * spot * spot / 10000
+                                         * (1 if r['type'] == 'CE' else -1), axis=1)
+                            _df_mm['vex'] = _df_mm.apply(
+                                lambda r: r['vega_mm'] * r['oi'] * (1 if r['type'] == 'CE' else -1), axis=1)
 
-                        # ── Build per-strategy data: payoff chart + metrics ──────
-                        _strat_data  = []   # list of dicts with name/score/html/metrics
-                        _iv_dec = float(_iv_strat) / 100.0 # type: ignore
-                        for _si, _so in enumerate(_strategies[:5]):
-                            _pe    = PayoffEngine(_so, spot, _T_strat, _iv_dec,
-                                                  call_wall=_cw, put_wall=_pw)
-                            _pr    = np.linspace(spot * 0.85, spot * 1.15, 1000)
-                            _max_p = _so.max_profit(_pr) * NIFTY_LOT
-                            _max_l = _so.max_loss(_pr)   * NIFTY_LOT
-                            _bes   = _so.breakevens(_pr)
-                            _pop   = _so.pop(spot, _T_strat, _iv_dec) * 100
-                            _ngrk  = _so.net_greeks(spot, _T_strat)
-                            _nprem = _so.net_premium * NIFTY_LOT
-                            _chart = _pe.build_payoff_chart().to_html(
-                                include_plotlyjs=False, full_html=False,
-                                config={'displayModeBar': False}
-                            )
-                            _greek_html = _pe.build_greeks_html()
+                            _net_dex = _df_mm['dex'].sum()
+                            _net_gex_mm = _df_mm['gex_mm'].sum()
+                            _net_vex = _df_mm['vex'].sum()
 
-                            # Leg rows for compact table
-                            _leg_rows = ''
-                            for _lg in _so.legs:
-                                _ltype_clr = '#4fc3f7' if _lg.opt_type == 'CE' else '#ef9a9a'
-                                _lact_clr  = RED if _lg.action == 'SELL' else GREEN
-                                _leg_rows += (
-                                    f'<tr style="border-bottom:1px solid #1e1e35;">'
-                                    f'<td style="padding:4px 10px;color:{_lact_clr};font-weight:700;">{_lg.action}</td>'
-                                    f'<td style="padding:4px 10px;color:{_ltype_clr};">{_lg.opt_type}</td>'
-                                    f'<td style="padding:4px 10px;color:{WHITE};font-weight:600;">{_lg.strike:.0f}</td>'
-                                    f'<td style="padding:4px 10px;color:{MUTED};">₹{_lg.entry_price:.1f}</td>'
-                                    f'<td style="padding:4px 10px;color:{MUTED};">{_lg.lots} lot</td>'
+                            _dex_bias = 'BUY SPOT' if _net_dex > 0 else 'SELL SPOT'
+                            _dex_c    = GREEN if _net_dex > 0 else RED
+                            _gex_pos  = 'LONG GAMMA (mean-rev)' if _net_gex_mm > 0 else 'SHORT GAMMA (trending)'
+                            _gex_c    = GREEN if _net_gex_mm > 0 else RED
+                            _vex_pos  = 'LONG VEGA (buy vol)' if _net_vex > 0 else 'SHORT VEGA (sell vol)'
+                            _vex_c    = GREEN if _net_vex > 0 else RED
+
+                            # Dealer bias summary
+                            if _net_gex_mm < 0 and abs(_net_dex) > 1000:
+                                _dealer_bias = 'HEDGING BUY SPOT ↑' if _net_dex > 0 else 'HEDGING SELL SPOT ↓'
+                                _bias_rationale = 'Short gamma dealers amplify moves — breakout risk'
+                                _bias_c = RED
+                            elif _net_gex_mm > 0:
+                                _dealer_bias = 'STABILIZING (PIN)'
+                                _bias_rationale = 'Long gamma dealers hedge: sell rallies, buy dips — pin behavior'
+                                _bias_c = GREEN
+                            else:
+                                _dealer_bias = 'NEUTRAL'
+                                _bias_rationale = 'Mixed positioning — no dominant dealer hedging pressure'
+                                _bias_c = YELLOW
+
+                            # Per-strike summary table
+                            _by_strike = _df_mm.groupby('strike').agg(
+                                dex=('dex','sum'), gex=('gex_mm','sum'), vex=('vex','sum')
+                            ).reset_index().sort_values('strike', ascending=False)
+                            _mm_rows = ''
+                            for _, _mr in _by_strike.iterrows():
+                                _msk = int(_mr['strike'])
+                                _md = _mr['dex']; _mg = _mr['gex']; _mv = _mr['vex']
+                                _mc = GREEN if _md > 0 else RED
+                                _gc = GREEN if _mg > 0 else RED
+                                _vc = GREEN if _mv > 0 else RED
+                                _is_atm_mm = abs(_msk - spot) < 100
+                                _mm_rows += (
+                                    f'<tr style="background:{"rgba(79,195,247,0.06)" if _is_atm_mm else "transparent"};border-bottom:1px solid #1a1a2e;">'
+                                    f'<td style="padding:4px 8px;font-weight:700;color:{ACCENT if _is_atm_mm else WHITE};">{_msk}{" ◄ ATM" if _is_atm_mm else ""}</td>'
+                                    f'<td style="padding:4px 8px;text-align:right;color:{_mc};">{"+" if _md>0 else ""}{_md/1000:.1f}K</td>'
+                                    f'<td style="padding:4px 8px;text-align:right;color:{_gc};">{"+" if _mg>0 else ""}{_mg/1e6:.2f}M</td>'
+                                    f'<td style="padding:4px 8px;text-align:right;color:{_vc};">{"+" if _mv>0 else ""}{_mv:.0f}</td>'
                                     f'</tr>'
                                 )
 
-                            _pop_clr = GREEN if _pop >= 65 else YELLOW if _pop >= 50 else RED
-                            _prem_clr = GREEN if _nprem > 0 else RED
-                            _rr_str = f'1:{abs(_max_p / _max_l):.1f}' if _max_l != 0 and abs(_max_l) < 1e6 else '∞'
-                            _bes_str = ' / '.join(f'{b:,.0f}' for b in _bes) if _bes else '—'
-                            _payload = json.dumps(_so.to_dict()).replace('"', '&quot;')
-
-                            _strat_data.append({
-                                'name':    _so.name,
-                                'score':   _so.score,
-                                'type':    _so.strategy_type,
-                                'pop':     _pop,
-                                'pop_clr': _pop_clr,
-                                'nprem':   _nprem,
-                                'prem_clr': _prem_clr,
-                                'max_p':   _max_p,
-                                'max_l':   abs(_max_l),
-                                'rr_str':  _rr_str,
-                                'bes_str': _bes_str,
-                                'chart_html': _chart,
-                                'greek_html': _greek_html,
-                                'ngrk':    _ngrk,
-                                'leg_rows': _leg_rows,
-                                'payload': _payload,
-                                'idx':     _si,
-                            })
-
-                        # ── Standalone backtest runner migrated to outer scope ───────────
-
-                        # ── Live P&L tracker data ────────────────────────────────
-                        tracked   = _strategy_manager.get_all_active_strategies()
-                        closed_h  = _strategy_manager.get_closed_strategies(limit=8)
-                        summary   = _strategy_manager.get_summary()
-                        tracked_html = generate_tracked_html(tracked, df_chain)
-                        _total_pnl   = summary.get('total_realized_pnl', 0)
-                        _total_clr   = GREEN if _total_pnl >= 0 else RED
-
-                        _closed_rows = ''
-                        for _ct in closed_h:
-                            _pnl = _ct.get('pnl', 0) or 0
-                            _pc  = GREEN if _pnl > 0 else RED
-                            _closed_rows += (
-                                f'<tr style="border-bottom:1px solid #1a1a2e;">'
-                                f'<td style="padding:5px 8px;color:#ccc;">{_ct.get("name","")}</td>'
-                                f'<td style="padding:5px 8px;color:{MUTED};">{(_ct.get("exit_time_str","") or "")[:10]}</td>'
-                                f'<td style="padding:5px 8px;text-align:right;font-weight:700;color:{_pc};">'
-                                f'{"+" if _pnl > 0 else ""}₹{_pnl:,.0f}</td>'
-                                f'</tr>'
-                            )
-
-                        # ── Build strategy pills + hidden strategy panels ─────────
-                        _pills_html  = ''
-                        _panels_html = ''
-                        _num_strats  = len(_strat_data)
-
-                        for _sd in _strat_data:
-                            _i         = _sd['idx']
-                            _sc        = GREEN if _sd['score'] >= 70 else YELLOW if _sd['score'] >= 45 else RED
-                            _active    = 'strat-pill-active' if _i == 0 else ''
-                            _pstyle_attr = '' if _i == 0 else ' style="display:none;"'
-
-                            _pills_html += f'''
-                            <button class="strat-pill {_active}" onclick="selectStrat({_i})"
-                                    id="pill-{_i}"
-                                    style="background:{"#1e2a3a" if _i == 0 else "#12121e"};
-                                           color:{_sc if _i == 0 else MUTED};
-                                           border:1px solid {_sc if _i == 0 else "#2a2a4a"};
-                                           border-radius:20px;padding:6px 16px;cursor:pointer;
-                                           font-size:11px;font-weight:700;white-space:nowrap;
-                                           transition:all 0.2s;">
-                                {_sd["name"]}
-                                <span style="font-size:10px;opacity:0.8;">({_sd["score"]})</span>
-                            </button>'''
-
-                            _panels_html += f'''
-                            <div id="strat-panel-{_i}"{_pstyle_attr}>
-                                <!-- Top metrics row -->
-                                <div style="display:grid;grid-template-columns:repeat(6,1fr);
-                                            gap:8px;margin-bottom:12px;">
-                                    <div style="background:#0d0d20;border:1px solid {_sd["pop_clr"]}44;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">POP</div>
-                                        <div style="font-size:28px;font-weight:900;
-                                                    color:{_sd["pop_clr"]};line-height:1;">{_sd["pop"]:.0f}%</div>
-                                    </div>
-                                    <div style="background:#0d0d20;border:1px solid #2a2a4a;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">Net Premium</div>
-                                        <div style="font-size:16px;font-weight:800;
-                                                    color:{_sd["prem_clr"]};">
-                                            {"+" if _sd["nprem"] > 0 else ""}₹{_sd["nprem"]:.0f}</div>
-                                    </div>
-                                    <div style="background:#0d0d20;border:1px solid #2a2a4a;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">Max Profit</div>
-                                        <div style="font-size:16px;font-weight:800;color:{GREEN};">
-                                            {"∞" if _sd["max_p"] > 1e6 else f"₹{_sd['max_p']:,.0f}"}</div>
-                                    </div>
-                                    <div style="background:#0d0d20;border:1px solid #2a2a4a;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">Max Loss</div>
-                                        <div style="font-size:16px;font-weight:800;color:{RED};">
-                                            {"∞" if _sd["max_l"] > 1e6 else f"₹{_sd['max_l']:,.0f}"}</div>
-                                    </div>
-                                    <div style="background:#0d0d20;border:1px solid #2a2a4a;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">R:R</div>
-                                        <div style="font-size:16px;font-weight:800;color:{WHITE};">{_sd["rr_str"]}</div>
-                                    </div>
-                                    <div style="background:#0d0d20;border:1px solid #2a2a4a;
-                                                border-radius:8px;padding:12px 8px;text-align:center;">
-                                        <div style="color:{MUTED};font-size:9px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:4px;">Breakeven(s)</div>
-                                        <div style="font-size:12px;font-weight:700;color:#ff7043;">{_sd["bes_str"]}</div>
+                            mm_tab_html = f'''
+                            <!-- MM Summary -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+                                <div class="card" style="border-left:4px solid {_bias_c};">
+                                    <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:12px;">DEALER POSITIONING SIGNAL</div>
+                                    <div style="font-size:22px;font-weight:900;color:{_bias_c};margin-bottom:6px;">{_dealer_bias}</div>
+                                    <div style="font-size:11px;color:#aaa;margin-bottom:14px;">{_bias_rationale}</div>
+                                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                                        <div class="metric-box" style="border-top:3px solid {_dex_c};">
+                                            <div class="metric-label">Dealer DEX</div>
+                                            <div style="font-size:16px;font-weight:800;color:{_dex_c};">{_dex_bias}</div>
+                                            <div class="metric-sub">{_net_dex/1000:+.1f}K units</div>
+                                        </div>
+                                        <div class="metric-box" style="border-top:3px solid {_gex_c};">
+                                            <div class="metric-label">Dealer GEX</div>
+                                            <div style="font-size:16px;font-weight:800;color:{_gex_c};">{_gex_pos}</div>
+                                            <div class="metric-sub">{_net_gex_mm/1e6:+.2f}M</div>
+                                        </div>
+                                        <div class="metric-box" style="border-top:3px solid {_vex_c};">
+                                            <div class="metric-label">Dealer Vega</div>
+                                            <div style="font-size:16px;font-weight:800;color:{_vex_c};">{_vex_pos}</div>
+                                            <div class="metric-sub">{_net_vex:+.0f} total</div>
+                                        </div>
                                     </div>
                                 </div>
-
-                                <!-- Greeks mini-bar -->
-                                <div style="display:flex;gap:14px;background:#0a0a18;border-radius:6px;
-                                            padding:8px 14px;margin-bottom:10px;flex-wrap:wrap;">
-                                    {f'<span style="color:{MUTED};font-size:10px;">Δ <b style="color:{"#ef9a9a" if _sd["ngrk"]["delta"] < 0 else "#a5d6a7"};">{_sd["ngrk"]["delta"]:+.3f}</b></span>'}
-                                    {f'<span style="color:{MUTED};font-size:10px;">Γ <b style="color:#aaa;">{_sd["ngrk"]["gamma"]:.4f}</b></span>'}
-                                    {f'<span style="color:{MUTED};font-size:10px;">θ/d <b style="color:{"#a5d6a7" if _sd["ngrk"]["theta"] > 0 else "#ef9a9a"};">{_sd["ngrk"]["theta"]:+.1f}</b></span>'}
-                                    {f'<span style="color:{MUTED};font-size:10px;">ν% <b style="color:#aaa;">{_sd["ngrk"]["vega"]:+.1f}</b></span>'}
-                                    <span style="margin-left:auto;">
-                                        <button onclick="trackStrategy('{_sd["payload"]}')"
-                                                style="background:{GREEN};color:#000;border:none;
-                                                       border-radius:6px;padding:5px 16px;font-size:11px;
-                                                       font-weight:700;cursor:pointer;">⊕ Track Live</button>
-                                    </span>
-                                </div>
-
-                                <!-- Payoff chart (full width) -->
-                                {_sd["chart_html"]}
-
-                                <!-- Leg breakdown + Greeks detail (collapsible) -->
-                                <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:10px;margin-top:10px;">
-                                    <div>
-                                        <div style="color:{MUTED};font-size:10px;font-weight:700;
-                                                    text-transform:uppercase;margin-bottom:6px;">Legs</div>
-                                        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                                <div class="card">
+                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:10px;">DEALER EXPOSURE BY STRIKE</div>
+                                    <div style="max-height:340px;overflow-y:auto;">
+                                        <table style="width:100%;border-collapse:collapse;font-size:11px;">
                                             <thead><tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;">
-                                                <th style="padding:4px 10px;text-align:left;">Action</th>
-                                                <th style="padding:4px 10px;text-align:left;">Type</th>
-                                                <th style="padding:4px 10px;text-align:left;">Strike</th>
-                                                <th style="padding:4px 10px;text-align:left;">Price</th>
-                                                <th style="padding:4px 10px;text-align:left;">Qty</th>
+                                                <th style="padding:4px 8px;text-align:left;">Strike</th>
+                                                <th style="padding:4px 8px;text-align:right;">DEX</th>
+                                                <th style="padding:4px 8px;text-align:right;">GEX</th>
+                                                <th style="padding:4px 8px;text-align:right;">Vega</th>
                                             </tr></thead>
-                                            <tbody>{_sd["leg_rows"]}</tbody>
+                                            <tbody>{_mm_rows}</tbody>
                                         </table>
                                     </div>
-                                    <details>
-                                        <summary style="color:{MUTED};font-size:10px;font-weight:700;
-                                                        text-transform:uppercase;cursor:pointer;
-                                                        padding:4px 0;">▶ Greeks per leg (1 lot)</summary>
-                                        <div style="margin-top:6px;">{_sd["greek_html"]}</div>
-                                    </details>
                                 </div>
                             </div>'''
+                    except Exception as _mm_e:
+                        mm_tab_html = f'<div class="card"><p style="color:#ff4444;">Dealer positioning error: {str(_mm_e)}</p></div>'
 
-                        # ── Assemble full strategy tab HTML ──────────────────────
-                        strategy_tab_html = f'''
-                        <!-- ===================== CONTEXT BAR ===================== -->
-                        <div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center;
-                                    background:linear-gradient(135deg,#12122a,#0e0e1e);
-                                    border:1px solid #252540;border-radius:10px;
-                                    padding:10px 16px;margin-bottom:14px;">
-                            <span style="font-size:13px;font-weight:900;color:{ACCENT};
-                                         letter-spacing:1px;margin-right:6px;">⚡ STRATEGY ENGINE</span>
-                            <span style="background:{_dte_clr}1a;color:{_dte_clr};font-size:11px;
-                                         font-weight:700;padding:3px 11px;border-radius:12px;
-                                         border:1px solid {_dte_clr}44;">{_dte_s}d expiry</span>
-                            <span style="background:{_reg_clr}1a;color:{_reg_clr};font-size:11px;
-                                         font-weight:700;padding:3px 11px;border-radius:12px;
-                                         border:1px solid {_reg_clr}44;">{_reg_s}</span>
-                            <span style="background:{_vrp_clr}1a;color:{_vrp_clr};font-size:11px;
-                                         padding:3px 11px;border-radius:12px;
-                                         border:1px solid {_vrp_clr}44;">VRP {_vrp_s:+.1f}%</span>
-                            <span style="background:#1a1a30;color:{MUTED};font-size:11px;
-                                         padding:3px 11px;border-radius:12px;">IV {_iv_strat:.1f}%</span>
-                            {'<span style="background:#1a1a30;color:#aaa;font-size:11px;padding:3px 11px;border-radius:12px;">⬆ CW ' + f'{_cw:.0f}' + '</span>' if _cw else ''}
-                            {'<span style="background:#1a1a30;color:#aaa;font-size:11px;padding:3px 11px;border-radius:12px;">⬇ PW ' + f'{_pw:.0f}' + '</span>' if _pw else ''}
-                            <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
-                                <span style="font-size:12px;font-weight:900;padding:4px 16px;
-                                             border-radius:12px;
-                                             background:{_bias_clr}22;color:{_bias_clr};
-                                             border:1px solid {_bias_clr}55;">{_bias_lbl}</span>
-                            </div>
-                        </div>
-
-                        <!-- =================== MAIN GRID ========================= -->
-                        <div style="display:grid;grid-template-columns:1fr 2.2fr;gap:14px;">
-
-                            <!-- LEFT COLUMN: Tracker + closed trades -->
-                            <div>
-                                <div class="card" style="margin-bottom:12px;">
-                                    <div style="display:flex;justify-content:space-between;
-                                                align-items:center;margin-bottom:10px;">
-                                        <span style="color:{ACCENT};font-size:12px;font-weight:700;
-                                                     letter-spacing:2px;">LIVE P&amp;L TRACKER</span>
-                                        <span style="color:{_total_clr};font-size:12px;font-weight:700;">
-                                            {"+" if _total_pnl >= 0 else ""}₹{_total_pnl:,.0f} realized</span>
-                                    </div>
-                                    <div id="pnlTrackerContainer" style="max-height:280px;overflow-y:auto;">
-                                        {tracked_html}
-                                    </div>
-                                    <div style="display:flex;gap:7px;margin-top:10px;flex-wrap:wrap;">
-                                        <input type="time" id="histScrubTime"
-                                               style="background:#0d0d20;color:{WHITE};
-                                                      border:1px solid #333;border-radius:5px;
-                                                      padding:3px 7px;font-size:11px;flex:1;">
-                                        <button onclick="fetchHistoricalPNL()"
-                                                style="background:{ACCENT};color:#000;border:none;
-                                                       border-radius:5px;padding:4px 12px;font-size:11px;
-                                                       font-weight:700;cursor:pointer;">Scrub</button>
-                                        <button onclick="resetToLivePNL()"
-                                                style="background:#1e1e30;color:{MUTED};border:none;
-                                                       border-radius:5px;padding:4px 10px;font-size:11px;
-                                                       cursor:pointer;">Live</button>
-                                    </div>
-                                </div>
-
-                                <div class="card">
-                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;
-                                                letter-spacing:2px;margin-bottom:8px;">CLOSED TRADES</div>
-                                    <table style="width:100%;border-collapse:collapse;font-size:11px;">
-                                        <thead>
-                                            <tr style="color:{MUTED};border-bottom:1px solid #252540;">
-                                                <th style="text-align:left;padding:4px 8px;">Strategy</th>
-                                                <th style="text-align:left;padding:4px 8px;">Exit</th>
-                                                <th style="text-align:right;padding:4px 8px;">P&amp;L</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {_closed_rows or f'<tr><td colspan="3" style="padding:8px;color:#444;text-align:center;">No closed trades yet</td></tr>'}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-
-                            <!-- RIGHT COLUMN: Strategy selector + payoff -->
-                            <div>
-                                <div class="card">
-                                    <!-- Strategy Selector Pills -->
-                                    <div style="display:flex;gap:7px;flex-wrap:wrap;
-                                                margin-bottom:14px;align-items:center;">
-                                        <span style="color:{MUTED};font-size:10px;font-weight:700;
-                                                     text-transform:uppercase;margin-right:4px;">Strategy:</span>
-                                        {_pills_html}
-                                    </div>
-                                    <!-- Strategy content panels (one visible at a time) -->
-                                    {_panels_html}
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- =================== BACKTEST PANEL ==================== -->
-                        <div class="card" style="margin-top:14px;">
-                            <div style="display:flex;justify-content:space-between;
-                                        align-items:center;margin-bottom:10px;">
-                                <div>
-                                    <span style="color:{ACCENT};font-size:12px;font-weight:700;
-                                                 letter-spacing:2px;">📊 BACKTESTER</span>
-                                    <span style="color:{MUTED};font-size:10px;margin-left:10px;">
-                                        NSE Bhavcopy (EOD) · Weekly Thursday expiry · Runs in background
-                                    </span>
-                                </div>
-                            </div>
-                            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;
-                                        background:#0a0a18;border-radius:8px;padding:10px 14px;
-                                        margin-bottom:10px;">
-                                <div>
-                                    <div style="color:{MUTED};font-size:9px;margin-bottom:4px;
-                                                text-transform:uppercase;">Strategy</div>
-                                    <select id="bt-type"
-                                            style="background:#12122a;color:{WHITE};border:1px solid #333;
-                                                   border-radius:5px;padding:5px 10px;font-size:12px;">
-                                        <option value="SHORT_STRADDLE">Short Straddle</option>
-                                        <option value="SHORT_STRANGLE">Short Strangle</option>
-                                        <option value="IRON_CONDOR">Iron Condor</option>
-                                        <option value="BULL_PUT_SPREAD">Bull Put Spread</option>
-                                        <option value="BEAR_CALL_SPREAD">Bear Call Spread</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <div style="color:{MUTED};font-size:9px;margin-bottom:4px;
-                                                text-transform:uppercase;">Period</div>
-                                    <select id="bt-days"
-                                            style="background:#12122a;color:{WHITE};border:1px solid #333;
-                                                   border-radius:5px;padding:5px 10px;font-size:12px;">
-                                        <option value="180">6 months</option>
-                                        <option value="365" selected>1 year</option>
-                                        <option value="730">2 years</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <div style="color:{MUTED};font-size:9px;margin-bottom:4px;
-                                                text-transform:uppercase;">Stop Loss</div>
-                                    <select id="bt-sl"
-                                            style="background:#12122a;color:{WHITE};border:1px solid #333;
-                                                   border-radius:5px;padding:5px 10px;font-size:12px;">
-                                        <option value="1.5">1.5× premium</option>
-                                        <option value="2.0" selected>2× premium</option>
-                                        <option value="3.0">3× premium</option>
-                                        <option value="99">No SL</option>
-                                    </select>
-                                </div>
-                                <button onclick="runBt()"
-                                        style="background:linear-gradient(135deg,{ACCENT},{ACCENT}aa);
-                                               color:#000;border:none;border-radius:7px;
-                                               padding:8px 22px;font-size:12px;font-weight:800;
-                                               cursor:pointer;letter-spacing:0.5px;">▶ Run</button>
-                                <div id="bt-status"
-                                     style="color:{YELLOW};font-size:11px;font-weight:600;
-                                            display:flex;align-items:center;gap:6px;">
-                                </div>
-                            </div>
-                            <div id="bt-results"></div>
-                        </div>
-
-                        <script>
-                        // ── Strategy pill selector ───────────────────────────────
-                        function selectStrat(idx) {{
-                            var total = {_num_strats};
-                            for (var i = 0; i < total; i++) {{
-                                var panel = document.getElementById('strat-panel-' + i);
-                                var pill  = document.getElementById('pill-' + i);
-                                if (panel) panel.style.display = (i === idx) ? '' : 'none';
-                                if (pill) {{
-                                    pill.style.background = (i === idx) ? '#1e2a3a' : '#12121e';
-                                    pill.style.color      = (i === idx) ? '#4fc3f7' : '#888';
-                                    pill.style.border     = '1px solid ' + (i === idx ? '#4fc3f7' : '#2a2a4a');
-                                }}
-                            }}
-                        }}
-
-                        // ── Standalone backtest (no DataServer needed) ───────────
-                        function runBt() {{
-                            var type = document.getElementById('bt-type').value;
-                            var days = parseInt(document.getElementById('bt-days').value);
-                            var sl   = parseFloat(document.getElementById('bt-sl').value);
-                            var stat = document.getElementById('bt-status');
-                            var res  = document.getElementById('bt-results');
-                            stat.innerHTML = '<span style="animation:pulse 1s infinite;">⏳</span> Running — may take 30-90 s…';
-                            res.innerHTML = '';
-
-                            // POST to the local HTTP server's /bt_run endpoint
-                            fetch('/bt_run', {{
-                                method: 'POST',
-                                headers: {{'Content-Type': 'application/json'}},
-                                body: JSON.stringify({{type: type, days: days, sl: sl}})
-                            }}).then(function(r) {{ return r.text(); }})
-                            .then(function(t) {{
-                                stat.textContent = '⏳ Processing…';
-                                pollBt(type);
-                            }}).catch(function() {{
-                                // Fallback: if no custom handler, notify
-                                stat.textContent = '⚠ Refresh after 60s — running in background';
-                            }});
-                        }}
-
-                        function pollBt(type) {{
-                            var maxTries = 40, tries = 0;
-                            var poll = setInterval(function() {{
-                                tries++;
-                                fetch('/bt_' + type + '.html?t=' + Date.now())
-                                .then(function(r) {{
-                                    if (r.ok) {{
-                                        return r.text().then(function(html) {{
-                                            if (html && html.length > 50) {{
-                                                clearInterval(poll);
-                                                document.getElementById('bt-status').textContent = '✓ Complete';
-                                                document.getElementById('bt-results').innerHTML = html;
-                                            }}
-                                        }});
-                                    }}
-                                }}).catch(function() {{}});
-                                if (tries >= maxTries) {{
-                                    clearInterval(poll);
-                                    document.getElementById('bt-status').textContent =
-                                        '⚠ Still running — refresh the tab manually';
-                                }}
-                            }}, 3000);
-                        }}
-
-                        // ── Track strategy ───────────────────────────────────────
-                        function trackStrategy(payloadStr) {{
-                            var payload;
-                            try {{ payload = JSON.parse(payloadStr.replace(/&quot;/g, '"')); }}
-                            catch(e) {{ alert('Parse error: ' + e); return; }}
-
-                            // Use relative path — works locally and via Cloudflare tunnel
-                            var targets = ['/api/track_strategy'];
-                            var attempt = function(idx) {{
-                                if (idx >= targets.length) {{
-                                    alert('Could not save — DataServer and local handler not available.');
-                                    return;
-                                }}
-                                fetch(targets[idx], {{
-                                    method: 'POST',
-                                    headers: {{'Content-Type': 'application/json'}},
-                                    body: JSON.stringify(payload)
-                                }}).then(function(r) {{ return r.json(); }})
-                                .then(function(d) {{
-                                    if (d.ok) {{
-                                        var btn = event.target;
-                                        btn.textContent = '✓ Tracked!';
-                                        btn.style.background = '#388e3c';
-                                        setTimeout(function() {{
-                                            btn.textContent = '⊕ Track Live';
-                                            btn.style.background = '#66bb6a';
-                                        }}, 2000);
-                                    }}
-                                }}).catch(function() {{ attempt(idx + 1); }});
-                            }};
-                            attempt(0);
-                        }}
-                        </script>'''
-
-                    except Exception as e:
-                        import traceback
-                        strategy_tab_html = f'<div class="card"><p style="color:#ff4444;">Strategy Engine Error: {str(e)}</p><pre style="color:#888;font-size:10px;">{traceback.format_exc()[:600]}</pre></div>'
-
-
-                        import plotly
-                        _plotlyjs_cdn = '<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>'
-
-                        # ── Market context for strategy generation ──
-                        _T_strat  = self.analytics.get_time_to_expiry(near_exp)
-                        _iv_strat = (vol_intel.get('iv', 15) if vol_intel else 15)
-                        _market_ctx = {
-                            'T':          _T_strat,
-                            'iv':         _iv_strat,
-                            'vrp':        vol_intel.get('vrp', 0) if vol_intel else 0,
-                            'regime':     vol_intel.get('regime', 'NORMAL') if vol_intel else 'NORMAL',
-                            'atm_iv':     _iv_strat,
-                            'call_wall':  float(seller.get('call_wall', 0)) if seller else 0,
-                            'put_wall':   float(seller.get('put_wall', 0)) if seller else 0,
-                            'em':         float(seller.get('em', spot * 0.015)) if seller else spot * 0.015,
-                            'oi_pressure': oi_pressure,
-                            'DTE':        seller.get('DTE', 7) if seller else 7,
-                        }
-                        _call_wall_s = _market_ctx['call_wall']
-                        _put_wall_s  = _market_ctx['put_wall']
-                        _dte_s       = _market_ctx['DTE']
-                        _iv_pct      = _iv_strat
-                        _vrp_s       = _market_ctx['vrp']
-                        _regime_s    = _market_ctx['regime']
-
-                        # ── Context bar colors ──
-                        _dte_clr = RED if _dte_s <= 1 else YELLOW if _dte_s <= 3 else GREEN
-                        _regime_clr = YELLOW if _regime_s == 'COMPRESSION' else RED if _regime_s == 'EXPANSION' else GREEN
-                        _vrp_clr = GREEN if _vrp_s > 2 else RED if _vrp_s < -2 else YELLOW
-                        _intra_bias = 'SELL-PREMIUM' if _vrp_s > 3 else 'AVOID SELL' if _vrp_s < -2 else 'NEUTRAL'
-                        _bias_clr   = GREEN if _intra_bias == 'SELL-PREMIUM' else RED if 'AVOID' in _intra_bias else YELLOW
-
-                        # ── Strategy generation with payoff charts ──
-                        from StrategyEngine import SmartStrategyGenerator, build_strategy_card_html
-                        gen = SmartStrategyGenerator(spot, df_chain, _market_ctx, near_exp or "")
-                        _strategies = gen.generate()
-
-                        strat_cards_html = ''
-                        for _s_obj in _strategies[:4]:   # Top 4 by score
-                            _payload = json.dumps(_s_obj.to_dict()).replace('"', '&quot;')
-                            strat_cards_html += build_strategy_card_html(
-                                _s_obj, spot, _T_strat, _iv_strat / 100,
-                                call_wall=_call_wall_s, put_wall=_put_wall_s,
-                                payload_json=_payload
-                            )
-
-                        # ── Live P&L tracker ──
-                        tracked  = _strategy_manager.get_all_active_strategies()
-                        closed_h = _strategy_manager.get_closed_strategies(limit=5)
-                        summary  = _strategy_manager.get_summary()
-                        tracked_html = generate_tracked_html(tracked, df_chain)
-
-                        # Closed trades mini-table
-                        _closed_rows = ''
-                        for _ct in closed_h:
-                            _pnl = _ct.get('pnl', 0) or 0
-                            _pnl_clr = GREEN if _pnl > 0 else RED
-                            _closed_rows += (
-                                f'<tr><td style="padding:4px 8px;color:#aaa;">{_ct.get("name","")}</td>'
-                                f'<td style="padding:4px 8px;color:{MUTED};">{_ct.get("exit_time_str","")[:10]}</td>'
-                                f'<td style="padding:4px 8px;text-align:right;font-weight:700;color:{_pnl_clr};">'
-                                f'{"+" if _pnl > 0 else ""}₹{_pnl:,.0f}</td></tr>'
-                            )
-                        _total_pnl    = summary.get('total_realized_pnl', 0)
-                        _total_pnl_clr = GREEN if _total_pnl >= 0 else RED
-
-                        buyer_setup_html = ""
-                        if buyer_setup:
-                            _bu = buyer_setup
-                            _bc_color = GREEN if 'BULLISH' in _bu['verdict_base'] else RED if 'BEARISH' in _bu['verdict_base'] else YELLOW
-                            buyer_setup_html = f'''
-                            <div class="card" style="margin-bottom:12px; border:1px solid {_bc_color}66; background:rgba(20,20,35,0.7);">
-                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                                    <div style="color:{_bc_color};font-size:14px;font-weight:900;letter-spacing:1px;">
-                                        ⚡ OPTION BUYER SETUP
-                                    </div>
-                                    <span style="color:{WHITE};font-size:12px;font-weight:700;background:{_bc_color}33;padding:2px 8px;border-radius:4px;">
-                                        {_bu['timing']}
-                                    </span>
-                                </div>
-                                <div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;margin-bottom:10px;">
-                                    <div>
-                                        <div style="color:{MUTED};font-size:11px;text-transform:uppercase;">Action</div>
-                                        <div style="color:{WHITE};font-size:16px;font-weight:900;">{_bu['action']}</div>
-                                    </div>
-                                    <div style="text-align:right;">
-                                        <div style="color:{MUTED};font-size:11px;text-transform:uppercase;">Entry Limit</div>
-                                        <div style="color:{ACCENT};font-size:16px;font-weight:900;">₹{_bu['entry_limit']}</div>
-                                    </div>
-                                </div>
-                                <div style="display:flex;justify-content:space-between;gap:10px;">
-                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {GREEN}33;">
-                                        <div style="color:{MUTED};font-size:10px;">Target 1 (0.5%)</div>
-                                        <div style="color:{GREEN};font-weight:700;">₹{_bu['t1_premium']}</div>
-                                    </div>
-                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {GREEN}55;">
-                                        <div style="color:{MUTED};font-size:10px;">Target 2 (1.0%)</div>
-                                        <div style="color:{GREEN};font-weight:700;">₹{_bu['t2_premium']}</div>
-                                    </div>
-                                    <div style="flex:1;background:#0d0d1a;padding:8px;border-radius:6px;text-align:center;border:1px solid {RED}44;">
-                                        <div style="color:{MUTED};font-size:10px;">Stop Loss</div>
-                                        <div style="color:{RED};font-weight:700;">₹{_bu['sl_premium']}</div>
-                                    </div>
-                                </div>
-                                <div style="margin-top:10px;text-align:center;color:{MUTED};font-size:10px;">
-                                    VWAP Level: {_bu['vwap_hard_level']} | Delta Proxy: {_bu['delta_exposure']}
-                                </div>
-                            </div>
-                            '''
-
-                        strategy_tab_html = f'''
-                        <!-- Context Bar -->
-                        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;
-                                    margin-bottom:12px;padding:10px 14px;background:#12122a;
-                                    border-radius:8px;border:1px solid #2a2a4a;">
-                            <span style="color:{ACCENT};font-size:12px;font-weight:700;margin-right:4px;">
-                                STRATEGY ENGINE</span>
-                            <span style="background:{_dte_clr}22;color:{_dte_clr};font-size:11px;
-                                         font-weight:700;padding:2px 10px;border-radius:10px;
-                                         border:1px solid {_dte_clr}44;">{_dte_s}d to expiry</span>
-                            <span style="background:{_regime_clr}22;color:{_regime_clr};font-size:11px;
-                                         font-weight:700;padding:2px 10px;border-radius:10px;
-                                         border:1px solid {_regime_clr}44;">Regime: {_regime_s}</span>
-                            <span style="background:{_vrp_clr}22;color:{_vrp_clr};font-size:11px;
-                                         padding:2px 10px;border-radius:10px;border:1px solid {_vrp_clr}44;">
-                                VRP {_vrp_s:+.1f}%</span>
-                            <span style="background:#1a1a2e;color:{MUTED};font-size:11px;
-                                         padding:2px 10px;border-radius:10px;">ATM IV {_iv_pct:.1f}%</span>
-                            <span style="background:{_bias_clr}22;color:{_bias_clr};font-size:12px;
-                                         font-weight:900;padding:2px 14px;border-radius:10px;
-                                         border:1px solid {_bias_clr}55;margin-left:auto;">
-                                ⚡ {_intra_bias}</span>
-                        </div>
-
-                        <!-- Main 2-column layout -->
-                        <div style="display:grid;grid-template-columns:1fr 1.6fr;gap:14px;">
-                            <!-- LEFT: P&L + Buyer Setup -->
-                            <div>
-                                {buyer_setup_html}
-                                <div class="card" style="margin-bottom:12px;">
-                                    <div style="display:flex;justify-content:space-between;
-                                                align-items:center;margin-bottom:12px;">
-                                        <div style="color:{ACCENT};font-size:13px;font-weight:700;
-                                                    letter-spacing:2px;">LIVE P&amp;L TRACKER</div>
-                                        <span style="color:{_total_pnl_clr};font-size:13px;font-weight:700;">
-                                            Realized: {"+" if _total_pnl >= 0 else ""}₹{_total_pnl:,.0f}</span>
-                                    </div>
-                                    <div id="pnlTrackerContainer">
-                                        {tracked_html}
-                                    </div>
-                                    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
-                                        <input type="time" id="histScrubTime"
-                                               style="background:#111;color:{WHITE};border:1px solid #444;
-                                                      border-radius:4px;padding:3px 6px;font-size:12px;">
-                                        <button onclick="fetchHistoricalPNL()"
-                                                style="background:{ACCENT};color:#000;border:none;
-                                                       border-radius:4px;padding:4px 10px;font-size:11px;
-                                                       font-weight:600;cursor:pointer;">Scrub Time</button>
-                                        <button onclick="resetToLivePNL()"
-                                                style="background:#334;color:{WHITE};border:none;
-                                                       border-radius:4px;padding:4px 10px;font-size:11px;
-                                                       cursor:pointer;">Live</button>
-                                    </div>
-                                </div>
-
-                                {f"""
-                                <div class="card">
-                                    <div style="color:{ACCENT};font-size:12px;font-weight:700;
-                                                letter-spacing:2px;margin-bottom:8px;">CLOSED TRADES</div>
-                                    <table style="width:100%;border-collapse:collapse;font-size:11px;">
-                                        <thead><tr style="color:{MUTED};border-bottom:1px solid #333;">
-                                            <th style="text-align:left;padding:4px 8px;">Strategy</th>
-                                            <th style="text-align:left;padding:4px 8px;">Date</th>
-                                            <th style="text-align:right;padding:4px 8px;">P&amp;L</th>
-                                        </tr></thead>
-                                        <tbody>{_closed_rows if _closed_rows else
-                                               f'<tr><td colspan="3" style="padding:6px 8px;color:#555;">No closed trades yet.</td></tr>'}
-                                        </tbody>
-                                    </table>
-                                </div>"""}
-                            </div>
-
-                            <!-- RIGHT: Strategy Builder + Payoff Charts -->
-                            <div>
-                                <div class="card" style="margin-bottom:12px;">
-                                    <div style="color:{ACCENT};font-size:13px;font-weight:700;
-                                                letter-spacing:2px;margin-bottom:12px;">
-                                        RECOMMENDED STRATEGIES
-                                        <span style="color:{MUTED};font-size:10px;font-weight:400;margin-left:8px;">
-                                            Top {min(4, len(_strategies))} by score — payoff at 1 lot
-                                        </span>
-                                    </div>
-                                    <div style="max-height:680px;overflow-y:auto;padding-right:6px;">
-                                        {strat_cards_html or
-                                         f'<div style="color:#666;">No strategies generated for current context.</div>'}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- BACKTEST PANEL (full width) -->
-                        <div class="card" style="margin-top:14px;" id="bt-panel">
-                            <div style="display:flex;justify-content:space-between;
-                                        align-items:center;margin-bottom:12px;">
-                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;">
-                                    📊 STRATEGY BACKTESTER
-                                    <span style="color:{MUTED};font-size:10px;font-weight:400;margin-left:8px;">
-                                        NSE Bhavcopy — EOD prices — weekly Thursday expiry
-                                    </span>
-                                </div>
-                            </div>
-                            <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;
-                                        background:#0d0d1e;padding:12px;border-radius:8px;margin-bottom:12px;">
-                                <div>
-                                    <div style="color:{MUTED};font-size:10px;margin-bottom:4px;">Strategy</div>
-                                    <select id="bt-type" style="background:#12122a;color:{WHITE};
-                                                                 border:1px solid #444;border-radius:4px;
-                                                                 padding:5px 10px;font-size:12px;">
-                                        <option value="SHORT_STRADDLE">Short Straddle</option>
-                                        <option value="SHORT_STRANGLE">Short Strangle</option>
-                                        <option value="IRON_CONDOR">Iron Condor</option>
-                                        <option value="BULL_PUT_SPREAD">Bull Put Spread</option>
-                                        <option value="BEAR_CALL_SPREAD">Bear Call Spread</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <div style="color:{MUTED};font-size:10px;margin-bottom:4px;">Period</div>
-                                    <select id="bt-days" style="background:#12122a;color:{WHITE};
-                                                                  border:1px solid #444;border-radius:4px;
-                                                                  padding:5px 10px;font-size:12px;">
-                                        <option value="180">6 months</option>
-                                        <option value="365" selected>1 year</option>
-                                        <option value="730">2 years</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <div style="color:{MUTED};font-size:10px;margin-bottom:4px;">Stop Loss</div>
-                                    <select id="bt-sl" style="background:#12122a;color:{WHITE};
-                                                               border:1px solid #444;border-radius:4px;
-                                                               padding:5px 10px;font-size:12px;">
-                                        <option value="1.5">1.5x premium</option>
-                                        <option value="2.0" selected>2x premium</option>
-                                        <option value="3.0">3x premium</option>
-                                        <option value="100">No SL</option>
-                                    </select>
-                                </div>
-                                <button onclick="runBacktest()"
-                                        style="background:{ACCENT};color:#000;border:none;
-                                               border-radius:6px;padding:7px 20px;font-size:12px;
-                                               font-weight:700;cursor:pointer;">▶ Run Backtest</button>
-                                <div id="bt-status" style="color:{YELLOW};font-size:12px;"></div>
-                            </div>
-                            <div id="bt-results"></div>
-                        </div>
-
-                        <script>
-                        function runBacktest() {{
-                            var type = document.getElementById('bt-type').value;
-                            var days = document.getElementById('bt-days').value;
-                            var sl   = document.getElementById('bt-sl').value;
-                            document.getElementById('bt-status').textContent = '⏳ Running backtest...';
-                            document.getElementById('bt-results').innerHTML = '';
-                            fetch('/api/backtest', {{
-                                method: 'POST',
-                                headers: {{'Content-Type': 'application/json'}},
-                                body: JSON.stringify({{strategy_type: type, days: parseInt(days),
-                                                      stop_loss_mult: parseFloat(sl)}})
-                            }}).then(r => r.json()).then(d => {{
-                                if (d.ok) {{ pollBtStatus(type); }}
-                                else {{ document.getElementById('bt-status').textContent = 'Error: ' + d.error; }}
-                            }}).catch(e => {{
-                                document.getElementById('bt-status').textContent = 'Backtest requires DataServer.';
-                            }});
-                        }}
-
-                        function pollBtStatus(type) {{
-                            var poll = setInterval(function() {{
-                                fetch('/api/backtest_status?type=' + type)
-                                .then(r => r.json()).then(d => {{
-                                    if (d.status === 'DONE') {{
-                                        clearInterval(poll);
-                                        document.getElementById('bt-status').textContent = '✓ Done';
-                                        document.getElementById('bt-results').innerHTML = d.html;
-                                    }} else if (d.status === 'RUNNING') {{
-                                        document.getElementById('bt-status').textContent = '⏳ Running...';
-                                    }}
-                                }}).catch(() => clearInterval(poll));
-                            }}, 3000);
-                        }}
-
-                        function trackStrategy(payloadStr) {{
-                            var payload;
-                            try {{ payload = JSON.parse(payloadStr.replace(/&quot;/g, '"')); }}
-                            catch(e) {{ alert('JSON parse error'); return; }}
-                            fetch('/api/track_strategy', {{
-                                method: 'POST',
-                                headers: {{'Content-Type': 'application/json'}},
-                                body: JSON.stringify(payload)
-                            }}).then(r => r.json()).then(d => {{
-                                if (d.ok) {{ alert('Strategy tracked! ID: ' + d.id); }}
-                                else {{ alert('Error: ' + (d.error || 'Unknown')); }}
-                            }}).catch(() => {{
-                                alert('DataServer not running — strategy saved locally only.');
-                            }});
-                        }}
-                        </script>'''
-
-                    # ──────────────────────────────────────────
-                    #  REGIME TAB HTML 
-                    # ──────────────────────────────────────────
+                    # ── REGIME TAB HTML ──
                     if regime_snapshot:
                         regime_tab_html = f'''
                         <div style="display:flex; flex-direction:column; gap:16px;">
@@ -4491,7 +4042,7 @@ class VolatilityAnalyzer:
 <div id="frag-vol">{vol_tab_html}</div>
 <div id="frag-chain">{chain_tab_html}</div>
 <div id="frag-prob">{prob_tab_html}</div>
-<div id="frag-strat">{strategy_tab_html}</div>
+<div id="frag-mm">{mm_tab_html}</div>
 <div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}">
     <span id="frag-verdict-transfer" style="display:none;">{verdict_html}</span>
 </div>'''
@@ -4587,7 +4138,6 @@ class VolatilityAnalyzer:
         <div class="tab-btn" onclick="switchTab('vol')">Vol Intelligence</div>
         <div class="tab-btn" onclick="switchTab('chain')">Option Chain Analyser</div>
         <div class="tab-btn" onclick="switchTab('prob')">Prob Density</div>
-        <div class="tab-btn" onclick="switchTab('strat')">Strategy Engine</div>
         <div class="tab-btn" onclick="switchTab('mm')">Market Maker Positioning</div>
     </div>
 
@@ -4597,35 +4147,11 @@ class VolatilityAnalyzer:
     <div id="tab-chain" class="tab-content">{chain_tab_html}</div>
     <div id="tab-prob" class="tab-content">{prob_tab_html}</div>
     <div id="tab-mm" class="tab-content">
-        <div style="display:flex; flex-direction:column; gap:16px;">
-            <!-- Institutional Signal Panel -->
-            <div id="mm-signal-container" style="display:none; padding:20px; background:#12122a; border-radius:12px; border-left: 6px solid #4FC3F7; border: 1px solid #2a2a4a; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
-                <div style="font-size:11px; color:{MUTED}; font-weight:700; letter-spacing:1.5px; margin-bottom:6px; text-transform:uppercase;">INSTITUTIONAL POSITIONING SIGNAL</div>
-                <div id="mm-signal-title" style="font-size:26px; font-weight:900; color:{WHITE}; margin-bottom:12px; letter-spacing:0.5px;">ANALYZING GREEKS...</div>
-                <div id="mm-signal-desc" style="font-size:14px; color:#e0e0e0; line-height:1.6;">Waiting for telemetry...</div>
-            </div>
-            
-            <!-- Raw Metrics Grid -->
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-                <div class="card" style="border-left: 4px solid {ACCENT}; height:100%;">
-                    <div class="header">
-                        <div class="title">MARKET GAMMA EXPOSURE (GEX)</div>
-                    </div>
-                    <div id="gex-content" style="padding: 20px; text-align: center; color: {MUTED};">Loading real-time GEX data...</div>
-                </div>
-                
-                <div class="card" style="border-left: 4px solid {ACCENT}; height:100%;">
-                    <div class="header">
-                        <div class="title">DEALER GREEK POSITIONING</div>
-                    </div>
-                    <div id="dealer-content" style="padding: 20px; text-align: center; color: {MUTED};">Loading real-time Dealer data...</div>
-                </div>
-            </div>
-        </div>
+        <div style="color:#666;font-size:12px;text-align:center;padding:40px;">Loading dealer positioning data...</div>
     </div>
 
     <script>
-    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'strat':5, 'mm':6}};
+    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'mm':5}};
     var activeTab = localStorage.getItem('volDashActiveTab') || 'regime';
 
     function switchTab(id) {{
@@ -4663,7 +4189,7 @@ class VolatilityAnalyzer:
                 var tmp = document.createElement('div');
                 tmp.innerHTML = xhr.responseText;
                 // Swap each tab's content
-                ['regime', 'iv', 'vol', 'chain', 'prob', 'strat'].forEach(function(id) {{
+                ['regime', 'iv', 'vol', 'chain', 'prob', 'mm'].forEach(function(id) {{
                     var fragEl = tmp.querySelector('#frag-' + id);
                     var tabEl = document.getElementById('tab-' + id);
                     if (fragEl && tabEl) {{

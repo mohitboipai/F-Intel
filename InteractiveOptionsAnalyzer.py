@@ -15,20 +15,15 @@ class InteractiveOptionsAnalyzer:
         self.expiry_date = None
         
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        APP_ID = "QUTT4YYMIG-100"
-        SECRET_ID = "ZG0WN2NL1B"
-        REDIRECT_URI = "http://127.0.0.1:3000/callback"
+
         
-        auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-        fyers = auth.get_fyers_instance()
-        if not fyers:
-            print("Authentication Failed!")
-            sys.exit(1)
-        print("Authentication Successful.")
-        return fyers
+        from fyers_auth_manager import get_fyers_instance
+
+        
+        return get_fyers_instance()
 
     def get_spot_price(self, verbose=True):
+        if not self.fyers: return 0
         data = {"symbols": self.symbol}
         try:
             response = self.fyers.quotes(data=data)
@@ -37,7 +32,10 @@ class InteractiveOptionsAnalyzer:
             if response.get('code') == -15 or "token" in response.get('message', '').lower():
                 if verbose: print("Token expired or invalid during quote fetch. Re-authenticating...")
                 self.fyers = self._authenticate()
-                response = self.fyers.quotes(data=data)
+                if self.fyers:
+                    response = self.fyers.quotes(data=data)
+                else:
+                    return self.spot_price
                 
             if response['s'] == "ok":
                 self.spot_price = response['d'][0]['v']['lp']
@@ -50,6 +48,7 @@ class InteractiveOptionsAnalyzer:
         return 0
 
     def get_option_chain_data(self):
+        if not self.fyers: return None
         # Convert expiry to epoch if set
         ts = ""
         if self.expiry_date:
@@ -74,7 +73,10 @@ class InteractiveOptionsAnalyzer:
             if response.get('code') == -15 or "token" in response.get('message', '').lower():
                 print("Token expired or invalid during chain fetch. Re-authenticating...")
                 self.fyers = self._authenticate()
-                response = self.fyers.optionchain(data=data)
+                if self.fyers:
+                    response = self.fyers.optionchain(data=data)
+                else:
+                    return None
 
             # Handle Invalid Expiry (Auto-Correction)
             if response.get('s') == 'error' and 'expiryData' in response.get('data', {}):
@@ -229,6 +231,8 @@ class InteractiveOptionsAnalyzer:
         joined_symbols = ",".join(symbols)
         data = {"symbols": joined_symbols}
         
+        if not self.fyers: return df
+        
         try:
             # print(f"Fetching quotes for: {joined_symbols}")
             response = self.fyers.quotes(data=data)
@@ -236,7 +240,10 @@ class InteractiveOptionsAnalyzer:
             # Handle Token Error
             if response.get('code') == -15 or "token" in response.get('message', '').lower():
                  self.fyers = self._authenticate()
-                 response = self.fyers.quotes(data=data)
+                 if self.fyers:
+                     response = self.fyers.quotes(data=data)
+                 else:
+                     return df
             
             if response.get('s') == "ok":
                 # Create a map symbol -> ltp

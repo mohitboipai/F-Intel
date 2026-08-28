@@ -113,7 +113,7 @@ class NiftyHestonMC:
         self.fyers = self._authenticate()
         self.analytics = OptionAnalytics()
         self.symbol = "NSE:NIFTY50-INDEX"
-        self.spot_price = 0
+        self.spot_price = 0.0
         self.expiry_date = None
         self.regimes = {
             "Normal (Contango)":     {"kappa": 2.0, "theta": 0.04, "xi": 0.3, "rho": -0.7, "v0": 0.02}, # Vol ~14%
@@ -123,18 +123,12 @@ class NiftyHestonMC:
         }
         
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        try:
-            from FyersAuth import FyersAuthenticator
-            auth = FyersAuthenticator("QUTT4YYMIG-100", "ZG0WN2NL1B", "http://127.0.0.1:3000/callback")
-            fyers = auth.get_fyers_instance()
-            if not fyers: sys.exit(1)
-            print("Authentication Successful.")
-            return fyers
-        except:
-             # Fallback for dry runs / testing without auth file nearby
-             print("Warning: Auth Module not found or failed.")
-             return None
+
+        
+        from fyers_auth_manager import get_fyers_instance
+
+        
+        return get_fyers_instance()
 
     def get_spot_price(self):
         if not self.fyers: return 24000.0
@@ -146,7 +140,7 @@ class NiftyHestonMC:
                 print(f"Fetched Spot Price: {self.spot_price}")
                 return self.spot_price
         except: pass
-        return 0
+        return 0.0
 
     def get_option_chain(self):
         if not self.fyers: return {}
@@ -288,8 +282,8 @@ class NiftyHestonMC:
             if mode == '4': break
             
             # Common Setup
-            if self.spot_price == 0: self.get_spot_price()
-            if self.spot_price == 0:
+            if self.spot_price == 0.0: self.get_spot_price()
+            if self.spot_price == 0.0:
                  try: self.spot_price = float(input("Enter Spot: "))
                  except: self.spot_price = 24000.0
                  

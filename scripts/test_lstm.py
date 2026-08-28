@@ -6,14 +6,10 @@ import traceback
 try:
     from FyersAuth import FyersAuthenticator
     from SharedDataCache import SharedDataCache
-
-    APP_ID = "QUTT4YYMIG-100"
-    SECRET_ID = "ZG0WN2NL1B"
-    REDIRECT_URI = "http://127.0.0.1:3000/callback"
     
     print("Initializing auth...")
-    auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-    fyers_client = auth.get_fyers_instance()
+    from fyers_auth_manager import get_fyers_instance
+        fyers_client = get_fyers_instance()
     
     print("Initializing cache...")
     cache = SharedDataCache(fyers=fyers_client, symbol="NSE:NIFTY50-INDEX")

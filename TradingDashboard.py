@@ -38,20 +38,17 @@ class TradingDashboard:
         self.spot_price = 0
         
     def _authenticate(self):
-        print("Authenticating...")
-        try:
-            auth = FyersAuthenticator("QUTT4YYMIG-100", "ZG0WN2NL1B", "http://127.0.0.1:3000/callback")
-            fyers = auth.get_fyers_instance()
-            if fyers:
-                print("OK")
-                return fyers
-        except Exception as e:
-            print(f"Auth Failed: {e}")
-        return None
-    
+
+        
+        from fyers_auth_manager import get_fyers_instance
+
+        
+        return get_fyers_instance()
+
     # ==================== DATA FETCHING ====================
     
     def get_spot_price(self):
+        if not self.fyers: return 0
         try:
             r = self.fyers.quotes({"symbols": self.symbol})
             if r.get('s') == 'ok':
@@ -66,6 +63,7 @@ class TradingDashboard:
     
     def get_historical_data(self, days=365):
         """Fetch daily OHLC for volatility calculations"""
+        if not self.fyers: return pd.DataFrame()
         today = datetime.now()
         start = today - timedelta(days=days)
         
@@ -369,7 +367,7 @@ class TradingDashboard:
                     res = self.scanner.scan_vrp(atm_iv)
                     print("\n--- VRP REPORT ---")
                     for k, v in res.items():
-                        if k == 'regime_data':
+                        if k == 'regime_data' and hasattr(v, 'items'):
                             print("Regime Details:")
                             for rk, rv in v.items():
                                 print(f"  - {rk}: {rv}")
@@ -443,7 +441,7 @@ class TradingDashboard:
                     put_df = df[df['type'] == 'PE']
                     if not put_df.empty:
                        closest_idx = (put_df['strike'] - target_put).abs().idxmin()
-                       put_iv = put_df.loc[closest_idx, 'iv']
+                       put_iv = float(put_df.at[closest_idx, 'iv'])  # type: ignore
                        skew_ratio = put_iv / atm_iv if atm_iv > 0 else 1.0
                        
                        # Dummy term spread (0) as we don't have far chain loaded here easily

@@ -63,21 +63,24 @@ class GammaExplosionModel:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _authenticate(self):
-        print("Authenticating with Fyers...")
-        auth = FyersAuthenticator("QUTT4YYMIG-100", "ZG0WN2NL1B", "http://127.0.0.1:3000/callback")
-        fyers = auth.get_fyers_instance()
-        if not fyers:
-            print("Authentication Failed!")
-            sys.exit(1)
-        print("Authentication Successful.")
-        return fyers
+
+
+        from fyers_auth_manager import get_fyers_instance
+
+
+        return get_fyers_instance()
 
     def _get_spot(self):
+        if not self.fyers:
+            return self.spot_price
         try:
             r = self.fyers.quotes(data={"symbols": self.symbol})
             if r.get('code') == -15 or "token" in r.get('message', '').lower():
                 self.fyers = self._authenticate()
-                r = self.fyers.quotes(data={"symbols": self.symbol})
+                if self.fyers:
+                    r = self.fyers.quotes(data={"symbols": self.symbol})
+                else:
+                    return self.spot_price
             if r.get('s') == 'ok':
                 self.spot_price = r['d'][0]['v'].get('lp', 0)
         except Exception as e:
@@ -86,7 +89,7 @@ class GammaExplosionModel:
 
     def _get_chain(self):
         """Fetch and parse full option chain. Returns DataFrame."""
-        if not self.expiry_date:
+        if not self.expiry_date or not self.fyers:
             return pd.DataFrame()
         try:
             dt = datetime.strptime(self.expiry_date, "%Y-%m-%d")
@@ -103,9 +106,12 @@ class GammaExplosionModel:
             })
             if r.get('code') == -15 or "token" in r.get('message', '').lower():
                 self.fyers = self._authenticate()
-                r = self.fyers.optionchain(data={
-                    "symbol": self.symbol, "strikecount": 500, "timestamp": ts
-                })
+                if self.fyers:
+                    r = self.fyers.optionchain(data={
+                        "symbol": self.symbol, "strikecount": 500, "timestamp": ts
+                    })
+                else:
+                    return pd.DataFrame()
 
             # Handle expiry mismatch
             if r.get('s') == 'error' and 'expiryData' in r.get('data', {}):
@@ -155,6 +161,8 @@ class GammaExplosionModel:
 
     def _fetch_rv_baseline(self):
         """Fetch 1-year daily data and compute RV baseline (once)."""
+        if not self.fyers:
+            return
         print("  Fetching 60-day history for IV-RV baseline...")
         try:
             today = datetime.now()
@@ -565,6 +573,9 @@ class GammaExplosionModel:
 
         exp = input("Enter Expiry (YYYY-MM-DD): ").strip()
         if not exp:
+            if not self.fyers:
+                print("Error: No Fyers instance.")
+                return
             try:
                 probe = self.fyers.optionchain(data={
                     "symbol": self.symbol, "strikecount": 1, "timestamp": ""})

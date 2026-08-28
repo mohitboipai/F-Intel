@@ -226,7 +226,7 @@ class BhavCopyEngine:
             'strike':            pd.to_numeric(df['STRIKE_PR'], errors='coerce').fillna(0).astype(float),
             'option_type':       df['_ot'].values,
             'close':             pd.to_numeric(df['CLOSE'], errors='coerce').fillna(0).astype(float),
-            'volume':            pd.to_numeric(df.get('CONTRACTS', df.get('TRDQTY', 0)), errors='coerce').fillna(0).astype(int),
+            'volume':            pd.to_numeric(df['CONTRACTS'] if 'CONTRACTS' in df.columns else (df['TRDQTY'] if 'TRDQTY' in df.columns else pd.Series(0, index=df.index)), errors='coerce').fillna(0).astype(int),
             'oi':                pd.to_numeric(df['OPEN_INT'], errors='coerce').fillna(0).astype(int),
             'underlying_close':  uc.values,
         }).query('strike > 0').reset_index(drop=True)
@@ -269,7 +269,7 @@ class BhavCopyEngine:
             'strike':            pd.to_numeric(df['StrkPric'], errors='coerce').fillna(0).astype(float),
             'option_type':       df['_ot'].values,
             'close':             pd.to_numeric(df['ClsPric'], errors='coerce').fillna(0).astype(float),
-            'volume':            pd.to_numeric(df.get('TtlTradgVol', df.get('TradgVol', 0)), errors='coerce').fillna(0).astype(int),
+            'volume':            pd.to_numeric(df['TtlTradgVol'] if 'TtlTradgVol' in df.columns else (df['TradgVol'] if 'TradgVol' in df.columns else pd.Series(0, index=df.index)), errors='coerce').fillna(0).astype(int),
             'oi':                pd.to_numeric(df['OpnIntrst'], errors='coerce').fillna(0).astype(int),
             'underlying_close':  uc_vals.values,
         }).query('strike > 0').reset_index(drop=True)
@@ -281,7 +281,7 @@ class BhavCopyEngine:
         uc = parsed['underlying_close']
         non_zero = uc[uc > 0]
         if not non_zero.empty:
-            close = float(non_zero.median())
+            close = non_zero.median()
             self._spot_history.append((date_str, close))
             # keep sorted
             self._spot_history.sort(key=lambda x: x[0])
@@ -301,7 +301,7 @@ class BhavCopyEngine:
 
         row = df[
             (df['expiry_date'] == expiry_dt) &
-            (df['strike']      == float(strike)) &
+            (df['strike']      == strike) &
             (df['option_type'] == option_type.upper())
         ]
         if row.empty:
@@ -328,7 +328,7 @@ class BhavCopyEngine:
             return None
         uc = df['underlying_close']
         non_zero = uc[uc > 0]
-        return float(non_zero.median()) if not non_zero.empty else None
+        return non_zero.median() if not non_zero.empty else None
 
     def get_atm_iv(self, date) -> float | None:
         """
@@ -354,7 +354,7 @@ class BhavCopyEngine:
         if non_zero.empty:
             self._iv_cache[date_str] = None
             return None
-        spot = float(non_zero.median())
+        spot = non_zero.median()
 
         # Nearest weekly expiry (prefer expiries within 7 days)
         date_d = _to_date(date)

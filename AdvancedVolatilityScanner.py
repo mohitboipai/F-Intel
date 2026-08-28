@@ -29,12 +29,12 @@ class AdvancedVolatilityScanner:
         self._ensure_log_file()
 
     def _authenticate(self):
-        # Re-using existing auth logic
-        APP_ID = "QUTT4YYMIG-100"
-        SECRET_ID = "ZG0WN2NL1B"
-        REDIRECT_URI = "http://127.0.0.1:3000/callback"
-        auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
-        return auth.get_fyers_instance()
+
+
+        from fyers_auth_manager import get_fyers_instance
+
+
+        return get_fyers_instance()
 
     def _ensure_log_file(self):
         if not os.path.exists(self.log_file):

@@ -457,7 +457,7 @@ class SmartStrategyGenerator:
         self.call_wall = market_context.get('call_wall', 0)
         self.put_wall  = market_context.get('put_wall', 0)
         self.atm_iv  = market_context.get('atm_iv', market_context.get('iv', 15))
-        self.straddle = market_context.get('em', spot * self.iv_dec * np.sqrt(self.T))
+        self.straddle = market_context.get('em') or (spot * self.iv_dec * np.sqrt(self.T))
 
         # ATM strike + prices
         self.atm_strike = self._find_atm()

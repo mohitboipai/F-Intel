@@ -148,8 +148,8 @@ def main():
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from FyersAuth import FyersAuthenticator
         
-        auth = FyersAuthenticator("QUTT4YYMIG-100", "ZG0WN2NL1B", "http://127.0.0.1:3000/callback")
-        fyers = auth.get_fyers_instance()
+        from fyers_auth_manager import get_fyers_instance
+        fyers = get_fyers_instance()
         
         import datetime
         end_dt = datetime.datetime.now()

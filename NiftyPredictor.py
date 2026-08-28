@@ -72,15 +72,12 @@ class NiftyRangePredictor:
         ]
         
         # Auth
-        self.app_id = "QUTT4YYMIG-100"
-        self.secret_id = "ZG0WN2NL1B"
-        self.redirect_uri = "http://127.0.0.1:3000/callback"
         self.authenticate()
 
     def authenticate(self):
         try:
-            auth = FyersAuthenticator(self.app_id, self.secret_id, self.redirect_uri)
-            self.fyers = auth.get_fyers_instance()
+            from fyers_auth_manager import get_fyers_instance
+        self.fyers = get_fyers_instance()
             print("Authentication Successful.")
         except Exception as e:
             print(f"Auth Failed: {e}")
