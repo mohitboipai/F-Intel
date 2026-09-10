@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+import threading
 from datetime import datetime
 from StrategyEngine import OptionLeg, Strategy
 
@@ -9,21 +10,24 @@ PORTFOLIO_FILE = "portfolio.json"
 class PortfolioManager:
     def __init__(self, filepath=PORTFOLIO_FILE):
         self.filepath = filepath
+        self._lock = threading.Lock()
         self.data = {"active": [], "history": []}
         self.load()
 
     def load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    self.data = json.load(f)
-            except Exception as e:
-                print(f"Error loading portfolio: {e}")
-                self.data = {"active": [], "history": []}
+        with self._lock:
+            if os.path.exists(self.filepath):
+                try:
+                    with open(self.filepath, "r") as f:
+                        self.data = json.load(f)
+                except Exception as e:
+                    print(f"Error loading portfolio: {e}")
+                    self.data = {"active": [], "history": []}
 
     def save(self):
-        with open(self.filepath, "w") as f:
-            json.dump(self.data, f, indent=4)
+        with self._lock:
+            with open(self.filepath, "w") as f:
+                json.dump(self.data, f, indent=4)
 
     def _estimate_margin(self, legs, spot) -> float:
         """

@@ -22,6 +22,10 @@ import matplotlib.gridspec as gridspec
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from FyersAuth import FyersAuthenticator
 from OptionAnalytics import OptionAnalytics
+try:
+    import config as _cfg
+except ImportError:
+    _cfg = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,11 +121,13 @@ class RealizedVolEngine:
     """
 
     def __init__(self):
-        self.fyers = self._authenticate()
+        from typing import Any
+        self.fyers: Any = self._authenticate()
         self.analytics = OptionAnalytics()
         self.symbol = "NSE:NIFTY50-INDEX"
-        self.spot_price = 0
+        self.spot_price: float = 0.0
         self.rv_estimators = RVEstimators()
+        self.vrp_history = []
         # Optional shared signal memory (inject from outside if desired)
         self.memory = None
 
@@ -134,14 +140,20 @@ class RealizedVolEngine:
 
 # ── Spot ──────────────────────────────────────────────────────────────
     def _get_spot(self):
+        if not self.fyers:
+            self.fyers = self._authenticate()
+        if not self.fyers:
+            return self.spot_price
+
         data = {"symbols": self.symbol}
         try:
             r = self.fyers.quotes(data=data)
-            if r.get('code') == -15 or "token" in r.get('message', '').lower():
+            if isinstance(r, dict) and (r.get('code') == -15 or "token" in str(r.get('message', '')).lower()):
                 self.fyers = self._authenticate()
-                r = self.fyers.quotes(data=data)
-            if r.get('s') == 'ok':
-                self.spot_price = r['d'][0]['v'].get('lp', 0)
+                if self.fyers:
+                    r = self.fyers.quotes(data=data)
+            if isinstance(r, dict) and r.get('s') == 'ok':
+                self.spot_price = float(r['d'][0]['v'].get('lp', 0.0))
         except Exception as e:
             print(f"Spot fetch error: {e}")
         return self.spot_price
@@ -149,6 +161,11 @@ class RealizedVolEngine:
     # ── History ───────────────────────────────────────────────────────────
     def _fetch_daily_history(self, days=365):
         """Fetch daily OHLC candles for the last N days."""
+        if not self.fyers:
+            self.fyers = self._authenticate()
+        if not self.fyers:
+            return pd.DataFrame()
+
         today = datetime.now()
         start = today - pd.Timedelta(days=days)
         data = {
@@ -158,7 +175,7 @@ class RealizedVolEngine:
             "cont_flag": "1"
         }
         r = self.fyers.history(data=data)
-        if r.get('s') == 'ok':
+        if isinstance(r, dict) and r.get('s') == 'ok':
             candles = r['candles']
             df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
             df['date'] = pd.to_datetime(df['ts'], unit='s')
@@ -169,6 +186,11 @@ class RealizedVolEngine:
 
     def _fetch_intraday_history(self):
         """Fetch today's 5-minute intraday candles for real-time RV/VWAP context."""
+        if not self.fyers:
+            self.fyers = self._authenticate()
+        if not self.fyers:
+            return pd.DataFrame()
+
         today = datetime.now()
         data = {
             "symbol": self.symbol, "resolution": "5", "date_format": "1",
@@ -178,7 +200,7 @@ class RealizedVolEngine:
         }
         try:
             r = self.fyers.history(data=data)
-            if r.get('s') == 'ok' and r.get('candles'):
+            if isinstance(r, dict) and r.get('s') == 'ok' and r.get('candles'):
                 df_intra = pd.DataFrame(r['candles'], columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
                 return df_intra
         except Exception as e:
@@ -188,6 +210,11 @@ class RealizedVolEngine:
     # ── ATM IV ────────────────────────────────────────────────────────────
     def _fetch_atm_iv(self, expiry):
         """Fetch current ATM IV from the option chain for a given expiry."""
+        if not self.fyers:
+            self.fyers = self._authenticate()
+        if not self.fyers:
+            return 0
+
         spot = self.spot_price
         if spot <= 0:
             return 0
@@ -202,7 +229,7 @@ class RealizedVolEngine:
             }
             r = self.fyers.optionchain(data=data_req)
 
-            if r.get('s') != 'ok' or 'data' not in r:
+            if not isinstance(r, dict) or r.get('s') != 'ok' or 'data' not in r:
                 return 0
 
             options = r['data'].get('optionsChain', [])
@@ -267,9 +294,18 @@ class RealizedVolEngine:
         cur_gk    = float(rv_gk.iloc[-1]) if len(rv_gk) > 0 else 0
         cur_yz    = float(rv_yz.iloc[-1]) if len(rv_yz) > 0 else 0
 
-        # Consensus RV
-        vals = [v for v in [cur_rv_20, cur_park, cur_gk, cur_yz] if v > 0]
-        consensus_rv = np.mean(vals) if vals else cur_rv_20
+        # Consensus RV (Yang-Zhang 40% weighted per Yang & Zhang 2000 minimum-variance estimator)
+        w_yz   = _cfg.get("rv_weight_yz", 0.40) if _cfg else 0.40
+        w_c2c  = _cfg.get("rv_weight_c2c", 0.20) if _cfg else 0.20
+        w_park = _cfg.get("rv_weight_park", 0.20) if _cfg else 0.20
+        w_gk   = _cfg.get("rv_weight_gk", 0.20) if _cfg else 0.20
+        
+        pairs = [(cur_rv_20, w_c2c), (cur_park, w_park), (cur_gk, w_gk), (cur_yz, w_yz)]
+        active_pairs = [(v, w) for v, w in pairs if v > 0]
+        if active_pairs:
+            consensus_rv = sum(v * w for v, w in active_pairs) / sum(w for _, w in active_pairs)
+        else:
+            consensus_rv = cur_rv_20
 
         # Historical Vol
         hv_series = self.analytics.calculate_rolling_historical_volatility(closes, window=20)
@@ -349,9 +385,18 @@ class RealizedVolEngine:
         cur_gk    = rv_gk.iloc[-1]   if len(rv_gk)   > 0 else 0
         cur_yz    = rv_yz.iloc[-1]   if len(rv_yz)   > 0 else 0
 
-        # Consensus RV = average of all 20d estimators (robust)
-        estimator_vals = [v for v in [cur_rv_20, cur_park, cur_gk, cur_yz] if v > 0]
-        consensus_rv = np.mean(estimator_vals) if estimator_vals else cur_rv_20
+        # Consensus RV = Yang-Zhang 40% weighted consensus (robust)
+        w_yz   = _cfg.get("rv_weight_yz", 0.40) if _cfg else 0.40
+        w_c2c  = _cfg.get("rv_weight_c2c", 0.20) if _cfg else 0.20
+        w_park = _cfg.get("rv_weight_park", 0.20) if _cfg else 0.20
+        w_gk   = _cfg.get("rv_weight_gk", 0.20) if _cfg else 0.20
+        
+        pairs = [(cur_rv_20, w_c2c), (cur_park, w_park), (cur_gk, w_gk), (cur_yz, w_yz)]
+        active_pairs = [(v, w) for v, w in pairs if v > 0]
+        if active_pairs:
+            consensus_rv = sum(v * w for v, w in active_pairs) / sum(w for _, w in active_pairs)
+        else:
+            consensus_rv = cur_rv_20
 
         # ── 2.5 Intraday Responsiveness (VWAP & Intraday Parkinson) ───────
         df_intra = self._fetch_intraday_history()
@@ -534,24 +579,41 @@ class RealizedVolEngine:
                 'confidence': 0.75
             }
 
+        # Track VRP history for rolling z-score
+        vrp = iv - rv
+        self.vrp_history.append(vrp)
+        max_w = _cfg.get("vrp_zscore_window", 252) if _cfg else 252
+        if len(self.vrp_history) > max_w:
+            self.vrp_history.pop(0)
+
+        # Calculate VRP z-score if sufficient history
+        vrp_z = None
+        if len(self.vrp_history) >= 10:
+            arr = np.array(self.vrp_history)
+            std = arr.std()
+            if std > 1e-4:
+                vrp_z = (vrp - arr.mean()) / std
+
         # OVERPRICED: IV well above actual realized moves
-        if iv_rv_ratio > 1.25 and iv_hv_ratio > 1.15:
+        is_overpriced = (vrp_z > 1.5) if vrp_z is not None else (iv_rv_ratio > 1.25 and iv_hv_ratio > 1.15)
+        if is_overpriced:
             return {
                 'name': 'OVERPRICED',
                 'description': 'Options expensive vs actual moves — sell premium',
                 'bias': 'NEUTRAL',
                 'vol_action': 'SELL VOL',
-                'confidence': min(0.9, (iv_rv_ratio - 1.0) * 1.5)
+                'confidence': min(0.9, abs(vrp_z) / 3.0) if vrp_z is not None else min(0.9, (iv_rv_ratio - 1.0) * 1.5)
             }
 
         # UNDERPRICED: IV well below actual realized moves
-        if iv_rv_ratio < 0.80 and iv_hv_ratio < 0.90:
+        is_underpriced = (vrp_z < -1.5) if vrp_z is not None else (iv_rv_ratio < 0.80 and iv_hv_ratio < 0.90)
+        if is_underpriced:
             return {
                 'name': 'UNDERPRICED',
                 'description': 'Options cheap vs actual moves — buy protection',
                 'bias': 'BEARISH',  # cheap options in fear markets
                 'vol_action': 'BUY VOL',
-                'confidence': min(0.9, (1.0 - iv_rv_ratio) * 2.0)
+                'confidence': min(0.9, abs(vrp_z) / 3.0) if vrp_z is not None else min(0.9, (1.0 - iv_rv_ratio) * 2.0)
             }
 
         # MOMENTUM: RV accelerating, market trending
@@ -666,15 +728,15 @@ class RealizedVolEngine:
                     labels=['Low Vol', 'Mid-Low Vol', 'Mid-High Vol', 'High Vol'],
                     duplicates='drop')
                 for bucket in ['Low Vol', 'Mid-Low Vol', 'Mid-High Vol', 'High Vol']:
-                    b_data = aligned[aligned['vol_bucket'] == bucket]['gap']
-                    if len(b_data) > 3:
+                    b_vals = np.asarray(aligned[aligned['vol_bucket'] == bucket]['gap'], dtype=float)
+                    if len(b_vals) > 3:
                         regime_gaps[bucket] = {
-                            'mean': b_data.mean(),
-                            'std': b_data.std(),
-                            'mean_abs': b_data.abs().mean(),
-                            'pct_up': (b_data > 0).mean() * 100,
-                            'pct_large': (b_data.abs() > 0.5).mean() * 100,
-                            'count': len(b_data)
+                            'mean': float(np.mean(b_vals)),
+                            'std': float(np.std(b_vals)),
+                            'mean_abs': float(np.mean(np.abs(b_vals))),
+                            'pct_up': float(np.mean(b_vals > 0) * 100),
+                            'pct_large': float(np.mean(np.abs(b_vals) > 0.5) * 100),
+                            'count': len(b_vals)
                         }
             except Exception:
                 pass
@@ -683,15 +745,15 @@ class RealizedVolEngine:
         dow_gaps = {}
         if 'date' in df.columns:
             gap_df = pd.DataFrame({'gap': gap_pct, 'date': df['date'].iloc[1:].values})
-            gap_df['dow'] = pd.to_datetime(gap_df['date']).dt.day_name()
+            gap_df['dow'] = [pd.Timestamp(d).day_name() for d in gap_df['date']]
             for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']:
-                day_data = gap_df[gap_df['dow'] == day]['gap']
-                if len(day_data) > 3:
+                day_vals = np.asarray(gap_df[gap_df['dow'] == day]['gap'], dtype=float)
+                if len(day_vals) > 3:
                     dow_gaps[day] = {
-                        'mean': day_data.mean(),
-                        'mean_abs': day_data.abs().mean(),
-                        'pct_up': (day_data > 0).mean() * 100,
-                        'count': len(day_data)
+                        'mean': float(np.mean(day_vals)),
+                        'mean_abs': float(np.mean(np.abs(day_vals))),
+                        'pct_up': float(np.mean(day_vals > 0) * 100),
+                        'count': len(day_vals)
                     }
 
         return {
@@ -924,7 +986,7 @@ class RealizedVolEngine:
         # Signal breakdown
         print(f"  Signal Breakdown:")
         for k, v in gap_pred['sub_scores'].items():
-            bar_pos = int(max(0, min(20, (v + 50) / 5)))
+            bar_pos = max(0, min(20, int((v + 50) / 5)))
             bar = '░' * bar_pos + '█' + '░' * (20 - bar_pos)
             label = k.replace('_', ' ').title()
             print(f"    {label:<18s} {bar} {v:>+6.1f}")
@@ -1221,7 +1283,7 @@ class RealizedVolEngine:
         # Sub-score breakdown
         print(f"  Signal Breakdown:")
         for k, v in pred['sub_scores'].items():
-            bar_pos = int(max(0, min(20, (v + 100) / 10)))
+            bar_pos = max(0, min(20, int((v + 100) / 10)))
             bar = "░" * bar_pos + "█" + "░" * (20 - bar_pos)
             label = k.replace('_', ' ').title()
             print(f"    {label:<15s} {bar} {v:>+6.1f}")
@@ -1371,7 +1433,7 @@ class RealizedVolEngine:
             ax4_rv.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc='upper left')
             ax4_price.grid(True, alpha=0.2)
 
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
             print("\nOpening RV Engine Dashboard...")
             plt.show()
 

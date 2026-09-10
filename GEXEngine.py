@@ -2,6 +2,14 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any
 
+try:
+    import config as _cfg
+    _DEFAULT_LOT_SIZE = _cfg.get("nifty_lot_size", 65)
+    _DEFAULT_R = _cfg.get("risk_free_rate", 0.051274)
+except Exception:
+    _DEFAULT_LOT_SIZE = 65
+    _DEFAULT_R = 0.051274
+
 class GEXEngine:
     """
     Unified Gamma Exposure (GEX) Engine.
@@ -9,17 +17,19 @@ class GEXEngine:
     """
     
     @staticmethod
-    def compute_gex(df: pd.DataFrame, spot: float, T: float, lot_size: int = 75, r_rate: float = 0.07) -> Dict[str, Any]:
+    def compute_gex(df: pd.DataFrame, spot: float, T: float, lot_size: int | None = None, r_rate: float | None = None) -> Dict[str, Any]:
         """
         Computes GEX metrics for a given option chain DataFrame.
         
         Assumptions:
-        Dealers are assumed net short calls & short puts (standard retail-driven NIFTY prior).
+        Standard model: dealers long calls (CE) / short puts (PE).
         Positive net GEX = long gamma = stabilizing.
         
         Formula:
         gex_per_strike = (ce_gamma * ce_oi - pe_gamma * pe_oi) * lot_size * spot * (spot * 0.01)
         """
+        lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
+        r_rate = r_rate if r_rate is not None else _DEFAULT_R
         profile = {}
         if df.empty or spot <= 0:
             return {

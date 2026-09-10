@@ -3,22 +3,41 @@ import pandas as pd
 from typing import Dict, Any, Literal
 from .GreeksEngine import GreeksEngine
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import config as _cfg
+    _DEFAULT_LOT_SIZE = _cfg.get("nifty_lot_size", 65)
+    _DEFAULT_R = _cfg.get("risk_free_rate", 0.051274)
+    _DEFAULT_Q = _cfg.get("dividend_yield", 0.0122)
+    _DEFAULT_IV = _cfg.get("iv_fallback_flat", 0.15)
+except Exception:
+    _DEFAULT_LOT_SIZE = 65
+    _DEFAULT_R = 0.051274
+    _DEFAULT_Q = 0.0122
+    _DEFAULT_IV = 0.15
+
 class DealerPositionEngine:
     """
     Estimates institutional dealer inventory and hedging requirements continuously.
     Utilizes configurable inference models to infer dealer positioning from observable data.
     """
     def __init__(self, 
-                 lot_size: int = 75,
-                 risk_free_rate: float = 0.07,
+                 lot_size: int | None = None,
+                 risk_free_rate: float | None = None,
+                 dividend_yield: float | None = None,
                  positioning_model: Literal['standard', 'inverted', 'flow'] = 'standard',
-                 default_iv: float = 0.15):
-        self.lot_size = lot_size
+                 default_iv: float | None = None):
+        self.lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
         self.positioning_model = positioning_model
-        self.default_iv = default_iv
+        self.default_iv = default_iv if default_iv is not None else _DEFAULT_IV
         
-        # Instantiate the pure mathematical greeks engine
-        self.greeks_engine = GreeksEngine(risk_free_rate=risk_free_rate, days_in_year=365.0)
+        # Instantiate the pure mathematical greeks engine with dividend yield
+        self.greeks_engine = GreeksEngine(
+            risk_free_rate=risk_free_rate if risk_free_rate is not None else _DEFAULT_R,
+            dividend_yield=dividend_yield if dividend_yield is not None else _DEFAULT_Q,
+            days_in_year=365.0
+        )
 
     def _infer_dealer_sign(self, df: pd.DataFrame) -> np.ndarray:
         """

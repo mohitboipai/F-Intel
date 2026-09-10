@@ -18,11 +18,12 @@ import threading
 import time
 from datetime import datetime
 
+import pandas as pd
+
 try:
     import pytz
-    _HAS_PYTZ = True
 except ImportError:
-    _HAS_PYTZ = False
+    pytz = None
 
 from NiftyHestonMC import NiftyHestonMC, HestonMath
 
@@ -65,7 +66,7 @@ class HestonCalibrator:
     def _in_market_hours(self) -> bool:
         """Return True if current IST time is between 09:15 and 15:30."""
         try:
-            if _HAS_PYTZ:
+            if pytz is not None:
                 tz  = pytz.timezone('Asia/Kolkata')
                 now = datetime.now(tz=tz)
             else:
@@ -106,11 +107,9 @@ class HestonCalibrator:
             # 4. Near-ATM CE subset for speed
             df = df.copy()
             df['dist'] = abs(df['strike'] - spot)
-            subset = (
-                df[(df['type'] == 'CE') & (df['dist'] < spot * 0.02)]
-                .sort_values('dist')
-                .head(self.STRIKES_NEAR_ATM)
-            )
+            ce_mask = (df['type'] == 'CE') & (df['dist'] < spot * 0.02)
+            ce_df: pd.DataFrame = df.loc[ce_mask]
+            subset = ce_df.sort_values(by='dist').head(self.STRIKES_NEAR_ATM)
             if len(subset) < 3:
                 print(f"[HestonCalibrator] Only {len(subset)} near-ATM CE "
                       "strikes — need ≥ 3, skipping.")

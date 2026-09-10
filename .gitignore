@@ -19,7 +19,6 @@ access_token.txt
 tunnel_url.txt
 
 # Generated Reports & Dashboard Artifacts (built at runtime by VolatilityAnalyzer)
-unified_dashboard.html
 unified_dashboard_fragment.html
 bt_*.html
 *.png
@@ -63,3 +62,10 @@ calculations/__init__.py
 portfolio.json
 wizard_history.json
 strategy_builder.html
+
+# F-Intel deployment secrets
+.env
+# Market config (deployment-specific: lot size, rate assumptions — DO NOT commit)
+fintel_config.json
+*.pyc
+data/backtest_results.db

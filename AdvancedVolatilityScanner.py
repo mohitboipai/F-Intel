@@ -12,9 +12,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
     from FyersAuth import FyersAuthenticator
     from OptionAnalytics import OptionAnalytics
+    import config as _cfg
 except ImportError:
     # Fallback for when running in isolation if modules aren't found
-    pass
+    _cfg = None
 
 class AdvancedVolatilityScanner:
     def __init__(self, fyers_instance=None):
@@ -127,13 +128,17 @@ class AdvancedVolatilityScanner:
         # Std Dev of the HV series itself
         vov = hv_close.rolling(20).std().iloc[-1]
         
+        ver_high = _cfg.get("ver_high_threshold", 1.15) if _cfg else 1.15
+        ver_low = _cfg.get("ver_low_threshold", 0.80) if _cfg else 0.80
+        vov_turbulent = _cfg.get("vov_turbulent", 4.0) if _cfg else 4.0
+
         regime = "NORMAL"
-        if ver > 1.1:
+        if ver > ver_high:
             regime = "MEAN REVERTING (Choppy)"
-        elif ver < 0.8:
+        elif ver < ver_low:
             regime = "TRENDING (Efficient)"
             
-        if vov > 5.0:
+        if vov > vov_turbulent:
             regime += " [UNSTABLE/TURBULENT]"
             
         return {
@@ -143,6 +148,40 @@ class AdvancedVolatilityScanner:
             'vov': vov,
             'regime_label': regime
         }
+
+    def compute_ivp(self, current_iv: float, iv_series: pd.Series) -> float:
+        """
+        IV Percentile (IVP): % of days in lookback where IV was lower than today's IV.
+        More robust to outliers than IV Rank (Tastytrade, Quantsapp, algotest.in).
+        """
+        if iv_series is None or len(iv_series) == 0 or current_iv <= 0:
+            return 50.0
+        s = iv_series.dropna()
+        if len(s) == 0:
+            return 50.0
+        lookback = _cfg.get("ivp_lookback_days", 252) if _cfg else 252
+        s = s.tail(lookback)
+        pct = (s < current_iv).mean() * 100.0
+        return round(pct, 1)
+
+    def compute_ivr(self, current_iv: float, iv_series: pd.Series) -> float:
+        """
+        IV Rank (IVR): (Current IV - Min IV) / (Max IV - Min IV) * 100.
+        Range-normalized metric across lookback period.
+        """
+        if iv_series is None or len(iv_series) == 0 or current_iv <= 0:
+            return 50.0
+        s = iv_series.dropna()
+        if len(s) == 0:
+            return 50.0
+        lookback = _cfg.get("ivr_lookback_days", 252) if _cfg else 252
+        s = s.tail(lookback)
+        min_iv = float(s.min())
+        max_iv = float(s.max())
+        if max_iv <= min_iv:
+            return 50.0
+        ivr = ((current_iv - min_iv) / (max_iv - min_iv)) * 100.0
+        return round(max(0.0, min(100.0, ivr)), 1)
 
     def scan_vrp(self, atm_iv):
         """

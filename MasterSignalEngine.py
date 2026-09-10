@@ -27,7 +27,7 @@ class MasterSignalEngine:
         regime_name = context.get('regime', 'UNKNOWN')
         vrp_iv_rv   = context.get('vrp', 0)
         
-        # Gamma & Flows
+        # Gamma & Flowsf
         net_gex   = context.get('net_gex', 0)
         net_vanna = context.get('net_vanna', 0)
         net_charm = context.get('net_charm', 0)

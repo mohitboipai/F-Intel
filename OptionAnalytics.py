@@ -3,6 +3,18 @@ from scipy.stats import norm
 import pandas as pd
 from datetime import datetime
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import config as _cfg
+    _DEFAULT_R = _cfg.get("risk_free_rate", 0.051274)
+    _DEFAULT_Q = _cfg.get("dividend_yield", 0.0122)
+    _DEFAULT_IV_SEED = _cfg.get("iv_solver_seed", 0.15)
+except Exception:
+    _DEFAULT_R = 0.051274
+    _DEFAULT_Q = 0.0122
+    _DEFAULT_IV_SEED = 0.15
+
 class OptionAnalytics:
     def __init__(self):
         pass
@@ -65,45 +77,45 @@ class OptionAnalytics:
         else:
             return "Normal"
 
-    def black_scholes(self, S, K, T, r, sigma, option_type='CE'):
+    def black_scholes(self, S, K, T, r, sigma, option_type='CE', q=0.0):
         """
         S: Spot Price
         K: Strike Price
         T: Time to Expiry (in years)
-        r: Risk-free rate (decimal, e.g., 0.05)
-        sigma: Volatility (decimal, e.g., 0.20)
+        r: Risk-free rate (decimal, e.g., 0.0513)
+        sigma: Volatility (decimal, e.g., 0.15)
+        q: Continuous dividend yield (decimal, e.g. 0.0122, Merton 1973)
         """
         if T <= 0 or sigma <= 0 or K <= 0 or S <= 0:
             return 0.0
             
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         
         if option_type == 'CE':
-            price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+            price = S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
         else:
-            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
             
         return price
 
-    def vega(self, S, K, T, r, sigma):
-        """Calculate Vega"""
+    def vega(self, S, K, T, r, sigma, q=0.0):
+        """Calculate Vega with optional continuous dividend yield."""
         if T <= 0 or sigma <= 0 or K <= 0 or S <= 0: return 0.0
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        return S * norm.pdf(d1) * np.sqrt(T)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        return S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
 
-    def implied_volatility(self, price, S, K, T, r, option_type='CE', tol=1e-5, max_iter=100):
+    def implied_volatility(self, price, S, K, T, r, option_type='CE', tol=1e-5, max_iter=100, q=0.0):
         """
         Calculate Implied Volatility using Hybrid Newton-Raphson + Bisection.
-        Newton is fast (quadratic convergence) but unstable near zero Vega.
-        Bisection is slow (linear) but guaranteed to converge.
+        Uses iv_solver_seed from config (default 0.15 = 15%) as initial guess.
         """
         # 1. Bounds check (Intrinsic Value)
         intrinsic = 0
         if option_type == 'CE':
-            intrinsic = max(S - K * np.exp(-r * T), 0)
+            intrinsic = max(S * np.exp(-q * T) - K * np.exp(-r * T), 0)
         else:
-            intrinsic = max(K * np.exp(-r * T) - S, 0)
+            intrinsic = max(K * np.exp(-r * T) - S * np.exp(-q * T), 0)
             
         if price <= intrinsic + 1e-6:
             return 0.0 # Price is too low, no volatility premium.
@@ -112,23 +124,21 @@ class OptionAnalytics:
         # Standard Newton-Raphson with Bisection fallback
         low = 1e-6
         high = 5.0 # Max 500% IV
-        sigma = 0.5 # Initial guess
+        sigma = _DEFAULT_IV_SEED # Initial guess from config
         
         for i in range(max_iter):
             # Calculate Price and Vega
-            bs_price = self.black_scholes(S, K, T, r, sigma, option_type)
+            bs_price = self.black_scholes(S, K, T, r, sigma, option_type, q=q)
             diff = bs_price - price
             
             if abs(diff) < tol:
                 return sigma * 100
                 
-            v = self.vega(S, K, T, r, sigma)
+            v = self.vega(S, K, T, r, sigma, q=q)
             
             # Newton Step
             if v > 1e-8:
                 sigma_new = sigma - diff / v
-                # If Newton jumps out of bounds, restart with Bisection logic for this step?
-                # Simpler: If new sigma is valid, use it. Else, shrink bounds and bisect.
                 if low < sigma_new < high:
                     sigma = sigma_new
                     continue
@@ -146,26 +156,30 @@ class OptionAnalytics:
                 
         return sigma * 100
 
-    def calculate_greeks(self, S, K, T, r, sigma, option_type='CE'):
+    def calculate_greeks(self, S, K, T, r, sigma, option_type='CE', q=0.0):
         """
-        Calculate Delta, Gamma, Vega, Theta
+        Calculate Delta, Gamma, Vega, Theta (Merton 1973 dividend adjusted)
         sigma: Expected as decimal (e.g. 0.20 for 20%)
         """
         if T <= 0 or sigma <= 0 or K <= 0 or S <= 0:
             return {'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0}
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         
         if option_type == 'CE':
-            delta = norm.cdf(d1)
-            theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365.0
+            delta = np.exp(-q * T) * norm.cdf(d1)
+            theta = (-S * np.exp(-q * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
+                     - r * K * np.exp(-r * T) * norm.cdf(d2) 
+                     + q * S * np.exp(-q * T) * norm.cdf(d1)) / 365.0
         else:
-            delta = norm.cdf(d1) - 1
-            theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365.0
+            delta = np.exp(-q * T) * (norm.cdf(d1) - 1)
+            theta = (-S * np.exp(-q * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
+                     + r * K * np.exp(-r * T) * norm.cdf(-d2) 
+                     - q * S * np.exp(-q * T) * norm.cdf(-d1)) / 365.0
 
-        gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-        vega = (S * norm.pdf(d1) * np.sqrt(T)) / 100.0 # Standard convention to divide by 100
+        gamma = np.exp(-q * T) * norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        vega = (S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)) / 100.0 # Standard convention to divide by 100
         
         return {
             'delta': round(delta, 3),
@@ -258,12 +272,14 @@ class OptionAnalytics:
         Returns a pandas Series.
         """
         try:
-            if not isinstance(price_series, (pd.Series, pd.DataFrame)):
-                s = pd.Series(price_series)
-            else:
+            if isinstance(price_series, pd.Series):
                 s = price_series
+            elif isinstance(price_series, pd.DataFrame):
+                s = price_series.iloc[:, 0]
+            else:
+                s = pd.Series(price_series)
                 
-            log_returns = np.log(s / s.shift(1))
+            log_returns = pd.Series(np.log(s / s.shift(1)), index=s.index)
             rolling_vol = log_returns.rolling(window=window).std() * np.sqrt(252) * 100
             return rolling_vol.dropna()
         except Exception as e:

@@ -3,6 +3,20 @@ import pandas as pd
 from scipy.stats import norm
 from typing import Dict, Any, Literal
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import config as _cfg
+    _DEFAULT_LOT_SIZE = _cfg.get("nifty_lot_size", 65)
+    _DEFAULT_R = _cfg.get("risk_free_rate", 0.051274)
+    _DEFAULT_GEX_SCALING = _cfg.get("gex_move_pct", 0.01)
+    _DEFAULT_IV = _cfg.get("iv_fallback_flat", 0.15)
+except Exception:
+    _DEFAULT_LOT_SIZE = 65
+    _DEFAULT_R = 0.051274
+    _DEFAULT_GEX_SCALING = 0.01
+    _DEFAULT_IV = 0.15
+
 class GexEngine:
     """
     Institutional Gamma Exposure (GEX) Calculation Engine.
@@ -11,16 +25,16 @@ class GexEngine:
     """
     
     def __init__(self, 
-                 lot_size: int = 75, 
-                 risk_free_rate: float = 0.07, 
-                 gex_scaling: float = 0.01,
+                 lot_size: int | None = None, 
+                 risk_free_rate: float | None = None, 
+                 gex_scaling: float | None = None,
                  positioning_model: Literal['standard', 'inverted', 'flow'] = 'standard',
-                 default_iv: float = 0.15):
+                 default_iv: float | None = None):
         """
         Initialize the GexEngine.
         
-        :param lot_size: Contract multiplier (e.g., NIFTY = 75, SPX = 100).
-        :param risk_free_rate: Risk-free rate for BSM calculation (0.07 = 7%).
+        :param lot_size: Contract multiplier (defaults to config.nifty_lot_size, e.g. 65).
+        :param risk_free_rate: Risk-free rate for BSM calculation (defaults to config.risk_free_rate, e.g. ~0.0513).
         :param gex_scaling: Move magnitude for GEX output (0.01 = 1% Spot move).
         :param positioning_model: Inference model for dealer inventory.
             'standard': Assumes dealers are Long Calls (Overwriting flow) and Short Puts (Protective flow).
@@ -28,13 +42,13 @@ class GexEngine:
             'inverted': Assumes dealers are Short Calls (Speculative flow) and Long Puts.
                         Call GEX is Negative (-), Put GEX is Positive (+).
             'flow': Uses actual trade initiation to infer exact dealer positioning (requires 'initiator' column).
-        :param default_iv: Fallback Implied Volatility when unobservable (0.15 = 15%).
+        :param default_iv: Fallback Implied Volatility when unobservable (defaults to config.iv_fallback_flat).
         """
-        self.lot_size = lot_size
-        self.r = risk_free_rate
-        self.gex_scaling = gex_scaling
+        self.lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
+        self.r = risk_free_rate if risk_free_rate is not None else _DEFAULT_R
+        self.gex_scaling = gex_scaling if gex_scaling is not None else _DEFAULT_GEX_SCALING
         self.positioning_model = positioning_model
-        self.default_iv = default_iv
+        self.default_iv = default_iv if default_iv is not None else _DEFAULT_IV
 
     def compute_gamma_vectorized(self, S: float, K: np.ndarray, T: np.ndarray, iv: np.ndarray) -> np.ndarray:
         """
@@ -162,7 +176,8 @@ class GexEngine:
         # Spot Gamma (GEX at nearest strike)
         try:
             nearest_strike = df['strike'].iloc[(df['strike'] - spot_price).abs().argsort()].values[0]
-            spot_gamma = profile.get(nearest_strike, 0.0)
+            val = profile.get(nearest_strike, 0.0)
+            spot_gamma = float(val) if val is not None else 0.0
         except Exception:
             spot_gamma = 0.0
             
@@ -184,7 +199,7 @@ class GexEngine:
         
         return {
             'net_gex': float(net_gex),
-            'spot_gamma': float(spot_gamma),
+            'spot_gamma': spot_gamma,
             'forward_gex': float(forward_gex),
             'rolling_gex': float(net_rolling_gex),
             '0dte_gex': float(gex_0dte),

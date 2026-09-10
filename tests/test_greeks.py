@@ -60,8 +60,16 @@ class TestGreeksEngine(unittest.TestCase):
         self.assertAlmostEqual(ce_df.iloc[0]['gamma'], pe_df.iloc[0]['gamma'], places=6)
         self.assertAlmostEqual(ce_df.iloc[0]['vega'], pe_df.iloc[0]['vega'], places=6)
         
-        # Delta difference should be 1
-        self.assertAlmostEqual(ce_df.iloc[0]['delta'] - pe_df.iloc[0]['delta'], 1.0, places=6)
+        # Merton (1973) Put-Call Parity for Delta: Delta_CE - Delta_PE = e^{-qT}
+        T = 30.0 / 365.0
+        expected_delta_diff = np.exp(-self.engine.q * T)
+        self.assertAlmostEqual(ce_df.iloc[0]['delta'] - pe_df.iloc[0]['delta'], expected_delta_diff, places=6)
+
+        # When q=0, standard BSM parity: Delta_CE - Delta_PE = 1.0
+        zero_q_engine = GreeksEngine(risk_free_rate=0.07, dividend_yield=0.0, days_in_year=365.0)
+        ce_0 = zero_q_engine.calculate_all_greeks(S, K, T_days, iv, np.array(['CE']))
+        pe_0 = zero_q_engine.calculate_all_greeks(S, K, T_days, iv, np.array(['PE']))
+        self.assertAlmostEqual(ce_0.iloc[0]['delta'] - pe_0.iloc[0]['delta'], 1.0, places=6)
 
 if __name__ == '__main__':
     unittest.main()

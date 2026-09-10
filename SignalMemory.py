@@ -37,6 +37,7 @@ Usage:
 import os
 import json
 import uuid
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -53,6 +54,7 @@ class SignalMemory:
 
     def __init__(self, memory_file: str = MEMORY_FILE):
         self.memory_file = memory_file
+        self._lock = threading.Lock()
         self._data = self._load()
 
     def _load(self) -> dict:
@@ -65,11 +67,13 @@ class SignalMemory:
         return self._empty_store()
 
     def _save(self):
-        try:
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, indent=2, default=str)
-        except Exception as e:
-            print(f"  [SignalMemory] Save error: {e}")
+        with self._lock:
+            try:
+                with open(self.memory_file, 'w', encoding='utf-8') as f:
+                    json.dump(self._data, f, indent=2, default=str)
+            except Exception as e:
+                print(f"  [SignalMemory] Save error: {e}")
+
 
     @staticmethod
     def _empty_store() -> dict:

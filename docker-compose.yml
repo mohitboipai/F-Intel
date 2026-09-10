@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  fintel:
+    build: .
+    image: fintel:latest
+    container_name: fintel_server
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./data:/app/data      # persist backtest db, market_memory.json, portfolio
+      - ./logs:/app/logs      # persist launcher logs
+      - ./fintel_session.json:/app/fintel_session.json:rw  # persist locked expiries
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Cloudflare Tunnel: uses named tunnel token if CLOUDFLARE_TUNNEL_TOKEN is set,
+  # otherwise falls back to automatic anonymous quick tunnel.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: fintel_tunnel
+    depends_on:
+      fintel:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "if [ -n \"$${CLOUDFLARE_TUNNEL_TOKEN}\" ]; then
+        exec tunnel --no-autoupdate run --token \"$${CLOUDFLARE_TUNNEL_TOKEN}\";
+      else
+        exec tunnel --no-autoupdate --url http://fintel:8082;
+      fi"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

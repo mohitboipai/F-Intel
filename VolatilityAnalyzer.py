@@ -24,6 +24,16 @@ from RealizedVolEngine import RealizedVolEngine
 from MasterSignalEngine import MasterSignalEngine
 from OptionBuyerEngine import OptionBuyerEngine
 
+try:
+    import config as _cfg
+except ImportError:
+    _cfg = None
+
+def _get_cfg(key, default):
+    if _cfg is not None:
+        return _cfg.get(key, default)
+    return default
+
 # ────────────────────────────────────────────────────────
 # NOTE: The old local StrategyEngine class has been retired.
 # Strategy generation is now performed exclusively by
@@ -205,7 +215,7 @@ class VolatilityAnalyzer:
         self.fyers: Any = self._authenticate()
         self.analytics = OptionAnalytics()
         self.symbol = "NSE:NIFTY50-INDEX"
-        self.spot_price = 0
+        self.spot_price: float = 0.0
         self.expiry_date = None # Current selected expiry
 
         # We need this for parse_and_filter compatibility, though we might override it
@@ -316,20 +326,55 @@ class VolatilityAnalyzer:
     # ================================================================
 
     def _ensure_iv(self, row_iv, price, strike, T, option_type):
-        """Recalculate IV if API value is suspect."""
-        if 0.5 < row_iv < 200:
-            return row_iv
-        if price > 0.5:
+        """
+        4-tier IV resolution (Dumas-Fleming-Whaley 1998; Gatheral SVI 2004):
+          Tier 1: Valid observable API IV (0.5% < iv < 200%).
+          Tier 2: Newton-Raphson/Bisection numerical solve from market price.
+          Tier 3: Moneyness quadratic smile approximation: IV(k) = a + b*k + c*k^2.
+          Tier 4: Flat regime fallback: iv_fallback_flat from config.
+        """
+        # Tier 1: Valid API IV
+        try:
+            if row_iv is not None and not np.isnan(row_iv) and 0.5 < float(row_iv) < 200.0:
+                return float(row_iv)
+        except (ValueError, TypeError):
+            pass
+
+        r = _get_cfg("risk_free_rate", 0.051274)
+        q = _get_cfg("dividend_yield", 0.0122) if (T * 365.0) > _get_cfg("dividend_dte_threshold", 7) else 0.0
+
+        # Tier 2: Solve from option price via Analytics
+        if price is not None and price > 0.5 and strike > 0 and T > 0:
             try:
-                calc_iv = self.analytics.implied_volatility(price, self.spot_price, strike, T, 0.10, option_type)
-                if 0 < calc_iv < 200:
-                    return calc_iv
+                calc_iv = self.analytics.implied_volatility(
+                    price, self.spot_price, strike, T, r, option_type, q=q
+                )
+                if 0.5 < calc_iv < 200.0:
+                    return float(calc_iv)
             except Exception:
                 pass
-        return row_iv if row_iv > 0 else 0
 
-    def _filter_strikes(self, df, spot, range_pct=0.04):
-        """Filter to strikes within range_pct of spot."""
+        # Tier 3: Quadratic smile fallback based on log-moneyness
+        if self.spot_price > 0 and strike > 0:
+            try:
+                k = np.log(strike / self.spot_price)
+                atm_base = _get_cfg("iv_fallback_flat", 0.15) * 100.0
+                smile_iv = atm_base - 15.0 * k + 25.0 * (k ** 2)
+                min_iv = _get_cfg("iv_fallback_min", 0.08) * 100.0
+                max_iv = _get_cfg("iv_fallback_max", 0.80) * 100.0
+                if min_iv <= smile_iv <= max_iv:
+                    return float(smile_iv)
+            except Exception:
+                pass
+
+        # Tier 4: Flat regime fallback from config
+        fallback = _get_cfg("iv_fallback_flat", 0.15) * 100.0
+        return float(fallback)
+
+    def _filter_strikes(self, df, spot, range_pct=None):
+        """Filter to strikes within range_pct of spot (defaults to config strike_filter_range)."""
+        if range_pct is None:
+            range_pct = _get_cfg("strike_filter_range", 0.05)
         return df[(df['strike'] > spot * (1 - range_pct)) & (df['strike'] < spot * (1 + range_pct))]
 
     # ================================================================
@@ -1825,10 +1870,11 @@ class VolatilityAnalyzer:
                 
                 # If either leg price is 0, compute it via BSM
                 sigma_dec = atm_iv / 100 if atm_iv > 0 else 0.15
+                _r = _get_cfg("risk_free_rate", 0.051274)
                 if ce_price <= 0 and atm_iv > 0:
-                    ce_price = self.analytics.black_scholes(spot, ce_strike, T, 0.07, sigma_dec, 'CE')
+                    ce_price = self.analytics.black_scholes(spot, ce_strike, T, _r, sigma_dec, 'CE')
                 if pe_price <= 0 and atm_iv > 0:
-                    pe_price = self.analytics.black_scholes(spot, pe_strike, T, 0.07, sigma_dec, 'PE')
+                    pe_price = self.analytics.black_scholes(spot, pe_strike, T, _r, sigma_dec, 'PE')
                 
                 straddle_price = ce_price + pe_price
                 
@@ -1911,7 +1957,7 @@ class VolatilityAnalyzer:
                 print(f"{'Strike':>8} {'Type':>4} {'Dist':>7} {'P(Touch)':>9} {'P(OTM)':>8} {'Prem':>7} {'Theta':>7} {'Signal':>10}")
                 print("-" * 72)
                 
-                r_rate = 0.07
+                r_rate = _get_cfg("risk_free_rate", 0.051274)
                 sigma = atm_iv / 100 if atm_iv > 0 else 0.15
                 
                 # Get unique strikes near ATM
@@ -2108,7 +2154,37 @@ class VolatilityAnalyzer:
             """Suppress request log spam, and handle POST for backtesting."""
             def log_message(self, *args): pass # type: ignore
             def log_request(self, *args): pass # type: ignore
+
+            def copyfile(self, source, outputfile):
+                try:
+                    super().copyfile(source, outputfile)
+                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                    pass
             
+            def do_GET(self):
+                if self.path.startswith('/fragment'):
+                    self.path = '/unified_dashboard_fragment.html'
+                    return super().do_GET()
+                elif self.path.startswith('/api/'):
+                    try:
+                        import urllib.request
+                        url = f"http://127.0.0.1:8082{self.path}"
+                        req = urllib.request.Request(url)
+                        with urllib.request.urlopen(req, timeout=3) as resp:
+                            data = resp.read()
+                            self.send_response(resp.status)
+                            self.send_header('Content-type', 'application/json')
+                            self.send_header('Access-Control-Allow-Origin', '*')
+                            self.end_headers()
+                            self.wfile.write(data)
+                            return
+                    except Exception as e:
+                        self.send_response(502)
+                        self.end_headers()
+                        self.wfile.write(str(e).encode())
+                        return
+                return super().do_GET()
+
             def do_POST(self):
                 if self.path == '/bt_run':
                     content_len = int(self.headers.get('Content-Length', 0))
@@ -2427,7 +2503,7 @@ class VolatilityAnalyzer:
             vrp_series = pd.Series([float(i) - float(rolling_hv.iloc[max(0, j-1)])
                                     for j, i in enumerate(rolling_hv.values)
                                     if j > 0], dtype=float).dropna()
-            vrp_percentile = float((vrp_series < vrp).mean() * 100) if len(vrp_series) > 10 else 50.0
+            vrp_percentile = (vrp_series < vrp).mean() * 100 if len(vrp_series) > 10 else 50.0
 
             signal_metrics = {'vrp': vrp, 'regime': regime}
             signal_result = self._score_signal(signal_metrics)
@@ -2565,10 +2641,11 @@ class VolatilityAnalyzer:
                 atm_iv = self._ensure_iv(atm_pe['iv'], pe_price, atm_pe['strike'], T, 'PE')
 
             sigma = atm_iv / 100 if atm_iv > 0 else 0.15
+            _r = _get_cfg("risk_free_rate", 0.051274)
             if ce_price <= 0 and atm_iv > 0:
-                ce_price = self.analytics.black_scholes(spot, atm_ce['strike'] if atm_ce is not None else atm_strike, T, 0.07, sigma, 'CE')
+                ce_price = self.analytics.black_scholes(spot, atm_ce['strike'] if atm_ce is not None else atm_strike, T, _r, sigma, 'CE')
             if pe_price <= 0 and atm_iv > 0:
-                pe_price = self.analytics.black_scholes(spot, atm_pe['strike'] if atm_pe is not None else atm_strike, T, 0.07, sigma, 'PE')
+                pe_price = self.analytics.black_scholes(spot, atm_pe['strike'] if atm_pe is not None else atm_strike, T, _r, sigma, 'PE')
 
             straddle = ce_price + pe_price
             em_pct = (straddle / spot) * 100
@@ -2659,7 +2736,7 @@ class VolatilityAnalyzer:
 
             # Strike selection
             strike_rows = []
-            r_rate = 0.07
+            r_rate = _get_cfg("risk_free_rate", 0.051274)
             for strike in nearby:
                 for otype in ['CE', 'PE']:
                     row_df = df_chain[(df_chain['strike'] == strike) & (df_chain['type'] == otype)]
@@ -2723,7 +2800,7 @@ class VolatilityAnalyzer:
                     return heston_cache['params']
                 avg_iv = cal_df['iv'].mean() / 100.0
                 v0_guess = max(0.005, avg_iv ** 2)
-                r = 0.07
+                r = _get_cfg("risk_free_rate", 0.051274)
                 initial = [2.0, v0_guess, v0_guess, -0.7, 0.3]
                 bounds = [(0.1, 10.0), (0.001, 0.5), (0.001, 0.5), (-0.99, 0.99), (0.01, 5.0)]
                 def objective(params):
@@ -2752,7 +2829,7 @@ class VolatilityAnalyzer:
             """Run 50k Heston MC paths for Day 0/7/14 → PDF + stats."""
             if not params or spot <= 0:
                 return None
-            r = 0.07
+            r = _get_cfg("risk_free_rate", 0.051274)
             kappa, theta, v0, rho, xi = params['kappa'], params['theta'], params['v0'], params['rho'], params['xi']
             near_T = self.analytics.get_time_to_expiry(near_exp)
             near_days = max(1, int(near_T * 365))
@@ -2812,7 +2889,7 @@ class VolatilityAnalyzer:
             if spot <= 0 or atm_iv <= 0:
                 return None
             sigma_ann = atm_iv / 100
-            r = 0.07
+            r = _get_cfg("risk_free_rate", 0.051274)
             near_T = self.analytics.get_time_to_expiry(near_exp)
             near_days = max(1, int(near_T * 365))
             horizons = [
@@ -2851,7 +2928,7 @@ class VolatilityAnalyzer:
             """Full MC simulation: fan chart, VaR/CVaR, vol path. 50k paths."""
             if not params or spot <= 0:
                 return None
-            r = 0.07
+            r = _get_cfg("risk_free_rate", 0.051274)
             kappa, theta, v0, rho, xi = params['kappa'], params['theta'], params['v0'], params['rho'], params['xi']
             near_T = self.analytics.get_time_to_expiry(near_exp)
             sim_days = 14
@@ -3414,7 +3491,8 @@ class VolatilityAnalyzer:
                         gex_html = ''
                         if not df_chain.empty:
                             try:
-                                _lot = 75  # NIFTY lot size
+                                _lot = _get_cfg("nifty_lot_size", 65)  # NIFTY lot size
+                                _r_gex = _get_cfg("risk_free_rate", 0.051274)
                                 _T_gex = self.analytics.get_time_to_expiry(near_exp) or (1 / 365)
                                 _df_gex = df_chain.copy()
 
@@ -3427,7 +3505,7 @@ class VolatilityAnalyzer:
                                         sigma = calc_iv / 100.0 if calc_iv > 0 else 0.15
                                         _ratio = spot / r['strike'] if r['strike'] > 0 else 1.0
                                         if _ratio <= 0: _ratio = 1e-6  # guard log domain
-                                        d1 = (np.log(_ratio) + (0.07 + 0.5 * sigma**2) * _T_gex) / (sigma * np.sqrt(max(_T_gex, 1e-6)))
+                                        d1 = (np.log(_ratio) + (_r_gex + 0.5 * sigma**2) * _T_gex) / (sigma * np.sqrt(max(_T_gex, 1e-6)))
                                         g = np.exp(-0.5 * d1**2) / (np.sqrt(2 * np.pi) * spot * sigma * np.sqrt(max(_T_gex, 1e-6)))
                                     return g
 
@@ -3439,7 +3517,7 @@ class VolatilityAnalyzer:
 
                                 _gex_by_strike = _df_gex.groupby('strike')['gex'].sum().reset_index()
                                 _gex_by_strike = _gex_by_strike[abs(_gex_by_strike['gex']) > 1e4]
-                                _gex_by_strike = _gex_by_strike.sort_values('strike', ascending=True)
+                                _gex_by_strike = pd.DataFrame(_gex_by_strike).sort_values(by='strike', ascending=True)
 
                                 _gex_colors = ['rgba(255,68,68,0.85)' if g > 0 else 'rgba(102,187,106,0.85)' for g in _gex_by_strike['gex']]
                                 fig_gex = go.Figure(go.Bar(
@@ -3589,6 +3667,867 @@ class VolatilityAnalyzer:
                         chain_tab_html = '<div class="card"><p style="color:#888;">No option chain data available for analysis.</p></div>'
 
 
+                    # ── TAB 5: THETA DECAY EXPLORER & GREEKS DYNAMICS ──
+                    theta_tab_html = '<div class="card"><p style="color:#888;">Waiting for option chain data to compute Theta Decay...</p></div>'
+                    try:
+                        if not df_chain.empty and spot > 0:
+                            _lot_th = _get_cfg("nifty_lot_size", 65)
+                            _r_th = _get_cfg("risk_free_rate", 0.051274)
+                            _q_th = _get_cfg("dividend_yield", 0.0122)
+                            _T_th = self.analytics.get_time_to_expiry(near_exp) or (7.0 / 365.0)
+                            _curr_dte_th = max(_T_th * 365.0, 0.05)
+                            _atm_iv_th = float(_pd_iv) if ('_pd_iv' in locals() and _pd_iv and _pd_iv > 0) else 14.0
+
+                            # Filter strikes around spot (±8% band)
+                            _lo_th, _hi_th = spot * 0.92, spot * 1.08
+                            _df_th = df_chain[df_chain['strike'].between(_lo_th, _hi_th)].copy()
+
+                            if not _df_th.empty:
+                                _strikes_sorted = sorted(_df_th['strike'].unique())
+                                _atm_strike_th = min(_strikes_sorted, key=lambda s: abs(s - spot))
+
+                                _th_lookup = {}
+                                for _, _row in _df_th.iterrows():
+                                    _th_lookup[(_row['strike'], _row['type'])] = _row
+
+                                _theta_table_rows = []
+                                _ce_thetas_inr = []
+                                _pe_thetas_inr = []
+                                _straddle_thetas_inr = []
+                                _daily_cushions_pts = []
+                                _decay_yields_pct = []
+                                _valid_strikes = []
+
+                                _peak_theta_val = 0.0
+                                _peak_strike = _atm_strike_th
+                                _best_harvest_score = -1.0
+                                _sweet_strike = _atm_strike_th
+                                _sweet_cushion = 0.0
+                                _sweet_yield = 0.0
+                                _top_buyer_strike = _atm_strike_th
+                                _top_buyer_conv = 0.0
+                                _top_buyer_score = 0.0
+                                _top_seller_strike = _atm_strike_th
+                                _top_seller_score = 0.0
+                                _atm_strad_prem = 0.0
+                                _atm_strad_ext_pts = 0.0
+                                _atm_strad_ext_inr = 0.0
+
+                                def _calc_merton_theta(K_val, sig_val, otype):
+                                    sqT = np.sqrt(max(_T_th, 1e-6))
+                                    d1 = (np.log(spot / K_val) + (_r_th - _q_th + 0.5 * sig_val**2) * _T_th) / (sig_val * sqT)
+                                    d2 = d1 - sig_val * sqT
+                                    eqT = np.exp(-_q_th * _T_th)
+                                    erT = np.exp(-_r_th * _T_th)
+                                    pdf_d1 = norm.pdf(d1)
+                                    gamma_val = eqT * pdf_d1 / (spot * sig_val * sqT)
+                                    vega_val = spot * eqT * pdf_d1 * sqT / 100.0
+                                    if otype == 'CE':
+                                        delta_val = eqT * norm.cdf(d1)
+                                        theta_val = (-spot * eqT * pdf_d1 * sig_val / (2.0 * sqT)
+                                                     - _r_th * K_val * erT * norm.cdf(d2)
+                                                     + _q_th * spot * eqT * norm.cdf(d1)) / 365.0
+                                        charm_val = eqT * (-_q_th * norm.cdf(d1) + pdf_d1 * (2*(_r_th - _q_th)*_T_th - d2*sig_val*sqT)/(2*_T_th*sig_val*sqT)) / 365.0
+                                    else:
+                                        delta_val = eqT * (norm.cdf(d1) - 1.0)
+                                        theta_val = (-spot * eqT * pdf_d1 * sig_val / (2.0 * sqT)
+                                                     + _r_th * K_val * erT * norm.cdf(-d2)
+                                                     - _q_th * spot * eqT * norm.cdf(-d1)) / 365.0
+                                        charm_val = eqT * (_q_th * norm.cdf(-d1) + pdf_d1 * (2*(_r_th - _q_th)*_T_th - d2*sig_val*sqT)/(2*_T_th*sig_val*sqT)) / 365.0
+                                    return theta_val, gamma_val, delta_val, charm_val, vega_val
+
+                                for _K in _strikes_sorted:
+                                    _ce_row = _th_lookup.get((_K, 'CE'))
+                                    _pe_row = _th_lookup.get((_K, 'PE'))
+
+                                    _ce_ltp = float(_ce_row['price']) if _ce_row is not None else 0.0
+                                    _pe_ltp = float(_pe_row['price']) if _pe_row is not None else 0.0
+                                    _ce_iv = float(_ce_row['iv']) if _ce_row is not None else 0.0
+                                    _pe_iv = float(_pe_row['iv']) if _pe_row is not None else 0.0
+
+                                    _ce_calc_iv = self._ensure_iv(_ce_iv, _ce_ltp, _K, _T_th, 'CE') if _ce_ltp > 0 else _atm_iv_th
+                                    _pe_calc_iv = self._ensure_iv(_pe_iv, _pe_ltp, _K, _T_th, 'PE') if _pe_ltp > 0 else _atm_iv_th
+
+                                    _sig_ce = max(_ce_calc_iv / 100.0, 0.02)
+                                    _sig_pe = max(_pe_calc_iv / 100.0, 0.02)
+
+                                    _th_ce, _gam_ce, _del_ce, _ch_ce, _vg_ce = _calc_merton_theta(_K, _sig_ce, 'CE')
+                                    _th_pe, _gam_pe, _del_pe, _ch_pe, _vg_pe = _calc_merton_theta(_K, _sig_pe, 'PE')
+
+                                    _th_ce_inr = _th_ce * _lot_th
+                                    _th_pe_inr = _th_pe * _lot_th
+                                    _th_strad_inr = _th_ce_inr + _th_pe_inr
+                                    _th_strad_1h = _th_strad_inr / 6.25
+
+                                    _strad_gam = _gam_ce + _gam_pe
+                                    _del_net = _del_ce + _del_pe
+                                    _vg_net = _vg_ce + _vg_pe
+
+                                    _th_day_pts = abs(_th_strad_inr / _lot_th)
+                                    _daily_cushion_pts = float(np.sqrt(max(2.0 * _th_day_pts / max(_strad_gam, 1e-7), 0.0)))
+                                    _daily_cushion_pts = min(_daily_cushion_pts, 999.0)
+
+                                    _strad_prem = max(_ce_ltp + _pe_ltp, 0.01)
+                                    _intrinsic = abs(spot - _K)
+                                    _strad_ext_pts = max(_strad_prem - _intrinsic, 0.0)
+                                    _strad_ext_inr = _strad_ext_pts * _lot_th
+                                    _ext_pct = (_strad_ext_pts / _strad_prem) * 100.0 if _strad_prem > 0 else 0.0
+
+                                    _yield_pct = (_th_day_pts / _strad_prem) * 100.0
+                                    _yield_pct = min(_yield_pct, 100.0)
+
+                                    _cushion_ratio = _daily_cushion_pts / max(spot, 1000.0)
+                                    _sell_score = min(max((_yield_pct * 0.4) + (min(_daily_cushion_pts, 250.0) / 250.0 * 30.0) + (20.0 if abs(_K - spot) <= 100 else 10.0), 0.0), 100.0)
+                                    _convexity = (_strad_gam / max(_strad_prem, 1.0)) * 10000.0
+                                    _buy_score = min(max(_convexity * 15.0 + (25.0 if abs(_K - spot) <= 75 else 10.0), 0.0), 100.0)
+
+                                    if _convexity > _top_buyer_conv:
+                                        _top_buyer_conv = _convexity
+                                        _top_buyer_strike = _K
+                                        _top_buyer_score = _buy_score
+
+                                    _valid_strikes.append(_K)
+                                    _ce_thetas_inr.append(_th_ce_inr)
+                                    _pe_thetas_inr.append(_th_pe_inr)
+                                    _straddle_thetas_inr.append(_th_strad_inr)
+                                    _daily_cushions_pts.append(_daily_cushion_pts)
+                                    _decay_yields_pct.append(_yield_pct)
+
+                                    if abs(_th_strad_inr) > _peak_theta_val:
+                                        _peak_theta_val = abs(_th_strad_inr)
+                                        _peak_strike = _K
+
+                                    _harvest_score = abs(_th_strad_inr) * _cushion_ratio * (1.0 + (_yield_pct / 100.0))
+                                    if abs(_K - spot) <= (spot * 0.04) and _harvest_score > _best_harvest_score:
+                                        _best_harvest_score = _harvest_score
+                                        _sweet_strike = _K
+                                        _sweet_cushion = _daily_cushion_pts
+                                        _sweet_yield = _yield_pct
+                                        _top_seller_strike = _K
+                                        _top_seller_score = _sell_score
+
+                                    _dist = _K - spot
+                                    _dist_cls = GREEN if _dist > 0 else RED if _dist < 0 else ACCENT
+                                    _dist_str = f"{_dist:+.0f}" if _dist != 0 else "ATM"
+
+                                    if _sell_score >= 50.0 and _daily_cushion_pts >= 60.0:
+                                        _edge_badge = f'<span class="badge-edge edge-seller" style="background:rgba(16,185,129,0.18);color:#10b981;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid rgba(16,185,129,0.35);">SELLER ADV ({_sell_score:.0f})</span>'
+                                    elif _buy_score >= 45.0:
+                                        _edge_badge = f'<span class="badge-edge edge-buyer" style="background:rgba(2,132,199,0.18);color:#38bdf8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.35);">BUY CONVEX ({_buy_score:.0f})</span>'
+                                    else:
+                                        _edge_badge = f'<span class="badge-edge edge-neutral" style="background:rgba(148,163,184,0.15);color:#94a3b8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">NEUTRAL</span>'
+
+                                    if abs(_K - spot) <= 50 and _curr_dte_th <= 0.5:
+                                        _ret_badge = f'<span style="background:rgba(239,68,68,0.2);color:#ef5350;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #ef5350;">EXIT / ROLL</span>'
+                                    elif _ext_pct <= 20.0 and _strad_prem > 5.0:
+                                        _ret_badge = f'<span style="background:rgba(255,213,79,0.2);color:#ffd54f;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #ffd54f;">TAKE PROFIT</span>'
+                                    elif _daily_cushion_pts < 30.0 and abs(_K - spot) <= 150:
+                                        _ret_badge = f'<span style="background:rgba(249,115,22,0.2);color:#fb923c;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #fb923c;">DEFEND</span>'
+                                    elif _sell_score >= 55.0:
+                                        _ret_badge = f'<span style="background:rgba(16,185,129,0.2);color:#10b981;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #10b981;">STAY IN TRADE</span>'
+                                    else:
+                                        _ret_badge = f'<span style="background:rgba(148,163,184,0.15);color:#94a3b8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">HOLD</span>'
+
+                                    _is_atm = (_K == _atm_strike_th)
+                                    if _is_atm:
+                                        _atm_strad_prem = _strad_prem
+                                        _atm_strad_ext_pts = _strad_ext_pts
+                                        _atm_strad_ext_inr = _strad_ext_inr
+
+                                    _row_id = 'id="th-row-atm"' if _is_atm else ''
+                                    _row_atm_attr = 'data-is-atm="true"' if _is_atm else ''
+                                    _row_style = 'background:rgba(79,195,247,0.12);font-weight:700;border-left:3px solid #4fc3f7;cursor:pointer;' if _is_atm else 'cursor:pointer;'
+
+                                    _theta_table_rows.append(
+                                        f'<tr {_row_id} {_row_atm_attr} data-strike="{_K}" data-dist="{_dist}" '
+                                        f'data-ce-ltp="{_ce_ltp:.2f}" data-pe-ltp="{_pe_ltp:.2f}" data-strad-ltp="{_strad_prem:.2f}" '
+                                        f'data-ext-pts="{_strad_ext_pts:.2f}" data-ext-inr="{_strad_ext_inr:.0f}" '
+                                        f'data-ce-theta="{_th_ce_inr:.2f}" data-pe-theta="{_th_pe_inr:.2f}" data-strad-theta="{_th_strad_inr:.2f}" '
+                                        f'data-strad-gam="{_strad_gam:.6f}" data-delta="{_del_net:.4f}" data-vega="{_vg_net:.4f}" '
+                                        f'data-cushion="{_daily_cushion_pts:.1f}" data-yield="{_yield_pct:.1f}" '
+                                        f'data-sell-score="{_sell_score:.0f}" data-buy-score="{_buy_score:.0f}" '
+                                        f'onclick="selectSimStrike({_K})" title="Click strike to simulate in Greek attribution engine" style="{_row_style}">'
+                                        f'<td style="text-align:left;color:{WHITE};font-weight:700;">{_K:,.0f} {"(ATM)" if _is_atm else ""}</td>'
+                                        f'<td style="color:{_dist_cls};">{_dist_str}</td>'
+                                        f'<td style="color:#ffd54f;font-weight:700;">₹{_strad_prem:.1f}</td>'
+                                        f'<td style="color:{YELLOW};">₹{_strad_ext_pts:.1f} <span style="color:{MUTED};font-size:10px;">({_ext_pct:.0f}%) / ₹{_strad_ext_inr:,.0f}</span></td>'
+                                        f'<td>₹{_ce_ltp:.1f} <span style="color:{MUTED};font-size:10px;">({_ce_calc_iv:.1f}%)</span></td>'
+                                        f'<td style="color:{RED};">₹{_th_ce_inr:,.0f}</td>'
+                                        f'<td>₹{_pe_ltp:.1f} <span style="color:{MUTED};font-size:10px;">({_pe_calc_iv:.1f}%)</span></td>'
+                                        f'<td style="color:{RED};">₹{_th_pe_inr:,.0f}</td>'
+                                        f'<td style="color:{RED};font-weight:700;">₹{_th_strad_inr:,.0f}</td>'
+                                        f'<td style="color:{YELLOW};">₹{_th_strad_1h:,.0f}</td>'
+                                        f'<td>{_strad_gam:.5f}</td>'
+                                        f'<td style="color:{GREEN};font-weight:700;">±{_daily_cushion_pts:.0f} pts</td>'
+                                        f'<td style="color:{ACCENT};">{_yield_pct:.1f}%/d</td>'
+                                        f'<td style="text-align:center;">{_edge_badge}</td>'
+                                        f'<td style="text-align:center;">{_ret_badge}</td>'
+                                        f'</tr>'
+                                    )
+
+                                _atm_idx = _valid_strikes.index(_atm_strike_th) if _atm_strike_th in _valid_strikes else 0
+                                _atm_ce_inr = _ce_thetas_inr[_atm_idx]
+                                _atm_pe_inr = _pe_thetas_inr[_atm_idx]
+                                _atm_strad_inr = _straddle_thetas_inr[_atm_idx]
+                                _atm_strad_1h = _atm_strad_inr / 6.25
+
+
+                                _fig_th1 = make_subplots(
+                                    rows=1, cols=2,
+                                    subplot_titles=[
+                                        "The Theta Cliff: Daily Decay (₹/lot) vs DTE",
+                                        "Strike vs Daily Theta Profile (₹/lot)"
+                                    ],
+                                    horizontal_spacing=0.08
+                                )
+
+                                _dte_steps_th = [7.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.1]
+                                for _tgt_strike, _tgt_name, _tgt_c in [
+                                    (_atm_strike_th, f"ATM ({_atm_strike_th:.0f})", ACCENT),
+                                    (_atm_strike_th + 200, f"OTM CE ({_atm_strike_th+200:.0f})", GREEN),
+                                    (_atm_strike_th - 200, f"ITM CE ({_atm_strike_th-200:.0f})", YELLOW)
+                                ]:
+                                    _curve_y = []
+                                    for _d in _dte_steps_th:
+                                        _t_step = max(_d / 365.0, 1e-6)
+                                        _sqT_s = np.sqrt(_t_step)
+                                        _sig_s = max(_atm_iv_th / 100.0, 0.02)
+                                        _d1_s = (np.log(spot/_tgt_strike) + (_r_th - _q_th + 0.5*_sig_s**2)*_t_step)/(_sig_s*_sqT_s)
+                                        _d2_s = _d1_s - _sig_s*_sqT_s
+                                        _th_s = (-spot * np.exp(-_q_th*_t_step) * norm.pdf(_d1_s) * _sig_s / (2*_sqT_s)
+                                                 - _r_th * _tgt_strike * np.exp(-_r_th*_t_step) * norm.cdf(_d2_s)
+                                                 + _q_th * spot * np.exp(-_q_th*_t_step) * norm.cdf(_d1_s)) / 365.0
+                                        _curve_y.append(abs(_th_s * _lot_th))
+                                    _fig_th1.add_trace(
+                                        go.Scatter(
+                                            x=_dte_steps_th, y=_curve_y,
+                                            mode='lines+markers', name=_tgt_name,
+                                            line=dict(color=_tgt_c, width=2.5),
+                                            marker=dict(size=6)
+                                        ),
+                                        row=1, col=1
+                                    )
+
+                                _fig_th1.add_trace(
+                                    go.Scatter(
+                                        x=_valid_strikes, y=[abs(x) for x in _ce_thetas_inr],
+                                        mode='lines+markers', name='Call Theta (₹)',
+                                        line=dict(color=ACCENT, width=2),
+                                        marker=dict(size=5)
+                                    ),
+                                    row=1, col=2
+                                )
+                                _fig_th1.add_trace(
+                                    go.Scatter(
+                                        x=_valid_strikes, y=[abs(x) for x in _pe_thetas_inr],
+                                        mode='lines+markers', name='Put Theta (₹)',
+                                        line=dict(color=RED, width=2),
+                                        marker=dict(size=5)
+                                    ),
+                                    row=1, col=2
+                                )
+                                _fig_th1.add_trace(
+                                    go.Scatter(
+                                        x=_valid_strikes, y=[abs(x) for x in _straddle_thetas_inr],
+                                        mode='lines', name='Straddle Theta (₹)',
+                                        line=dict(color=YELLOW, width=2, dash='dash')
+                                    ),
+                                    row=1, col=2
+                                )
+                                _fig_th1.add_vline(x=spot, line_width=1.5, line_dash="dash", line_color="#ffffff", row=1, col=2)
+
+                                _fig_th1.update_layout(
+                                    height=350, autosize=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                                    font=dict(color=WHITE, family='Inter, sans-serif', size=10),
+                                    legend=dict(bgcolor='rgba(18,18,42,0.85)', font=dict(size=9), orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                                    margin=dict(l=40, r=20, t=40, b=30), hovermode='x unified'
+                                )
+                                _fig_th1.update_xaxes(title_text="Days to Expiry (DTE)", autorange="reversed", gridcolor='rgba(255,255,255,0.05)', row=1, col=1)
+                                _fig_th1.update_yaxes(title_text="Decay (₹/lot/day)", gridcolor='rgba(255,255,255,0.05)', row=1, col=1)
+                                _fig_th1.update_xaxes(title_text="Strike Price", gridcolor='rgba(255,255,255,0.05)', row=1, col=2)
+                                _fig_th1.update_yaxes(title_text="Decay (₹/lot/day)", gridcolor='rgba(255,255,255,0.05)', row=1, col=2)
+                                _plotly_th1 = _fig_th1.to_html(include_plotlyjs=False, full_html=False)
+
+                                _fig_th2 = make_subplots(
+                                    rows=1, cols=2,
+                                    subplot_titles=[
+                                        "Harvest Cushion: Daily Breakeven Move (±pts) vs Strike",
+                                        "Strike × DTE 2D Decay Heatmap (₹/day)"
+                                    ],
+                                    horizontal_spacing=0.08
+                                )
+
+                                _fig_th2.add_trace(
+                                    go.Scatter(
+                                        x=_valid_strikes, y=_daily_cushions_pts,
+                                        mode='lines+markers', name='Daily Cushion (±pts)',
+                                        line=dict(color=GREEN, width=2.5),
+                                        fill='tozeroy', fillcolor='rgba(16,185,129,0.1)'
+                                    ),
+                                    row=1, col=1
+                                )
+                                _fig_th2.add_vline(x=spot, line_width=1.5, line_dash="dash", line_color="#ffffff", row=1, col=1)
+
+                                _heatmap_z = []
+                                for _K in _valid_strikes:
+                                    _row_z = []
+                                    for _d in _dte_steps_th:
+                                        _t_s = max(_d / 365.0, 1e-6)
+                                        _sqT_s = np.sqrt(_t_s)
+                                        _sig_s = max(_atm_iv_th / 100.0, 0.02)
+                                        _d1_s = (np.log(spot/_K) + (_r_th - _q_th + 0.5*_sig_s**2)*_t_s)/(_sig_s*_sqT_s)
+                                        _th_s = (-spot * np.exp(-_q_th*_t_s) * norm.pdf(_d1_s) * _sig_s / (2*_sqT_s)) / 365.0
+                                        _row_z.append(round(abs(_th_s * _lot_th), 0))
+                                    _heatmap_z.append(_row_z)
+
+                                _fig_th2.add_trace(
+                                    go.Heatmap(
+                                        z=_heatmap_z,
+                                        x=[f"{d}d" for d in _dte_steps_th],
+                                        y=_valid_strikes,
+                                        colorscale='Viridis',
+                                        colorbar=dict(title=dict(text="₹/day", font=dict(size=10)), len=0.8, x=1.02),
+                                        hoverongaps=False
+                                    ),
+                                    row=1, col=2
+                                )
+
+                                _fig_th2.update_layout(
+                                    height=350, autosize=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                                    font=dict(color=WHITE, family='Inter, sans-serif', size=10),
+                                    legend=dict(bgcolor='rgba(18,18,42,0.85)', font=dict(size=9)),
+                                    margin=dict(l=40, r=20, t=40, b=30), hovermode='closest'
+                                )
+                                _fig_th2.update_xaxes(title_text="Strike Price", gridcolor='rgba(255,255,255,0.05)', row=1, col=1)
+                                _fig_th2.update_yaxes(title_text="Breakeven Cushion (± pts)", gridcolor='rgba(255,255,255,0.05)', row=1, col=1)
+                                _fig_th2.update_xaxes(title_text="DTE Horizon", gridcolor='rgba(255,255,255,0.05)', row=1, col=2)
+                                _fig_th2.update_yaxes(title_text="Strike Price", gridcolor='rgba(255,255,255,0.05)', row=1, col=2)
+                                _plotly_th2 = _fig_th2.to_html(include_plotlyjs=False, full_html=False)
+
+                                # ── Quantitative Normalization & Granular Decay Calculations ──
+                                _atm_idx = _valid_strikes.index(_atm_strike_th) if _atm_strike_th in _valid_strikes else 0
+                                _atm_ce_inr = _ce_thetas_inr[_atm_idx] if _atm_idx < len(_ce_thetas_inr) else -1800.0
+                                _atm_pe_inr = _pe_thetas_inr[_atm_idx] if _atm_idx < len(_pe_thetas_inr) else -1950.0
+                                _atm_strad_inr = _straddle_thetas_inr[_atm_idx] if _atm_idx < len(_straddle_thetas_inr) else (_atm_ce_inr + _atm_pe_inr)
+                                _atm_ce_1h = _atm_ce_inr / 6.25
+                                _atm_pe_1h = _atm_pe_inr / 6.25
+                                _atm_strad_1h = _atm_strad_inr / 6.25
+                                _atm_ce_1m = _atm_ce_inr / 375.0
+                                _atm_pe_1m = _atm_pe_inr / 375.0
+                                _atm_strad_1m = _atm_strad_inr / 375.0
+
+                                _atm_ce_row = _th_lookup.get((_atm_strike_th, 'CE'))
+                                _atm_pe_row = _th_lookup.get((_atm_strike_th, 'PE'))
+                                _atm_ce_ltp = float(_atm_ce_row['price']) if _atm_ce_row is not None else 0.0
+                                _atm_pe_ltp = float(_atm_pe_row['price']) if _atm_pe_row is not None else 0.0
+                                _atm_strad_prem = max(_atm_ce_ltp + _atm_pe_ltp, 0.01)
+
+                                _atm_ce_ext_pts = max(0.0, _atm_ce_ltp - max(0.0, spot - _atm_strike_th))
+                                _atm_ce_ext_inr = _atm_ce_ext_pts * _lot_th
+                                _atm_pe_ext_pts = max(0.0, _atm_pe_ltp - max(0.0, _atm_strike_th - spot))
+                                _atm_pe_ext_inr = _atm_pe_ext_pts * _lot_th
+                                _atm_strad_ext_pts = _atm_ce_ext_pts + _atm_pe_ext_pts
+                                _atm_strad_ext_inr = _atm_strad_ext_pts * _lot_th
+
+                                _atm_ce_yield = (abs(_atm_ce_inr / _lot_th) / max(_atm_ce_ltp, 0.1)) * 100.0
+                                _atm_pe_yield = (abs(_atm_pe_inr / _lot_th) / max(_atm_pe_ltp, 0.1)) * 100.0
+                                _atm_strad_yield = (abs(_atm_strad_inr / _lot_th) / max(_atm_strad_prem, 0.1)) * 100.0
+
+                                # Expected Move (1-sigma, Gatheral 2006 / Merton 1973)
+                                _em_pts = spot * (_atm_iv_th / 100.0) * np.sqrt(max(_curr_dte_th / 365.0, 1e-4))
+                                if _em_pts < 10.0: _em_pts = spot * 0.008
+
+                                # Renormalized Alpha Metric (Bouchaud & Sornette 1994/2000)
+                                _atm_sig = max(_atm_iv_th / 100.0, 0.02)
+                                _atm_gam_ce = _calc_merton_theta(_atm_strike_th, _atm_sig, 'CE')[1]
+                                _atm_gam_pe = _calc_merton_theta(_atm_strike_th, _atm_sig, 'PE')[1]
+                                _atm_gam = _atm_gam_ce + _atm_gam_pe
+                                _gamma_hazard_inr = 0.5 * _atm_gam * (_em_pts ** 2) * _lot_th
+                                _renorm_alpha = abs(_atm_strad_inr) / max(_gamma_hazard_inr, 1.0)
+                                _alpha_color = GREEN if _renorm_alpha >= 1.0 else YELLOW if _renorm_alpha >= 0.7 else RED
+                                _alpha_label = "Alpha Edge Zone" if _renorm_alpha >= 1.0 else "Neutral Buffer" if _renorm_alpha >= 0.7 else "Gamma Hazard Zone"
+
+                                # 9-Step Normalized Scenario Matrix (precalculated for instant render)
+                                _scen_table_rows = []
+                                for _z in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]:
+                                    _ds_z = round(_z * _em_pts, 1)
+                                    _s_z = round(spot + _ds_z, 1)
+                                    _d_ce_z = 0.5 * _ds_z + 0.5 * (_atm_gam / 2.0) * (_ds_z ** 2)
+                                    _d_pe_z = -0.5 * _ds_z + 0.5 * (_atm_gam / 2.0) * (_ds_z ** 2)
+                                    _ce_z = max(0.05, round(_atm_ce_ltp + _d_ce_z, 1))
+                                    _pe_z = max(0.05, round(_atm_pe_ltp + _d_pe_z, 1))
+                                    _st_z = round(_ce_z + _pe_z, 1)
+                                    _pnl_s_pts = round(_atm_strad_prem - _st_z, 1)
+                                    _pnl_s_inr = round(_pnl_s_pts * _lot_th, 0)
+                                    _pnl_s_pct = round((_pnl_s_pts / max(_atm_strad_prem, 0.1)) * 100.0, 1)
+                                    _pnl_b_inr = -_pnl_s_inr
+
+                                    if abs(_z) >= 1.5:
+                                        _cause = "Gamma Hazard (Curvature Loss)"
+                                        _zone = "DANGER / DEFEND"
+                                        _z_col = "#ef5350"
+                                        _z_bg = "rgba(239,68,68,0.15)"
+                                    elif abs(_z) >= 1.0:
+                                        _cause = "Spot at Breakeven Edge"
+                                        _zone = "BREAKEVEN EDGE"
+                                        _z_col = "#ffd54f"
+                                        _z_bg = "rgba(255,213,79,0.15)"
+                                    elif abs(_z) >= 0.5:
+                                        _cause = "Theta Buffering Spot Move"
+                                        _zone = "SAFE / HARVEST"
+                                        _z_col = "#10b981"
+                                        _z_bg = "rgba(16,185,129,0.15)"
+                                    else:
+                                        _cause = "Pure Calendar Bleed"
+                                        _zone = "MAX HARVEST"
+                                        _z_col = "#10b981"
+                                        _z_bg = "rgba(16,185,129,0.25)"
+
+                                    _row_active = 'style="background:rgba(2,132,199,0.18); font-weight:700;"' if _z == 0.0 else ''
+                                    _s_sign = '+' if _pnl_s_inr >= 0 else ''
+                                    _b_sign = '+' if _pnl_b_inr >= 0 else ''
+                                    _s_col = '#10b981' if _pnl_s_inr >= 0 else '#ef5350'
+                                    _b_col = '#10b981' if _pnl_b_inr >= 0 else '#ef5350'
+
+                                    _scen_table_rows.append(
+                                        f'<tr data-z="{_z}" {_row_active}>'
+                                        f'<td style="text-align:left; font-weight:800; color:{_z_col};">{_z:+.1f}σ</td>'
+                                        f'<td>{_ds_z:+.1f} pts</td>'
+                                        f'<td style="font-weight:700;">{_s_z:,.1f}</td>'
+                                        f'<td style="color:#38bdf8;">₹{_ce_z:.1f}</td>'
+                                        f'<td style="color:#ff7043;">₹{_pe_z:.1f}</td>'
+                                        f'<td style="color:#ffd54f; font-weight:700;">₹{_st_z:.1f}</td>'
+                                        f'<td style="color:{_s_col}; font-weight:800;">{_s_sign}₹{_pnl_s_inr:,.0f}</td>'
+                                        f'<td style="color:{_s_col};">{_s_sign}{_pnl_s_pct:.1f}%</td>'
+                                        f'<td style="color:{_b_col}; font-weight:800;">{_b_sign}₹{_pnl_b_inr:,.0f}</td>'
+                                        f'<td style="text-align:left; color:#94a3b8; font-size:11px;">{_cause}</td>'
+                                        f'<td style="text-align:center;"><span style="background:{_z_bg}; color:{_z_col}; font-size:10px; font-weight:800; padding:2px 8px; border-radius:4px; border:1px solid {_z_col}44;">{_zone}</span></td>'
+                                        f'</tr>'
+                                    )
+
+                                _strike_options = []
+                                for _s_opt in _valid_strikes:
+                                    _sel = 'selected' if _s_opt == _atm_strike_th else ''
+                                    _atm_tag = ' (ATM)' if _s_opt == _atm_strike_th else ''
+                                    _strike_options.append(f'<option value="{_s_opt}" {_sel}>{_s_opt:,.0f}{_atm_tag}</option>')
+
+                                theta_tab_html = f'''
+                                <div style="display:flex; flex-direction:column; gap:12px;">
+                                    <!-- CONTROLS & SELECTION BAR -->
+                                    <div class="action-bar" style="justify-content:space-between; flex-wrap:wrap; gap:8px;">
+                                        <div style="display:flex; align-items:center; gap:8px;">
+                                            <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px;">Target Strike:</span>
+                                            <select id="sel-th-strike" onchange="selectSimStrike(parseFloat(this.value))" style="background:#12122a; color:{WHITE}; border:1px solid #0284c7; padding:4px 8px; border-radius:6px; font-size:11px; font-weight:700;">
+                                                {''.join(_strike_options)}
+                                            </select>
+                                            <button class="btn" id="btn-th-autolock" onclick="toggleAutoLockATM(this)" title="Auto-center table around ATM strike and prevent jumping on refresh" style="display:flex; align-items:center; gap:5px; padding:4px 8px; font-size:11px; font-weight:700; background:rgba(16,185,129,0.18); color:#10b981; border:1px solid #10b981; border-radius:6px; cursor:pointer;">
+                                                &#128274; Lock ATM: ON
+                                            </button>
+                                        </div>
+                                        <div style="display:flex; align-items:center; gap:6px;">
+                                            <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px;">Decay Unit:</span>
+                                            <div style="display:flex; background:#0c0c1e; padding:2px; border-radius:6px; border:1px solid #2a2a4a;">
+                                                <button class="th-unit-btn active" id="btn-unit-inr" onclick="setThetaUnit('INR')" style="padding:3px 8px; font-size:10px; font-weight:700; border-radius:4px; border:none; cursor:pointer; background:#0284c7; color:#ffffff;">₹ / Lot (65)</button>
+                                                <button class="th-unit-btn" id="btn-unit-pts" onclick="setThetaUnit('PTS')" style="padding:3px 8px; font-size:10px; font-weight:700; border-radius:4px; border:none; cursor:pointer; background:transparent; color:#94a3b8;">Pts / Share</button>
+                                            </div>
+                                        </div>
+                                        <div style="display:flex; align-items:center; gap:6px;">
+                                            <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase;">View:</span>
+                                            <button class="theta-type-btn active" id="btn-th-ce" onclick="toggleThetaView('CE')">CE</button>
+                                            <button class="theta-type-btn" id="btn-th-pe" onclick="toggleThetaView('PE')">PE</button>
+                                            <button class="theta-type-btn" id="btn-th-straddle" onclick="toggleThetaView('STRADDLE')">Straddle</button>
+                                        </div>
+                                        <div style="display:flex; align-items:center; gap:6px;">
+                                            <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase;">Focus:</span>
+                                            <button class="theta-focus-btn active" id="btn-focus-all" onclick="setThetaTableFocus('all')">All</button>
+                                            <button class="theta-focus-btn" id="btn-focus-seller" onclick="setThetaTableFocus('seller')">Seller</button>
+                                            <button class="theta-focus-btn" id="btn-focus-buyer" onclick="setThetaTableFocus('buyer')">Buyer</button>
+                                        </div>
+                                        <div style="display:flex; align-items:center; gap:6px;">
+                                            <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase;">Model:</span>
+                                            <button class="theta-model-btn active" id="btn-th-bsm" onclick="toggleThetaModel('bsm')">BSM</button>
+                                            <button class="theta-model-btn" id="btn-th-heston" onclick="toggleThetaModel('heston')">Heston</button>
+                                            <button class="theta-model-btn" id="btn-th-both" onclick="toggleThetaModel('both')">Both</button>
+                                            <select id="sel-th-range" onchange="changeThetaRange(this.value)" style="background:#12122a; color:{WHITE}; border:1px solid #2a2a4a; padding:3px 6px; border-radius:6px; font-size:10px;">
+                                                <option value="5">±5%</option>
+                                                <option value="10" selected>±10%</option>
+                                                <option value="15">±15%</option>
+                                            </select>
+                                            <button class="btn" id="btn-th-recalc" onclick="refreshThetaDecay(this)" title="Recalculate model" style="padding:4px 8px; font-size:10px; font-weight:700; background:#0284c7; color:#ffffff; border:none; border-radius:6px; cursor:pointer;">
+                                                &#8635; Recalc
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <!-- EXECUTIVE 3-WAY DECAY PANEL (Call vs Put vs Straddle) -->
+                                    <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
+                                        <!-- CALL CARD -->
+                                        <div class="card" style="border-top:4px solid #38bdf8; background:rgba(18,18,42,0.85); padding:12px;">
+                                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                                <div style="display:flex; align-items:center; gap:6px;">
+                                                    <span style="font-size:13px; font-weight:900; color:#38bdf8; letter-spacing:1px;">CALL (CE) DECAY</span>
+                                                    <span id="card-ce-strike" style="font-size:11px; color:#94a3b8; font-weight:700;">{_atm_strike_th:,.0f}</span>
+                                                </div>
+                                                <div style="font-size:14px; font-weight:800; color:{WHITE};" id="card-ce-price">LTP: ₹{_atm_ce_ltp:.1f}</div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:8px;">
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(2,132,199,0.08); border:1px solid rgba(2,132,199,0.25);">
+                                                    <div class="metric-label" style="color:#38bdf8;">Decay / Day</div>
+                                                    <div id="card-ce-day" style="font-size:15px; font-weight:800; color:#ef5350;">-₹{abs(_atm_ce_inr):,.0f}</div>
+                                                    <div id="card-ce-day-sub" class="metric-sub">-{abs(_atm_ce_inr/_lot_th):.1f} pts/d</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(2,132,199,0.08); border:1px solid rgba(2,132,199,0.25);">
+                                                    <div class="metric-label" style="color:#38bdf8;">Decay / Hour</div>
+                                                    <div id="card-ce-hour" style="font-size:15px; font-weight:800; color:#ffd54f;">-₹{abs(_atm_ce_1h):,.0f}</div>
+                                                    <div id="card-ce-hour-sub" class="metric-sub">-{abs(_atm_ce_1h/_lot_th):.2f} pts/h</div>
+                                                </div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Decay / Minute</div>
+                                                    <div id="card-ce-min" style="font-size:13px; font-weight:800; color:#94a3b8;">-₹{abs(_atm_ce_1m):.2f}</div>
+                                                    <div id="card-ce-min-sub" class="metric-sub">-{abs(_atm_ce_1m/_lot_th):.3f} pts/m</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Till Expiry</div>
+                                                    <div id="card-ce-exp" style="font-size:13px; font-weight:800; color:#38bdf8;">₹{_atm_ce_ext_inr:,.0f}</div>
+                                                    <div id="card-ce-exp-sub" class="metric-sub">{_atm_ce_ext_pts:.1f} pts ext</div>
+                                                </div>
+                                            </div>
+                                            <div style="margin-top:6px; font-size:10px; color:#94a3b8; display:flex; justify-content:space-between;">
+                                                <span>Yield: <strong id="card-ce-yield" style="color:#38bdf8;">{_atm_ce_yield:.1f}%/d</strong></span>
+                                                <span>Delta: <strong id="card-ce-delta" style="color:{WHITE};">+0.50</strong></span>
+                                            </div>
+                                        </div>
+
+                                        <!-- PUT CARD -->
+                                        <div class="card" style="border-top:4px solid #ff7043; background:rgba(18,18,42,0.85); padding:12px;">
+                                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                                <div style="display:flex; align-items:center; gap:6px;">
+                                                    <span style="font-size:13px; font-weight:900; color:#ff7043; letter-spacing:1px;">PUT (PE) DECAY</span>
+                                                    <span id="card-pe-strike" style="font-size:11px; color:#94a3b8; font-weight:700;">{_atm_strike_th:,.0f}</span>
+                                                </div>
+                                                <div style="font-size:14px; font-weight:800; color:{WHITE};" id="card-pe-price">LTP: ₹{_atm_pe_ltp:.1f}</div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:8px;">
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(255,112,67,0.08); border:1px solid rgba(255,112,67,0.25);">
+                                                    <div class="metric-label" style="color:#ff7043;">Decay / Day</div>
+                                                    <div id="card-pe-day" style="font-size:15px; font-weight:800; color:#ef5350;">-₹{abs(_atm_pe_inr):,.0f}</div>
+                                                    <div id="card-pe-day-sub" class="metric-sub">-{abs(_atm_pe_inr/_lot_th):.1f} pts/d</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(255,112,67,0.08); border:1px solid rgba(255,112,67,0.25);">
+                                                    <div class="metric-label" style="color:#ff7043;">Decay / Hour</div>
+                                                    <div id="card-pe-hour" style="font-size:15px; font-weight:800; color:#ffd54f;">-₹{abs(_atm_pe_1h):,.0f}</div>
+                                                    <div id="card-pe-hour-sub" class="metric-sub">-{abs(_atm_pe_1h/_lot_th):.2f} pts/h</div>
+                                                </div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Decay / Minute</div>
+                                                    <div id="card-pe-min" style="font-size:13px; font-weight:800; color:#94a3b8;">-₹{abs(_atm_pe_1m):.2f}</div>
+                                                    <div id="card-pe-min-sub" class="metric-sub">-{abs(_atm_pe_1m/_lot_th):.3f} pts/m</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Till Expiry</div>
+                                                    <div id="card-pe-exp" style="font-size:13px; font-weight:800; color:#ff7043;">₹{_atm_pe_ext_inr:,.0f}</div>
+                                                    <div id="card-pe-exp-sub" class="metric-sub">{_atm_pe_ext_pts:.1f} pts ext</div>
+                                                </div>
+                                            </div>
+                                            <div style="margin-top:6px; font-size:10px; color:#94a3b8; display:flex; justify-content:space-between;">
+                                                <span>Yield: <strong id="card-pe-yield" style="color:#ff7043;">{_atm_pe_yield:.1f}%/d</strong></span>
+                                                <span>Delta: <strong id="card-pe-delta" style="color:{WHITE};">-0.50</strong></span>
+                                            </div>
+                                        </div>
+
+                                        <!-- STRADDLE COMBINED CARD -->
+                                        <div class="card" style="border-top:4px solid #ffd54f; background:rgba(18,18,42,0.85); padding:12px;">
+                                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                                <div style="display:flex; align-items:center; gap:6px;">
+                                                    <span style="font-size:13px; font-weight:900; color:#ffd54f; letter-spacing:1px;">STRADDLE (CE+PE)</span>
+                                                    <span id="card-strad-strike" style="font-size:11px; color:#94a3b8; font-weight:700;">{_atm_strike_th:,.0f}</span>
+                                                </div>
+                                                <div style="font-size:14px; font-weight:800; color:#ffd54f;" id="card-strad-price">LTP: ₹{_atm_strad_prem:.1f}</div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:8px;">
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(255,213,79,0.08); border:1px solid rgba(255,213,79,0.25);">
+                                                    <div class="metric-label" style="color:#ffd54f;">Combined / Day</div>
+                                                    <div id="card-strad-day" style="font-size:15px; font-weight:800; color:#ef5350;">-₹{abs(_atm_strad_inr):,.0f}</div>
+                                                    <div id="card-strad-day-sub" class="metric-sub">-{abs(_atm_strad_inr/_lot_th):.1f} pts/d</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px; background:rgba(255,213,79,0.08); border:1px solid rgba(255,213,79,0.25);">
+                                                    <div class="metric-label" style="color:#ffd54f;">Combined / Hour</div>
+                                                    <div id="card-strad-hour" style="font-size:15px; font-weight:800; color:#ffd54f;">-₹{abs(_atm_strad_1h):,.0f}</div>
+                                                    <div id="card-strad-hour-sub" class="metric-sub">-{abs(_atm_strad_1h/_lot_th):.2f} pts/h</div>
+                                                </div>
+                                            </div>
+                                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Combined / Minute</div>
+                                                    <div id="card-strad-min" style="font-size:13px; font-weight:800; color:#94a3b8;">-₹{abs(_atm_strad_1m):.2f}</div>
+                                                    <div id="card-strad-min-sub" class="metric-sub">-{abs(_atm_strad_1m/_lot_th):.3f} pts/m</div>
+                                                </div>
+                                                <div class="metric-box" style="padding:6px 8px;">
+                                                    <div class="metric-label">Total Expiry Bleed</div>
+                                                    <div id="card-strad-exp" style="font-size:13px; font-weight:800; color:#ffd54f;">₹{_atm_strad_ext_inr:,.0f}</div>
+                                                    <div id="card-strad-exp-sub" class="metric-sub">{_atm_strad_ext_pts:.1f} pts ext</div>
+                                                </div>
+                                            </div>
+                                            <div style="margin-top:6px; font-size:10px; color:#94a3b8; display:flex; justify-content:space-between; align-items:center;">
+                                                <span>Yield: <strong id="card-strad-yield" style="color:#ffd54f;">{_atm_strad_yield:.1f}%/d</strong></span>
+                                                <span>Renorm Alpha: <strong id="card-strad-alpha" style="color:{_alpha_color}; font-weight:800;">{_renorm_alpha:.2f} ({_alpha_label})</strong></span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- GREEK CAUSE & EFFECT ATTRIBUTION DOCK -->
+                                    <div class="card" style="padding:12px; border-left:4px solid #0284c7; background:rgba(18,18,42,0.75);">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+                                            <div style="display:flex; align-items:center; gap:8px;">
+                                                <span style="color:#38bdf8; font-size:12px; font-weight:900; letter-spacing:1px;">🔬 GREEK CAUSE & EFFECT ATTRIBUTION ENGINE</span>
+                                                <span style="background:rgba(2,132,199,0.2); color:#38bdf8; font-size:10px; font-weight:700; padding:2px 8px; border-radius:12px; border:1px solid rgba(2,132,199,0.35);">Merton 1973 · Bouchaud-Sornette 2000</span>
+                                            </div>
+                                            <div style="font-size:11px; color:{MUTED};">Decomposing option price change: <strong style="color:{WHITE};">ΔP = ΘΔt + ΔΔS + ½Γ(ΔS)² + VΔσ</strong></div>
+                                        </div>
+
+                                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; margin-bottom:8px;">
+                                            <div class="metric-box" style="border:1px solid rgba(16,185,129,0.3); background:rgba(16,185,129,0.06); text-align:left; padding:8px 10px;">
+                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                                                    <span style="color:#10b981; font-weight:800; font-size:10px;">1. THETA (ΘΔt)</span>
+                                                    <span id="attr-th-rate" style="font-size:10px; color:#10b981; font-weight:700;">-₹{abs(_atm_strad_inr):,.0f}/d</span>
+                                                </div>
+                                                <div id="attr-th-val" style="font-size:16px; font-weight:800; color:#10b981; margin-bottom:2px;">+₹0</div>
+                                                <div style="font-size:9px; color:#94a3b8; line-height:1.2;">Pure calendar time bleed. Steady profit for seller; steady loss for buyer.</div>
+                                            </div>
+
+                                            <div class="metric-box" style="border:1px solid rgba(56,189,248,0.3); background:rgba(56,189,248,0.06); text-align:left; padding:8px 10px;">
+                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                                                    <span style="color:#38bdf8; font-weight:800; font-size:10px;">2. DELTA (ΔΔS)</span>
+                                                    <span id="attr-del-rate" style="font-size:10px; color:#38bdf8; font-weight:700;">Net: 0.00</span>
+                                                </div>
+                                                <div id="attr-del-val" style="font-size:16px; font-weight:800; color:#38bdf8; margin-bottom:2px;">₹0</div>
+                                                <div style="font-size:9px; color:#94a3b8; line-height:1.2;">Linear directional impact. Straddle net delta is near zero at ATM.</div>
+                                            </div>
+
+                                            <div class="metric-box" style="border:1px solid rgba(255,213,79,0.3); background:rgba(255,213,79,0.06); text-align:left; padding:8px 10px;">
+                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                                                    <span style="color:#ffd54f; font-weight:800; font-size:10px;">3. GAMMA (½ΓΔS²)</span>
+                                                    <span id="attr-gam-rate" style="font-size:10px; color:#ffd54f; font-weight:700;">Γ: {_atm_gam:.4f}</span>
+                                                </div>
+                                                <div id="attr-gam-val" style="font-size:16px; font-weight:800; color:#ffd54f; margin-bottom:2px;">-₹0</div>
+                                                <div style="font-size:9px; color:#94a3b8; line-height:1.2;">Curvature drag. Accelerates against seller on large moves; boosts buyer.</div>
+                                            </div>
+
+                                            <div class="metric-box" style="border:1px solid rgba(192,132,252,0.3); background:rgba(192,132,252,0.06); text-align:left; padding:8px 10px;">
+                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                                                    <span style="color:#c084fc; font-weight:800; font-size:10px;">4. VEGA (VΔσ)</span>
+                                                    <span id="attr-veg-rate" style="font-size:10px; color:#c084fc; font-weight:700;">₹1,950/1%</span>
+                                                </div>
+                                                <div id="attr-veg-val" style="font-size:16px; font-weight:800; color:#c084fc; margin-bottom:2px;">₹0</div>
+                                                <div style="font-size:9px; color:#94a3b8; line-height:1.2;">Implied volatility shock. Vol expansion hurts seller; vol crush helps.</div>
+                                            </div>
+                                        </div>
+
+                                        <div style="background:#0a0a18; padding:6px 10px; border-radius:6px; font-size:11px; display:flex; justify-content:space-between; align-items:center; border:1px solid #2a2a4a;">
+                                            <div>
+                                                <span style="color:#94a3b8; font-weight:700;">ATTRIBUTION FORMULA:</span>
+                                                <span style="color:{WHITE}; font-family:monospace; margin-left:6px;" id="formula-text">ΔPrice = Θ(₹0) + Δ(₹0) + ½Γ(₹0) + V(₹0) = ₹0</span>
+                                            </div>
+                                            <div style="display:flex; align-items:center; gap:6px;">
+                                                <span style="color:#94a3b8;">Expected Move (1σ):</span>
+                                                <strong style="color:#ffd54f;" id="attr-em-pts">±{_em_pts:.1f} pts</strong>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- NORMALIZED SPOT SHIFT & TIME-TRAVEL FORECASTER -->
+                                    <div class="card" style="padding:12px; border-left:4px solid #10b981; background:rgba(18,18,42,0.75);">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:6px;">
+                                            <div style="display:flex; align-items:center; gap:8px;">
+                                                <span style="color:#10b981; font-size:12px; font-weight:900; letter-spacing:1px;">⚡ NORMALIZED SPOT SHIFT & TIME-TRAVEL FORECASTER</span>
+                                                <span style="background:rgba(16,185,129,0.2); color:#10b981; font-size:10px; font-weight:700; padding:2px 8px; border-radius:12px; border:1px solid rgba(16,185,129,0.35);">Real-Time P&L & Retention Engine</span>
+                                            </div>
+                                            <div>
+                                                <span style="color:#38bdf8; font-size:11px; font-weight:700; cursor:pointer; text-decoration:underline;" onclick="resetSimShocks()">Reset All Shocks</span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Sliders Grid -->
+                                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:10px; background:rgba(10,10,24,0.65); padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                                            <!-- Spot Shift -->
+                                            <div style="display:flex; flex-direction:column; gap:5px;">
+                                                <div style="display:flex; justify-content:space-between; font-size:11px;">
+                                                    <span style="color:#10b981; font-weight:800;">📈 Spot Shift (ΔS & Z):</span>
+                                                    <span id="lbl-sim-spot" style="color:#10b981; font-weight:800;">0 pts (0.0σ)</span>
+                                                </div>
+                                                <input type="range" id="slider-sim-spot" min="-300" max="300" step="5" value="0" oninput="onThetaSimSliderChange()" style="width:100%; accent-color:#10b981; cursor:pointer;">
+                                                <div style="display:flex; gap:3px; flex-wrap:wrap;">
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(-150)">-150</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(-100)">-100</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(-50)">-50</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(0)">0 (ATM)</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(50)">+50</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(100)">+100</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimSpotPreset(150)">+150</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- Minutes -->
+                                            <div style="display:flex; flex-direction:column; gap:5px;">
+                                                <div style="display:flex; justify-content:space-between; font-size:11px;">
+                                                    <span style="color:#38bdf8; font-weight:800;">⏱ Forward Time (Min):</span>
+                                                    <span id="lbl-sim-min" style="color:#38bdf8; font-weight:800;">+0 min</span>
+                                                </div>
+                                                <input type="range" id="slider-sim-min" min="0" max="375" step="5" value="0" oninput="onThetaSimSliderChange()" style="width:100%; accent-color:#0284c7; cursor:pointer;">
+                                                <div style="display:flex; gap:3px; flex-wrap:wrap;">
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(0)">Now</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(15)">+15m</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(30)">+30m</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(60)">+60m</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(180)">+3h</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimTimePreset(375)">Close (3:30)</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- Days -->
+                                            <div style="display:flex; flex-direction:column; gap:5px;">
+                                                <div style="display:flex; justify-content:space-between; font-size:11px;">
+                                                    <span style="color:#ffd54f; font-weight:800;">📅 Forward Days (Overnight):</span>
+                                                    <span id="lbl-sim-days" style="color:#ffd54f; font-weight:800;">+0.0 days</span>
+                                                </div>
+                                                <input type="range" id="slider-sim-days" min="0" max="{max(_curr_dte_th, 1.0):.1f}" step="0.1" value="0" oninput="onThetaSimSliderChange()" style="width:100%; accent-color:#ffd54f; cursor:pointer;">
+                                                <div style="display:flex; gap:3px; flex-wrap:wrap;">
+                                                    <button type="button" class="th-quick-btn" onclick="setSimDaysPreset(0)">0d</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimDaysPreset(0.5)">+0.5d</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimDaysPreset(1.0)">+1.0d</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimDaysPreset({_curr_dte_th:.1f})">Till Expiry</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- IV Shift -->
+                                            <div style="display:flex; flex-direction:column; gap:5px;">
+                                                <div style="display:flex; justify-content:space-between; font-size:11px;">
+                                                    <span style="color:#c084fc; font-weight:800;">🌪 IV Shift (Δσ):</span>
+                                                    <span id="lbl-sim-iv" style="color:#c084fc; font-weight:800;">0.0%</span>
+                                                </div>
+                                                <input type="range" id="slider-sim-iv" min="-5.0" max="5.0" step="0.2" value="0" oninput="onThetaSimSliderChange()" style="width:100%; accent-color:#c084fc; cursor:pointer;">
+                                                <div style="display:flex; gap:3px; flex-wrap:wrap;">
+                                                    <button type="button" class="th-quick-btn" onclick="setSimIVPreset(-3.0)">-3% Crush</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimIVPreset(-1.0)">-1%</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimIVPreset(0)">0%</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimIVPreset(1.0)">+1%</button>
+                                                    <button type="button" class="th-quick-btn" onclick="setSimIVPreset(3.0)">+3% Spike</button>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Outcome Strip -->
+                                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px;">
+                                            <div class="metric-box" style="border:1px solid rgba(2,132,199,0.35); background:rgba(2,132,199,0.08);">
+                                                <div class="metric-label" style="color:#38bdf8;">Projected Straddle LTP</div>
+                                                <div id="sim-res-price" style="font-size:16px; font-weight:800; color:{WHITE};">₹{_atm_strad_prem:.1f}</div>
+                                                <div id="sim-res-price-sub" class="metric-sub">Base: ₹{_atm_strad_prem:.1f} (Δ: ₹0.0)</div>
+                                            </div>
+                                            <div class="metric-box" style="border:1px solid rgba(16,185,129,0.35); background:rgba(16,185,129,0.08);">
+                                                <div class="metric-label" style="color:#10b981;">Seller P&L (1 Lot)</div>
+                                                <div id="sim-res-seller-pnl" style="font-size:16px; font-weight:800; color:#10b981;">+₹0 (+0.0%)</div>
+                                                <div id="sim-res-seller-sub" class="metric-sub">Theta decay captured</div>
+                                            </div>
+                                            <div class="metric-box" style="border:1px solid rgba(239,68,68,0.35); background:rgba(239,68,68,0.08);">
+                                                <div class="metric-label" style="color:#ef5350;">Buyer P&L (1 Lot)</div>
+                                                <div id="sim-res-buyer-pnl" style="font-size:16px; font-weight:800; color:#ef5350;">-₹0 (-0.0%)</div>
+                                                <div id="sim-res-buyer-sub" class="metric-sub">Convexity vs decay bleed</div>
+                                            </div>
+                                            <div class="metric-box" id="sim-res-action-card" style="border:1px solid rgba(16,185,129,0.4); background:rgba(16,185,129,0.12);">
+                                                <div class="metric-label" style="color:#10b981;">Position Retention Guide</div>
+                                                <div id="sim-res-action-title" style="font-size:14px; font-weight:900; color:#10b981;">STAY IN POSITION</div>
+                                                <div id="sim-res-action-desc" class="metric-sub" style="color:{WHITE};">Extrinsic decay active · Safe cushion</div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- 9-STEP NORMALIZED SCENARIO MATRIX (Gatheral 2006 · Merton 1973) -->
+                                    <div class="card" style="padding:10px;">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                            <div style="color:{ACCENT}; font-size:11px; font-weight:800; letter-spacing:1px;">9-STEP RESEARCH-NORMALIZED SCENARIO MATRIX (GATHERAL 2006 · MERTON 1973)</div>
+                                            <div style="font-size:10px; color:{MUTED};">Universal standard deviation scaling (Z = -2.0σ to +2.0σ) · Call, Put, Straddle Payoffs</div>
+                                        </div>
+                                        <div style="overflow-x:auto;">
+                                            <table class="data-table" id="scenarios-table">
+                                                <thead>
+                                                    <tr style="position:sticky; top:0; background:{CARD_BG}; z-index:2;">
+                                                        <th style="text-align:left;">Displacement (Z)</th>
+                                                        <th>Spot Shift</th>
+                                                        <th>Nifty Index</th>
+                                                        <th style="color:#38bdf8;">Call LTP (₹)</th>
+                                                        <th style="color:#ff7043;">Put LTP (₹)</th>
+                                                        <th style="color:#ffd54f;">Straddle LTP (₹)</th>
+                                                        <th style="color:#10b981;">Seller P&L (₹)</th>
+                                                        <th style="color:#10b981;">Seller %</th>
+                                                        <th style="color:#ef5350;">Buyer P&L (₹)</th>
+                                                        <th style="text-align:left;">Dominant Greek Cause</th>
+                                                        <th style="text-align:center;">Status / Advice</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {''.join(_scen_table_rows)}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+
+                                    <!-- VISUALIZATION ROW 1 -->
+                                    <div class="card" style="padding:10px;">
+                                        <div style="min-height:350px; width:100%;" id="theta-chart-row1">
+                                            {_plotly_th1}
+                                        </div>
+                                    </div>
+
+                                    <!-- VISUALIZATION ROW 2 -->
+                                    <div class="card" style="padding:10px;">
+                                        <div style="min-height:350px; width:100%;" id="theta-chart-row2">
+                                            {_plotly_th2}
+                                        </div>
+                                    </div>
+
+                                    <!-- PER-STRIKE ACTIONABLE MATRIX TABLE -->
+                                    <div class="card">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                            <div style="color:{ACCENT}; font-size:12px; font-weight:800; letter-spacing:1.5px;">PER-STRIKE THETA DECAY & HARVEST MATRIX</div>
+                                            <div style="font-size:11px; color:{MUTED};">Straddle LTP · Expiry Horizon · CE/PE Burn · Gamma · Daily Cushion · Trade Verdict & Advice</div>
+                                        </div>
+                                        <div id="theta-table-container" style="max-height:360px; overflow-y:auto; position:relative; scroll-behavior:smooth;">
+                                            <table class="data-table" id="theta-decay-table">
+                                                <thead>
+                                                    <tr style="position:sticky; top:0; background:{CARD_BG}; z-index:2;">
+                                                        <th style="text-align:left;">Strike</th>
+                                                        <th>Dist</th>
+                                                        <th style="color:#ffd54f;">Straddle LTP</th>
+                                                        <th style="color:{YELLOW};">Expiry Horizon</th>
+                                                        <th>CE LTP (IV)</th>
+                                                        <th>CE θ/Day</th>
+                                                        <th>PE LTP (IV)</th>
+                                                        <th>PE θ/Day</th>
+                                                        <th>Straddle θ/Day</th>
+                                                        <th>1-Hr Burn</th>
+                                                        <th>Gamma (Γ)</th>
+                                                        <th>Daily Cushion</th>
+                                                        <th>Decay Yield</th>
+                                                        <th style="text-align:center;">Edge Verdict</th>
+                                                        <th style="text-align:center;">Position Advice</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {''.join(_theta_table_rows)}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>'''
+
+                    except Exception as _th_e:
+                        theta_tab_html = f'<div class="card"><p style="color:#ff4444;">Theta Decay module error: {str(_th_e)}</p></div>'
+
+
                     # ── TAB 4: PROBABILITY DENSITY ──
                     prob_tab_html = '<div class="card"><p style="color:#888;">Waiting for ATM IV data to compute probability density...</p></div>'
                     if prob_density:
@@ -3681,7 +4620,8 @@ class VolatilityAnalyzer:
                         sigma_ann = _pd_iv / 100
                         cone_days = np.linspace(1, max(h['days'] for h in prob_density), 60)
                         cone_T = cone_days / 365.0
-                        mean_price = spot * np.exp((0.07 - 0.5 * sigma_ann**2) * cone_T)
+                        _r_cone = _get_cfg("risk_free_rate", 0.051274)
+                        mean_price = spot * np.exp((_r_cone - 0.5 * sigma_ann**2) * cone_T)
                         sigma_t = sigma_ann * np.sqrt(cone_T)
                         z_floor = np.zeros_like(cone_days)
                         # Mean line
@@ -3822,20 +4762,21 @@ class VolatilityAnalyzer:
                     # StrategyManager / trackStrategy() / /api/track_strategy endpoint
                     # remain active for strategy_builder.html standalone page.
 
-                    # ── MARKET MAKER POSITIONING TAB ──
+                    # ── MARKET MAKER POSITIONING TAB (TRI-MODEL COMPARISON) ──
                     mm_tab_html = '<div class="card"><p style="color:#888;">Loading dealer positioning...</p></div>'
                     try:
                         if not df_chain.empty and spot > 0:
-                            _lot_mm  = 75
+                            _lot_mm = _get_cfg("nifty_lot_size", 65)
+                            _r_mm = _get_cfg("risk_free_rate", 0.051274)
                             _T_mm = self.analytics.get_time_to_expiry(near_exp) or (1 / 365)
                             _df_mm = df_chain.copy()
 
-                            # Compute gamma + delta via BSM per leg
+                            # Compute gamma + delta + vega via BSM per leg
                             def _bsm_greeks(row):
                                 try:
                                     calc_iv = self._ensure_iv(row['iv'], row['price'], row['strike'], _T_mm, row['type'])
                                     sigma = max(calc_iv / 100.0, 0.01)
-                                    K = row['strike']; S = spot; r = 0.07
+                                    K = row['strike']; S = spot; r = _r_mm
                                     if K <= 0 or S <= 0:
                                         return pd.Series({'gamma': 0.0, 'delta': 0.0, 'vega': 0.0})
                                     sqT = np.sqrt(max(_T_mm, 1e-6))
@@ -3844,7 +4785,7 @@ class VolatilityAnalyzer:
                                     from scipy.stats import norm
                                     phi = np.exp(-0.5 * d1**2) / np.sqrt(2 * np.pi)
                                     gamma = phi / (S * sigma * sqT)
-                                    delta = norm.cdf(d1) if row['type'] == 'CE' else norm.cdf(d1) - 1
+                                    delta = norm.cdf(d1) if row['type'] == 'CE' else norm.cdf(d1) - 1.0
                                     vega  = S * phi * sqT / 100.0  # vega per 1% IV move
                                     return pd.Series({'gamma': gamma, 'delta': delta, 'vega': vega})
                                 except:
@@ -3853,103 +4794,277 @@ class VolatilityAnalyzer:
                             _greeks = _df_mm.apply(_bsm_greeks, axis=1)
                             _df_mm[['gamma_mm', 'delta_mm', 'vega_mm']] = _greeks
 
-                            # Dealer exposure: dealer is counterparty to buyers (short calls, long puts roughly)
-                            # DEX: -(CE_delta * CE_OI - PE_delta * PE_OI) * lot
-                            # GEX: CE_gamma * CE_OI * lot * S^2 / 1e4 (positive) - same for PE (negative)
-                            # Vega exposure: CE_vega * CE_OI - PE_vega * PE_OI
-                            _df_mm['dex'] = _df_mm.apply(
-                                lambda r: -(r['delta_mm'] * r['oi'] * _lot_mm) if r['type'] == 'CE'
-                                else (abs(r['delta_mm']) * r['oi'] * _lot_mm), axis=1)
-                            _df_mm['gex_mm'] = _df_mm.apply(
-                                lambda r: r['gamma_mm'] * r['oi'] * _lot_mm * spot * spot / 10000
-                                         * (1 if r['type'] == 'CE' else -1), axis=1)
-                            _df_mm['vex'] = _df_mm.apply(
-                                lambda r: r['vega_mm'] * r['oi'] * (1 if r['type'] == 'CE' else -1), axis=1)
+                            # Common base scaling: Spot^2 * 0.01
+                            _scaling = spot * (spot * 0.01)
 
-                            _net_dex = _df_mm['dex'].sum()
-                            _net_gex_mm = _df_mm['gex_mm'].sum()
-                            _net_vex = _df_mm['vex'].sum()
+                            # ── 1. MODEL A: STANDARD (Wall Street Prior: Long CE +1, Short PE -1) ──
+                            # CE: Dealer buys Call (+1). Delta > 0 -> DEX > 0. Gamma > 0 -> GEX > 0
+                            # PE: Dealer sells Put (-1). Delta < 0 -> DEX = (-1)*Delta = +|Delta| > 0. Gamma > 0 -> GEX = (-1)*Gamma < 0
+                            _df_mm['dex_std'] = _df_mm.apply(
+                                lambda r: r['delta_mm'] * r['oi'] * _lot_mm if r['type'] == 'CE'
+                                else -r['delta_mm'] * r['oi'] * _lot_mm, axis=1)
+                            _df_mm['gex_std'] = _df_mm.apply(
+                                lambda r: r['gamma_mm'] * r['oi'] * _lot_mm * _scaling if r['type'] == 'CE'
+                                else -r['gamma_mm'] * r['oi'] * _lot_mm * _scaling, axis=1)
+                            _df_mm['gex_sh_std'] = _df_mm.apply(
+                                lambda r: r['gamma_mm'] * r['oi'] * _lot_mm * (spot * 0.01) if r['type'] == 'CE'
+                                else -r['gamma_mm'] * r['oi'] * _lot_mm * (spot * 0.01), axis=1)
 
-                            _dex_bias = 'BUY SPOT' if _net_dex > 0 else 'SELL SPOT'
-                            _dex_c    = GREEN if _net_dex > 0 else RED
-                            _gex_pos  = 'LONG GAMMA (mean-rev)' if _net_gex_mm > 0 else 'SHORT GAMMA (trending)'
-                            _gex_c    = GREEN if _net_gex_mm > 0 else RED
-                            _vex_pos  = 'LONG VEGA (buy vol)' if _net_vex > 0 else 'SHORT VEGA (sell vol)'
-                            _vex_c    = GREEN if _net_vex > 0 else RED
+                            # ── 2. MODEL B: INVERTED (Retail Speculative: Short CE -1, Long PE +1) ──
+                            # Retail buys calls / institutions sell puts -> Dealer is Short CE (-1), Long PE (+1)
+                            _df_mm['dex_inv'] = -_df_mm['dex_std']
+                            _df_mm['gex_inv'] = -_df_mm['gex_std']
+                            _df_mm['gex_sh_inv'] = -_df_mm['gex_sh_std']
 
-                            # Dealer bias summary
-                            if _net_gex_mm < 0 and abs(_net_dex) > 1000:
-                                _dealer_bias = 'HEDGING BUY SPOT ↑' if _net_dex > 0 else 'HEDGING SELL SPOT ↓'
-                                _bias_rationale = 'Short gamma dealers amplify moves — breakout risk'
-                                _bias_c = RED
-                            elif _net_gex_mm > 0:
-                                _dealer_bias = 'STABILIZING (PIN)'
-                                _bias_rationale = 'Long gamma dealers hedge: sell rallies, buy dips — pin behavior'
-                                _bias_c = GREEN
+                            # ── 3. MODEL C: DUAL-SHORT (NSE Option Writers / Straddles: Short CE -1, Short PE -1) ──
+                            # CE: Dealer sells Call (-1). Delta > 0 -> DEX = -Delta < 0. Gamma > 0 -> GEX = -Gamma < 0
+                            # PE: Dealer sells Put (-1).  Delta < 0 -> DEX = -Delta = +|Delta| > 0. Gamma > 0 -> GEX = -Gamma < 0
+                            _df_mm['dex_dual'] = _df_mm.apply(
+                                lambda r: -r['delta_mm'] * r['oi'] * _lot_mm if r['type'] == 'CE'
+                                else -r['delta_mm'] * r['oi'] * _lot_mm, axis=1)
+                            _df_mm['gex_dual'] = _df_mm.apply(
+                                lambda r: -r['gamma_mm'] * r['oi'] * _lot_mm * _scaling, axis=1)
+                            _df_mm['gex_sh_dual'] = _df_mm.apply(
+                                lambda r: -r['gamma_mm'] * r['oi'] * _lot_mm * (spot * 0.01), axis=1)
+
+                            # ── AGGREGATES & METRICS ──
+                            # Model A (Standard)
+                            _net_dex_std = _df_mm['dex_std'].sum()
+                            _net_gex_std = _df_mm['gex_std'].sum()
+                            _hedge_std_val = -_df_mm['gex_sh_std'].sum()
+                            _std_regime = 'LONG GAMMA (Pinning ↔)' if _net_gex_std > 0 else 'SHORT GAMMA (Trending ↕)'
+                            _std_regime_c = GREEN if _net_gex_std > 0 else RED
+                            _std_dex_bias = 'BUY SPOT' if _net_dex_std > 0 else 'SELL SPOT'
+                            _std_dex_c = GREEN if _net_dex_std > 0 else RED
+                            _hedge_std_action = f"SELL {abs(_hedge_std_val)/1000:.1f}K sh (dampens move)" if _hedge_std_val < 0 else f"BUY {abs(_hedge_std_val)/1000:.1f}K sh (chases move)"
+
+                            # Zero Gamma Flip Strike for Standard
+                            _sk_std = _df_mm.groupby('strike')['gex_std'].sum().sort_index()
+                            _sk_strikes = [float(k) for k in _sk_std.index]
+                            _sk_vals = [float(v) for v in _sk_std.values]
+                            _flip_std = None
+                            for _i in range(len(_sk_vals) - 1):
+                                if _sk_vals[_i] * _sk_vals[_i + 1] < 0:
+                                    _flip_val = _sk_strikes[_i] if abs(_sk_vals[_i]) < abs(_sk_vals[_i + 1]) else _sk_strikes[_i + 1]
+                                    _flip_std = round(_flip_val)
+                                    break
+                            _flip_std_txt = f"{_flip_std} ({abs(spot - _flip_std):.0f} pts {'above' if spot > _flip_std else 'below'})" if _flip_std else "No Flip Point"
+
+                            # Model B (Inverted)
+                            _net_dex_inv = _df_mm['dex_inv'].sum()
+                            _net_gex_inv = _df_mm['gex_inv'].sum()
+                            _hedge_inv_val = -_df_mm['gex_sh_inv'].sum()
+                            _inv_regime = 'PUT SUPPORT (Pinning ↔)' if _net_gex_inv > 0 else 'CALL SQUEEZE RISK (Breakout ↑)'
+                            _inv_regime_c = GREEN if _net_gex_inv > 0 else RED
+                            _inv_dex_bias = 'BUY SPOT' if _net_dex_inv > 0 else 'SELL SPOT'
+                            _inv_dex_c = GREEN if _net_dex_inv > 0 else RED
+                            _hedge_inv_action = f"BUY {abs(_hedge_inv_val)/1000:.1f}K sh (amplifies rally)" if _hedge_inv_val > 0 else f"SELL {abs(_hedge_inv_val)/1000:.1f}K sh (chases drop)"
+                            _flip_inv_txt = f"{_flip_std} (Inverted Flip Level)" if _flip_std else "No Flip Point"
+
+                            # Model C (Dual-Short / Option Writers)
+                            _net_dex_dual = _df_mm['dex_dual'].sum()
+                            _net_gex_dual = _df_mm['gex_dual'].sum()
+                            _hedge_dual_val = -_df_mm['gex_sh_dual'].sum()
+                            _dual_regime = 'SHORT VOLATILITY (Straddle Acceleration ⚡)'
+                            _dual_regime_c = RED
+                            _dual_dex_bias = 'PUT HEAVY (Downside Drag)' if _net_dex_dual > 0 else 'CALL HEAVY (Upside Drag)'
+                            _dual_dex_c = GREEN if _net_dex_dual > 0 else RED
+                            _hedge_dual_action = f"BUY {abs(_hedge_dual_val)/1000:.1f}K sh (chases breakout)" if _hedge_dual_val > 0 else f"SELL {abs(_hedge_dual_val)/1000:.1f}K sh (chases breakdown)"
+                            
+                            # Max Gamma Valley Strike for Dual-Short (Straddle Center)
+                            _sk_dual = _df_mm.groupby('strike')['gex_dual'].sum()
+                            _max_valley_strike = round(float(str(_sk_dual.idxmin()))) if not _sk_dual.empty else 0
+                            _dist_valley = abs(spot - _max_valley_strike) if _max_valley_strike else 0
+
+                            # ── Consensus & Synthesis ──
+                            _consensus_title = "MARKET MAKER DYNAMICS CONSENSUS"
+                            _hedges = [_hedge_std_val, _hedge_inv_val, _hedge_dual_val]
+                            _sell_hedges = sum(1 for h in _hedges if h < 0)
+                            if _sell_hedges >= 2:
+                                _consensus_flow = "DAMPENING FLOW (Dealers forced to SELL spot into 1% rally)"
+                                _consensus_flow_c = GREEN
                             else:
-                                _dealer_bias = 'NEUTRAL'
-                                _bias_rationale = 'Mixed positioning — no dominant dealer hedging pressure'
-                                _bias_c = YELLOW
+                                _consensus_flow = "ACCELERATING FLOW (Dealers forced to BUY spot into 1% rally)"
+                                _consensus_flow_c = RED
 
-                            # Per-strike summary table
+                            if _net_gex_std > 0:
+                                _consensus_desc = f"<b>Mean Reverting Pinning:</b> Standard Wall St model indicates net positive dealer gamma ({_net_gex_std/1e6:+.1f}M), which dampens volatility. However, if spot moves >{_dist_valley:.0f} pts away from straddle center ({_max_valley_strike}), Dual-Short option writing dynamics take over and amplify momentum."
+                            else:
+                                _consensus_desc = f"<b>Slippery Regime Alert:</b> Both Standard and Dual-Short models indicate negative dealer gamma. Market makers are net short volatility and will be forced to chase momentum in the direction of the break."
+
+                            # ── Per-strike Summary Table ──
+                            _ce_oi_map = _df_mm[_df_mm['type'] == 'CE'].set_index('strike')['oi']
+                            _pe_oi_map = _df_mm[_df_mm['type'] == 'PE'].set_index('strike')['oi']
+
                             _by_strike = _df_mm.groupby('strike').agg(
-                                dex=('dex','sum'), gex=('gex_mm','sum'), vex=('vex','sum')
+                                gex_std=('gex_std', 'sum'),
+                                gex_inv=('gex_inv', 'sum'),
+                                gex_dual=('gex_dual', 'sum'),
+                                dex_dual=('dex_dual', 'sum')
                             ).reset_index().sort_values('strike', ascending=False)
+
+                            _by_strike['oi_ce'] = _by_strike['strike'].map(_ce_oi_map).fillna(0)
+                            _by_strike['oi_pe'] = _by_strike['strike'].map(_pe_oi_map).fillna(0)
+
                             _mm_rows = ''
                             for _, _mr in _by_strike.iterrows():
                                 _msk = int(_mr['strike'])
-                                _md = _mr['dex']; _mg = _mr['gex']; _mv = _mr['vex']
-                                _mc = GREEN if _md > 0 else RED
-                                _gc = GREEN if _mg > 0 else RED
-                                _vc = GREEN if _mv > 0 else RED
-                                _is_atm_mm = abs(_msk - spot) < 100
+                                _g_std = _mr['gex_std'] / 1e6
+                                _g_inv = _mr['gex_inv'] / 1e6
+                                _g_dual = _mr['gex_dual'] / 1e6
+                                _d_dual = _mr['dex_dual'] / 1000
+                                _ce_k = _mr['oi_ce'] / 1000
+                                _pe_k = _mr['oi_pe'] / 1000
+                                _dist = _msk - spot
+
+                                _c_std = GREEN if _g_std > 0 else RED
+                                _c_inv = GREEN if _g_inv > 0 else RED
+                                _c_dual = RED
+                                _c_d_dual = GREEN if _d_dual > 0 else RED
+
+                                _is_atm_mm = abs(_dist) < 75
                                 _mm_rows += (
-                                    f'<tr style="background:{"rgba(79,195,247,0.06)" if _is_atm_mm else "transparent"};border-bottom:1px solid #1a1a2e;">'
-                                    f'<td style="padding:4px 8px;font-weight:700;color:{ACCENT if _is_atm_mm else WHITE};">{_msk}{" ◄ ATM" if _is_atm_mm else ""}</td>'
-                                    f'<td style="padding:4px 8px;text-align:right;color:{_mc};">{"+" if _md>0 else ""}{_md/1000:.1f}K</td>'
-                                    f'<td style="padding:4px 8px;text-align:right;color:{_gc};">{"+" if _mg>0 else ""}{_mg/1e6:.2f}M</td>'
-                                    f'<td style="padding:4px 8px;text-align:right;color:{_vc};">{"+" if _mv>0 else ""}{_mv:.0f}</td>'
+                                    f'<tr style="background:{"rgba(79,195,247,0.08)" if _is_atm_mm else "transparent"};border-bottom:1px solid #1a1a2e;">'
+                                    f'<td style="padding:6px 10px;font-weight:700;color:{ACCENT if _is_atm_mm else WHITE};">{_msk}{" ◄ ATM" if _is_atm_mm else ""}</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;color:{MUTED};">{_dist:+.0f}</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;color:{WHITE};">{_ce_k:.0f}K / {_pe_k:.0f}K</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;font-weight:600;color:{_c_std};">{"+" if _g_std>0 else ""}{_g_std:.1f}M</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;font-weight:600;color:{_c_inv};">{"+" if _g_inv>0 else ""}{_g_inv:.1f}M</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;font-weight:600;color:{_c_dual};">{_g_dual:.1f}M</td>'
+                                    f'<td style="padding:6px 10px;text-align:right;font-weight:600;color:{_c_d_dual};">{"+" if _d_dual>0 else ""}{_d_dual:.1f}K</td>'
                                     f'</tr>'
                                 )
 
                             mm_tab_html = f'''
-                            <!-- MM Summary -->
-                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
-                                <div class="card" style="border-left:4px solid {_bias_c};">
-                                    <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:12px;">DEALER POSITIONING SIGNAL</div>
-                                    <div style="font-size:22px;font-weight:900;color:{_bias_c};margin-bottom:6px;">{_dealer_bias}</div>
-                                    <div style="font-size:11px;color:#aaa;margin-bottom:14px;">{_bias_rationale}</div>
-                                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
-                                        <div class="metric-box" style="border-top:3px solid {_dex_c};">
+                            <!-- Tri-Model Comparative Cards -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px;">
+                                <!-- Model A: Standard -->
+                                <div class="card" style="border-top:4px solid {_std_regime_c};position:relative;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                                        <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">1. STANDARD (WALL ST)</div>
+                                        <span style="background:rgba(79,195,247,0.15);color:{ACCENT};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">SPX OVERWRITE</span>
+                                    </div>
+                                    <div style="font-size:11px;color:{MUTED};margin-bottom:12px;">Dealers Long Calls (+1) | Short Puts (-1)</div>
+                                    
+                                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+                                        <div class="metric-box">
                                             <div class="metric-label">Dealer DEX</div>
-                                            <div style="font-size:16px;font-weight:800;color:{_dex_c};">{_dex_bias}</div>
-                                            <div class="metric-sub">{_net_dex/1000:+.1f}K units</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_std_dex_c};">{_std_dex_bias}</div>
+                                            <div class="metric-sub">{_net_dex_std/1000:+.1f}K sh</div>
                                         </div>
-                                        <div class="metric-box" style="border-top:3px solid {_gex_c};">
+                                        <div class="metric-box">
                                             <div class="metric-label">Dealer GEX</div>
-                                            <div style="font-size:16px;font-weight:800;color:{_gex_c};">{_gex_pos}</div>
-                                            <div class="metric-sub">{_net_gex_mm/1e6:+.2f}M</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_std_regime_c};">{_net_gex_std/1e6:+.1f}M</div>
+                                            <div class="metric-sub">{_std_regime[:10]}</div>
                                         </div>
-                                        <div class="metric-box" style="border-top:3px solid {_vex_c};">
-                                            <div class="metric-label">Dealer Vega</div>
-                                            <div style="font-size:16px;font-weight:800;color:{_vex_c};">{_vex_pos}</div>
-                                            <div class="metric-sub">{_net_vex:+.0f} total</div>
+                                    </div>
+                                    <div style="background:#0c0c1e;padding:8px 10px;border-radius:6px;font-size:11px;border:1px solid #22223a;">
+                                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                                            <span style="color:{MUTED};">Flip Strike:</span>
+                                            <strong style="color:{WHITE};">{_flip_std_txt}</strong>
+                                        </div>
+                                        <div style="display:flex;justify-content:space-between;">
+                                            <span style="color:{MUTED};">+1% Hedge Flow:</span>
+                                            <strong style="color:{GREEN if 'SELL' in _hedge_std_action else RED};">{_hedge_std_action}</strong>
                                         </div>
                                     </div>
                                 </div>
-                                <div class="card">
-                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:10px;">DEALER EXPOSURE BY STRIKE</div>
-                                    <div style="max-height:340px;overflow-y:auto;">
-                                        <table style="width:100%;border-collapse:collapse;font-size:11px;">
-                                            <thead><tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;">
-                                                <th style="padding:4px 8px;text-align:left;">Strike</th>
-                                                <th style="padding:4px 8px;text-align:right;">DEX</th>
-                                                <th style="padding:4px 8px;text-align:right;">GEX</th>
-                                                <th style="padding:4px 8px;text-align:right;">Vega</th>
-                                            </tr></thead>
-                                            <tbody>{_mm_rows}</tbody>
-                                        </table>
+
+                                <!-- Model B: Inverted -->
+                                <div class="card" style="border-top:4px solid {_inv_regime_c};position:relative;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                                        <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">2. INVERTED (SPECULATIVE)</div>
+                                        <span style="background:rgba(255,214,0,0.15);color:{YELLOW};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">RETAIL MANIA</span>
                                     </div>
+                                    <div style="font-size:11px;color:{MUTED};margin-bottom:12px;">Dealers Short Calls (-1) | Long Puts (+1)</div>
+                                    
+                                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+                                        <div class="metric-box">
+                                            <div class="metric-label">Dealer DEX</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_inv_dex_c};">{_inv_dex_bias}</div>
+                                            <div class="metric-sub">{_net_dex_inv/1000:+.1f}K sh</div>
+                                        </div>
+                                        <div class="metric-box">
+                                            <div class="metric-label">Dealer GEX</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_inv_regime_c};">{_net_gex_inv/1e6:+.1f}M</div>
+                                            <div class="metric-sub">{_inv_regime[:12]}</div>
+                                        </div>
+                                    </div>
+                                    <div style="background:#0c0c1e;padding:8px 10px;border-radius:6px;font-size:11px;border:1px solid #22223a;">
+                                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                                            <span style="color:{MUTED};">Flip Strike:</span>
+                                            <strong style="color:{WHITE};">{_flip_inv_txt}</strong>
+                                        </div>
+                                        <div style="display:flex;justify-content:space-between;">
+                                            <span style="color:{MUTED};">+1% Hedge Flow:</span>
+                                            <strong style="color:{RED if 'BUY' in _hedge_inv_action else GREEN};">{_hedge_inv_action}</strong>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Model C: Dual-Short (NSE Reality) -->
+                                <div class="card" style="border-top:4px solid {_dual_regime_c};position:relative;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                                        <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">3. DUAL-SHORT (NSE WRITERS)</div>
+                                        <span style="background:rgba(255,61,0,0.15);color:{RED};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">THETA HARVEST</span>
+                                    </div>
+                                    <div style="font-size:11px;color:{MUTED};margin-bottom:12px;">Dealers Short Calls (-1) & Short Puts (-1)</div>
+                                    
+                                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+                                        <div class="metric-box">
+                                            <div class="metric-label">Direction Bias</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_dual_dex_c};">{_dual_dex_bias}</div>
+                                            <div class="metric-sub">{_net_dex_dual/1000:+.1f}K net</div>
+                                        </div>
+                                        <div class="metric-box">
+                                            <div class="metric-label">Dealer GEX</div>
+                                            <div style="font-size:15px;font-weight:800;color:{_dual_regime_c};">{_net_gex_dual/1e6:.1f}M</div>
+                                            <div class="metric-sub">SHORT VOLATILITY</div>
+                                        </div>
+                                    </div>
+                                    <div style="background:#0c0c1e;padding:8px 10px;border-radius:6px;font-size:11px;border:1px solid #22223a;">
+                                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                                            <span style="color:{MUTED};">Straddle Center:</span>
+                                            <strong style="color:{WHITE};">{_max_valley_strike} ({_dist_valley:.0f} pts away)</strong>
+                                        </div>
+                                        <div style="display:flex;justify-content:space-between;">
+                                            <span style="color:{MUTED};">+1% Hedge Flow:</span>
+                                            <strong style="color:{RED};">{_hedge_dual_action}</strong>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Consensus & Strategy Implication Banner -->
+                            <div class="card" style="margin-bottom:14px;border-left:4px solid {ACCENT};background:#0e1022;">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                                    <span style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1px;">{_consensus_title}</span>
+                                    <span style="font-size:11px;font-weight:700;color:{_consensus_flow_c};">{_consensus_flow}</span>
+                                </div>
+                                <div style="font-size:12px;color:#ccc;line-height:1.5;">{_consensus_desc}</div>
+                            </div>
+
+                            <!-- Per-Strike Comparative Table -->
+                            <div class="card">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                                    <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">PER-STRIKE TRI-MODEL EXPOSURE COMPARISON</div>
+                                    <div style="font-size:11px;color:{MUTED};">CE/PE OI · Standard GEX · Inverted GEX · Dual-Short GEX & DEX</div>
+                                </div>
+                                <div style="max-height:380px;overflow-y:auto;">
+                                    <table style="width:100%;border-collapse:collapse;font-size:11px;">
+                                        <thead>
+                                            <tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;position:sticky;top:0;background:{CARD_BG};z-index:2;">
+                                                <th style="padding:6px 10px;text-align:left;">Strike</th>
+                                                <th style="padding:6px 10px;text-align:right;">Dist</th>
+                                                <th style="padding:6px 10px;text-align:right;">CE / PE OI</th>
+                                                <th style="padding:6px 10px;text-align:right;">Std GEX (M)</th>
+                                                <th style="padding:6px 10px;text-align:right;">Inv GEX (M)</th>
+                                                <th style="padding:6px 10px;text-align:right;">Dual GEX (M)</th>
+                                                <th style="padding:6px 10px;text-align:right;">Dual DEX (K)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>{_mm_rows}</tbody>
+                                    </table>
                                 </div>
                             </div>'''
                     except Exception as _mm_e:
@@ -4041,6 +5156,7 @@ class VolatilityAnalyzer:
 <div id="frag-iv">{iv_tab_html}</div>
 <div id="frag-vol">{vol_tab_html}</div>
 <div id="frag-chain">{chain_tab_html}</div>
+<div id="frag-theta">{theta_tab_html}</div>
 <div id="frag-prob">{prob_tab_html}</div>
 <div id="frag-mm">{mm_tab_html}</div>
 <div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}">
@@ -4079,6 +5195,11 @@ class VolatilityAnalyzer:
     .metric-label {{ color:{MUTED}; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:1px; }}
     .metric-sub {{ color:{MUTED}; font-size:11px; }}
     .action-bar {{ display:flex; align-items:center; padding:10px 16px; background:#12122a; border-radius:8px; border:1px solid #2a2a4a; flex-wrap:wrap; gap:8px; }}
+    .theta-type-btn, .theta-model-btn, .theta-focus-btn {{ padding: 6px 12px; background: {CARD_BG}; border: 1px solid #2a2a4a; border-radius: 6px; cursor: pointer; color: {MUTED}; font-size: 11px; font-weight: 600; transition: all 0.2s; }}
+    .theta-type-btn:hover, .theta-model-btn:hover, .theta-focus-btn:hover {{ color: {WHITE}; background: #1e1e38; }}
+    .theta-type-btn.active, .theta-model-btn.active, .theta-focus-btn.active {{ color: {ACCENT}; background: #12122a; border-color: {ACCENT}; }}
+    .th-quick-btn {{ background: rgba(255,255,255,0.06); color: #cbd5e1; border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; font-size: 10px; font-weight: 600; padding: 2px 7px; cursor: pointer; transition: all 0.15s ease; }}
+    .th-quick-btn:hover {{ background: #0284c7; color: #ffffff; border-color: #0284c7; }}
     .data-table {{ width:100%; border-collapse:collapse; font-size:12px; }}
     .data-table th {{ color:{MUTED}; font-size:11px; text-transform:uppercase; padding:6px 8px; border-bottom:1px solid #2a2a4a; text-align:right; }}
     .data-table td {{ padding:5px 8px; border-bottom:1px solid #1a1a2a; color:{WHITE}; text-align:right; }}
@@ -4137,6 +5258,7 @@ class VolatilityAnalyzer:
         <div class="tab-btn" onclick="switchTab('iv')">IV Surface</div>
         <div class="tab-btn" onclick="switchTab('vol')">Vol Intelligence</div>
         <div class="tab-btn" onclick="switchTab('chain')">Option Chain Analyser</div>
+        <div class="tab-btn" onclick="switchTab('theta')">Theta Decay</div>
         <div class="tab-btn" onclick="switchTab('prob')">Prob Density</div>
         <div class="tab-btn" onclick="switchTab('mm')">Market Maker Positioning</div>
     </div>
@@ -4145,26 +5267,58 @@ class VolatilityAnalyzer:
     <div id="tab-iv" class="tab-content">{iv_tab_html}</div>
     <div id="tab-vol" class="tab-content">{vol_tab_html}</div>
     <div id="tab-chain" class="tab-content">{chain_tab_html}</div>
+    <div id="tab-theta" class="tab-content">{theta_tab_html}</div>
     <div id="tab-prob" class="tab-content">{prob_tab_html}</div>
-    <div id="tab-mm" class="tab-content">
-        <div style="color:#666;font-size:12px;text-align:center;padding:40px;">Loading dealer positioning data...</div>
-    </div>
+    <div id="tab-mm" class="tab-content">{mm_tab_html}</div>
 
     <script>
-    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'prob':4, 'mm':5}};
+    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'theta':4,'prob':5, 'mm':6}};
     var activeTab = localStorage.getItem('volDashActiveTab') || 'regime';
 
+    function resizePlots(tabId) {{
+        var target = tabId || activeTab;
+        var el = document.getElementById('tab-' + target);
+        if (!el) return;
+        window.dispatchEvent(new Event('resize'));
+        el.querySelectorAll('.plotly-graph-div').forEach(function(g) {{
+            if (window.Plotly && Plotly.Plots) {{
+                try {{
+                    Plotly.Plots.resize(g);
+                    Plotly.relayout(g, {{autosize: true}});
+                }} catch(e) {{}}
+            }}
+        }});
+    }}
+
     function switchTab(id) {{
-        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(function(t) {{ t.classList.remove('active'); }});
+        document.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
         var el = document.getElementById('tab-' + id);
         if (el) el.classList.add('active');
         var idx = tabMap[id];
         if (idx !== undefined) {{
-            document.querySelectorAll('.tab-btn')[idx].classList.add('active');
+            var btns = document.querySelectorAll('.tab-btn');
+            if (btns[idx]) btns[idx].classList.add('active');
         }}
         activeTab = id;
-        localStorage.setItem('volDashActiveTab', id);
+        try {{ localStorage.setItem('volDashActiveTab', id); }} catch(e) {{}}
+
+        if (typeof requestAnimationFrame !== 'undefined') {{
+            requestAnimationFrame(function() {{ resizePlots(id); }});
+        }}
+        setTimeout(function() {{ resizePlots(id); }}, 40);
+        setTimeout(function() {{ resizePlots(id); }}, 150);
+
+        if (id === 'theta') {{
+            applyThetaFilters();
+            ensureThetaChartsRendered();
+            updateAutoLockBtn();
+            recalcThetaSimClient();
+            if (autoLockATM) {{
+                setTimeout(lockTableToATM, 60);
+                setTimeout(lockTableToATM, 200);
+            }}
+        }}
     }}
 
     // Restore active tab on first load
@@ -4182,6 +5336,10 @@ class VolatilityAnalyzer:
         var indicator = document.getElementById('refresh-indicator');
         if (indicator) indicator.classList.add('show');
 
+        // Capture scroll position before fragment replacement to eliminate jumping
+        var prevThetaContainer = document.getElementById('theta-table-container');
+        var prevThetaScroll = prevThetaContainer ? prevThetaContainer.scrollTop : null;
+
         var xhr = new XMLHttpRequest();
         xhr.open('GET', FRAG_URL + '?t=' + Date.now(), true);
         xhr.onload = function() {{
@@ -4189,12 +5347,19 @@ class VolatilityAnalyzer:
                 var tmp = document.createElement('div');
                 tmp.innerHTML = xhr.responseText;
                 // Swap each tab's content
-                ['regime', 'iv', 'vol', 'chain', 'prob', 'mm'].forEach(function(id) {{
+                ['regime', 'iv', 'vol', 'chain', 'theta', 'prob', 'mm'].forEach(function(id) {{
                     var fragEl = tmp.querySelector('#frag-' + id);
                     var tabEl = document.getElementById('tab-' + id);
                     if (fragEl && tabEl) {{
-                        tabEl.innerHTML = fragEl.innerHTML;
-                        executeScripts(tabEl);
+                        if (id === 'theta' && !fragEl.querySelector('#btn-th-recalc')) {{
+                            // Preserve modern tab-theta DOM and refresh data dynamically
+                            if (activeTab === 'theta') {{
+                                fetchAndRenderThetaCharts(currentThetaModel);
+                            }}
+                        }} else {{
+                            tabEl.innerHTML = fragEl.innerHTML;
+                            executeScripts(tabEl);
+                        }}
                     }}
                 }});
                 // Update header spot + time from fragment metadata
@@ -4208,6 +5373,17 @@ class VolatilityAnalyzer:
                 }}
                 // Re-activate current tab (restores button highlight after DOM swap)
                 switchTab(activeTab);
+
+                // Preserve or auto-lock table scroll position around ATM
+                var newThetaContainer = document.getElementById('theta-table-container');
+                if (newThetaContainer) {{
+                    if (autoLockATM) {{
+                        lockTableToATM();
+                    }} else if (prevThetaScroll !== null) {{
+                        newThetaContainer.scrollTop = prevThetaScroll;
+                    }}
+                }}
+                updateAutoLockBtn();
             }}
             if (indicator) setTimeout(function(){{ indicator.classList.remove('show'); }}, 500);
         }};
@@ -4225,6 +5401,844 @@ class VolatilityAnalyzer:
             s.textContent = old.textContent;
             old.parentNode.replaceChild(s, old);
         }});
+    }}
+
+    // ── Theta Decay Dynamic Interactive Handlers ──
+    var currentThetaType = sessionStorage.getItem('th_type') || 'CE';
+    var currentThetaModel = sessionStorage.getItem('th_model') || 'bsm';
+    var currentThetaRange = sessionStorage.getItem('th_range') || '10';
+    var currentThetaFocus = sessionStorage.getItem('th_focus') || 'all';
+    var autoLockATM = (localStorage.getItem('th_autolock') !== 'false');
+    var activeSimStrike = null;
+    var simMin = 0;
+    var simDays = 0;
+    var simSpotShock = 0;
+    var simIVShock = 0;
+
+    function lockTableToATM() {{
+        var container = document.getElementById('theta-table-container');
+        if (!container) return;
+        var atmRow = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]');
+        if (atmRow) {{
+            var rowTop = atmRow.offsetTop;
+            var targetScroll = Math.max(0, rowTop - (container.clientHeight / 2) + (atmRow.clientHeight / 2));
+            container.scrollTop = targetScroll;
+        }}
+    }}
+
+    function toggleAutoLockATM(btn) {{
+        autoLockATM = !autoLockATM;
+        try {{ localStorage.setItem('th_autolock', autoLockATM ? 'true' : 'false'); }} catch(e) {{}}
+        updateAutoLockBtn(btn);
+        if (autoLockATM) {{
+            lockTableToATM();
+        }}
+    }}
+
+    function updateAutoLockBtn(btn) {{
+        var b = btn || document.getElementById('btn-th-autolock');
+        if (!b) return;
+        if (autoLockATM) {{
+            b.innerHTML = '&#128274; Lock ATM: ON';
+            b.style.background = 'rgba(16,185,129,0.18)';
+            b.style.color = '#10b981';
+            b.style.borderColor = '#10b981';
+        }} else {{
+            b.innerHTML = '&#128275; Lock ATM: OFF';
+            b.style.background = 'rgba(255,255,255,0.05)';
+            b.style.color = '#888888';
+            b.style.borderColor = '#444444';
+        }}
+    }}
+
+    function refreshThetaDecay(btn) {{
+        var b = btn || document.getElementById('btn-th-recalc');
+        if (b) {{
+            b.innerHTML = '&#8635; Recalculating...';
+            b.style.opacity = '0.75';
+            b.disabled = true;
+        }}
+        fetchAndRenderThetaCharts(currentThetaModel, function() {{
+            if (b) {{
+                b.innerHTML = '&#10003; Updated';
+                b.style.opacity = '1';
+                setTimeout(function() {{
+                    b.innerHTML = '&#8635; Recalculate Model';
+                    b.disabled = false;
+                }}, 1000);
+            }}
+            recalcThetaSimClient();
+            if (autoLockATM) {{
+                setTimeout(lockTableToATM, 60);
+            }}
+        }});
+    }}
+
+    function setThetaTableFocus(focus) {{
+        currentThetaFocus = focus;
+        try {{ sessionStorage.setItem('th_focus', focus); }} catch(e) {{}}
+        ['all', 'seller', 'buyer'].forEach(function(f) {{
+            var el = document.getElementById('btn-focus-' + f);
+            if (el) el.classList.toggle('active', f === focus);
+        }});
+        applyThetaFilters();
+    }}
+
+    var currentThetaUnit = sessionStorage.getItem('th_unit') || 'INR';
+
+    function setThetaUnit(unit) {{
+        currentThetaUnit = unit;
+        try {{ sessionStorage.setItem('th_unit', unit); }} catch(e) {{}}
+        var btnInr = document.getElementById('btn-unit-inr');
+        var btnPts = document.getElementById('btn-unit-pts');
+        if (btnInr && btnPts) {{
+            if (unit === 'INR') {{
+                btnInr.style.background = '#0284c7';
+                btnInr.style.color = '#ffffff';
+                btnPts.style.background = 'transparent';
+                btnPts.style.color = '#94a3b8';
+            }} else {{
+                btnPts.style.background = '#0284c7';
+                btnPts.style.color = '#ffffff';
+                btnInr.style.background = 'transparent';
+                btnInr.style.color = '#94a3b8';
+            }}
+        }}
+        updateExecutiveDecayCards(activeSimStrike);
+    }}
+
+    function updateExecutiveDecayCards(strike) {{
+        var container = document.getElementById('theta-table-container');
+        if (!container) return;
+        var row = null;
+        if (strike) {{
+            row = container.querySelector('tr[data-strike="' + strike + '"]');
+        }}
+        if (!row) {{
+            row = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]') || container.querySelector('tbody tr');
+        }}
+        if (!row) return;
+
+        var sVal = parseFloat(row.getAttribute('data-strike')) || 23400;
+        var cLtp = parseFloat(row.getAttribute('data-ce-ltp')) || 0;
+        var pLtp = parseFloat(row.getAttribute('data-pe-ltp')) || 0;
+        var stLtp = parseFloat(row.getAttribute('data-strad-ltp')) || (cLtp + pLtp);
+
+        var cThLot = parseFloat(row.getAttribute('data-ce-theta')) || 0;
+        var pThLot = parseFloat(row.getAttribute('data-pe-theta')) || 0;
+        var stThLot = parseFloat(row.getAttribute('data-strad-theta')) || (cThLot + pThLot);
+
+        var extPts = parseFloat(row.getAttribute('data-ext-pts')) || 0;
+        var extInr = parseFloat(row.getAttribute('data-ext-inr')) || 0;
+        var gamma = parseFloat(row.getAttribute('data-strad-gam')) || 0.003;
+        var delta = parseFloat(row.getAttribute('data-delta')) || 0;
+        var yieldVal = parseFloat(row.getAttribute('data-yield')) || 0;
+        var lot = 65;
+
+        // Update strike labels on cards
+        var lblCeS = document.getElementById('card-ce-strike');
+        if (lblCeS) lblCeS.textContent = sVal.toLocaleString('en-IN');
+        var lblPeS = document.getElementById('card-pe-strike');
+        if (lblPeS) lblPeS.textContent = sVal.toLocaleString('en-IN');
+        var lblStS = document.getElementById('card-strad-strike');
+        if (lblStS) lblStS.textContent = sVal.toLocaleString('en-IN');
+
+        // LTPs
+        var elCeP = document.getElementById('card-ce-price');
+        if (elCeP) elCeP.textContent = 'LTP: ₹' + cLtp.toFixed(1);
+        var elPeP = document.getElementById('card-pe-price');
+        if (elPeP) elPeP.textContent = 'LTP: ₹' + pLtp.toFixed(1);
+        var elStP = document.getElementById('card-strad-price');
+        if (elStP) elStP.textContent = 'LTP: ₹' + stLtp.toFixed(1);
+
+        // Values according to currentThetaUnit
+        var isINR = (currentThetaUnit === 'INR');
+
+        // CALL Card
+        var elCeDay = document.getElementById('card-ce-day');
+        if (elCeDay) elCeDay.textContent = isINR ? '-₹' + Math.round(Math.abs(cThLot)).toLocaleString('en-IN') : '-' + Math.abs(cThLot / lot).toFixed(1) + ' pts';
+        var elCeDaySub = document.getElementById('card-ce-day-sub');
+        if (elCeDaySub) elCeDaySub.textContent = isINR ? '-' + Math.abs(cThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(cThLot)).toLocaleString('en-IN') + '/d';
+
+        var elCeHr = document.getElementById('card-ce-hour');
+        if (elCeHr) elCeHr.textContent = isINR ? '-₹' + Math.round(Math.abs(cThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(cThLot / (lot * 6.25)).toFixed(2) + ' pts';
+        var elCeHrSub = document.getElementById('card-ce-hour-sub');
+        if (elCeHrSub) elCeHrSub.textContent = isINR ? '-' + Math.abs(cThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(cThLot / 6.25)).toLocaleString('en-IN') + '/h';
+
+        var elCeMin = document.getElementById('card-ce-min');
+        if (elCeMin) elCeMin.textContent = isINR ? '-₹' + Math.abs(cThLot / 375.0).toFixed(2) : '-' + Math.abs(cThLot / (lot * 375.0)).toFixed(3) + ' pts';
+        var elCeMinSub = document.getElementById('card-ce-min-sub');
+        if (elCeMinSub) elCeMinSub.textContent = isINR ? '-' + Math.abs(cThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(cThLot / 375.0).toFixed(2) + '/m';
+
+        var elCeExp = document.getElementById('card-ce-exp');
+        if (elCeExp) elCeExp.textContent = isINR ? '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') : (extPts / 2.0).toFixed(1) + ' pts';
+        var elCeExpSub = document.getElementById('card-ce-exp-sub');
+        if (elCeExpSub) elCeExpSub.textContent = isINR ? (extPts / 2.0).toFixed(1) + ' pts ext' : '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') + ' ext';
+
+        // PUT Card
+        var elPeDay = document.getElementById('card-pe-day');
+        if (elPeDay) elPeDay.textContent = isINR ? '-₹' + Math.round(Math.abs(pThLot)).toLocaleString('en-IN') : '-' + Math.abs(pThLot / lot).toFixed(1) + ' pts';
+        var elPeDaySub = document.getElementById('card-pe-day-sub');
+        if (elPeDaySub) elPeDaySub.textContent = isINR ? '-' + Math.abs(pThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(pThLot)).toLocaleString('en-IN') + '/d';
+
+        var elPeHr = document.getElementById('card-pe-hour');
+        if (elPeHr) elPeHr.textContent = isINR ? '-₹' + Math.round(Math.abs(pThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(pThLot / (lot * 6.25)).toFixed(2) + ' pts';
+        var elPeHrSub = document.getElementById('card-pe-hour-sub');
+        if (elPeHrSub) elPeHrSub.textContent = isINR ? '-' + Math.abs(pThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(pThLot / 6.25)).toLocaleString('en-IN') + '/h';
+
+        var elPeMin = document.getElementById('card-pe-min');
+        if (elPeMin) elPeMin.textContent = isINR ? '-₹' + Math.abs(pThLot / 375.0).toFixed(2) : '-' + Math.abs(pThLot / (lot * 375.0)).toFixed(3) + ' pts';
+        var elPeMinSub = document.getElementById('card-pe-min-sub');
+        if (elPeMinSub) elPeMinSub.textContent = isINR ? '-' + Math.abs(pThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(pThLot / 375.0).toFixed(2) + '/m';
+
+        var elPeExp = document.getElementById('card-pe-exp');
+        if (elPeExp) elPeExp.textContent = isINR ? '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') : (extPts / 2.0).toFixed(1) + ' pts';
+        var elPeExpSub = document.getElementById('card-pe-exp-sub');
+        if (elPeExpSub) elPeExpSub.textContent = isINR ? (extPts / 2.0).toFixed(1) + ' pts ext' : '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') + ' ext';
+
+        // STRADDLE Card
+        var elStDay = document.getElementById('card-strad-day');
+        if (elStDay) elStDay.textContent = isINR ? '-₹' + Math.round(Math.abs(stThLot)).toLocaleString('en-IN') : '-' + Math.abs(stThLot / lot).toFixed(1) + ' pts';
+        var elStDaySub = document.getElementById('card-strad-day-sub');
+        if (elStDaySub) elStDaySub.textContent = isINR ? '-' + Math.abs(stThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(stThLot)).toLocaleString('en-IN') + '/d';
+
+        var elStHr = document.getElementById('card-strad-hour');
+        if (elStHr) elStHr.textContent = isINR ? '-₹' + Math.round(Math.abs(stThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(stThLot / (lot * 6.25)).toFixed(2) + ' pts';
+        var elStHrSub = document.getElementById('card-strad-hour-sub');
+        if (elStHrSub) elStHrSub.textContent = isINR ? '-' + Math.abs(stThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(stThLot / 6.25)).toLocaleString('en-IN') + '/h';
+
+        var elStMin = document.getElementById('card-strad-min');
+        if (elStMin) elStMin.textContent = isINR ? '-₹' + Math.abs(stThLot / 375.0).toFixed(2) : '-' + Math.abs(stThLot / (lot * 375.0)).toFixed(3) + ' pts';
+        var elStMinSub = document.getElementById('card-strad-min-sub');
+        if (elStMinSub) elStMinSub.textContent = isINR ? '-' + Math.abs(stThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(stThLot / 375.0).toFixed(2) + '/m';
+
+        var elStExp = document.getElementById('card-strad-exp');
+        if (elStExp) elStExp.textContent = isINR ? '₹' + Math.round(extInr).toLocaleString('en-IN') : extPts.toFixed(1) + ' pts';
+        var elStExpSub = document.getElementById('card-strad-exp-sub');
+        if (elStExpSub) elStExpSub.textContent = isINR ? extPts.toFixed(1) + ' pts ext' : '₹' + Math.round(extInr).toLocaleString('en-IN') + ' ext';
+
+        // Renormalized Alpha Metric
+        var em = 250.0;
+        var emEl = document.getElementById('attr-em-pts');
+        if (emEl) {{
+            var m = emEl.textContent.match(/[0-9,.]+/);
+            if (m) em = parseFloat(m[0].replace(/,/g, '')) || em;
+        }}
+        var gammaHazard = 0.5 * gamma * (em * em) * lot;
+        var renormAlpha = Math.abs(stThLot) / Math.max(gammaHazard, 1.0);
+        var elAlpha = document.getElementById('card-strad-alpha');
+        if (elAlpha) {{
+            var aCol = renormAlpha >= 1.0 ? '#10b981' : (renormAlpha >= 0.7 ? '#ffd54f' : '#ef5350');
+            var aLabel = renormAlpha >= 1.0 ? 'Alpha Edge' : (renormAlpha >= 0.7 ? 'Buffer Zone' : 'Gamma Drag');
+            elAlpha.textContent = renormAlpha.toFixed(2) + ' (' + aLabel + ')';
+            elAlpha.style.color = aCol;
+        }}
+    }}
+
+    function selectSimStrike(strike) {{
+        activeSimStrike = strike;
+        var sel = document.getElementById('sel-th-strike');
+        if (sel && sel.value !== String(strike)) {{
+            sel.value = String(strike);
+        }}
+        var container = document.getElementById('theta-table-container');
+        if (container) {{
+            var allRows = container.querySelectorAll('tbody tr');
+            allRows.forEach(function(r) {{
+                var s = parseFloat(r.getAttribute('data-strike'));
+                if (s === strike) {{
+                    r.style.boxShadow = 'inset 0 0 0 2px #0284c7';
+                }} else {{
+                    r.style.boxShadow = '';
+                }}
+            }});
+        }}
+        updateExecutiveDecayCards(strike);
+        recalcThetaSimClient();
+    }}
+
+    function onThetaSimSliderChange() {{
+        var minEl = document.getElementById('slider-sim-min');
+        var daysEl = document.getElementById('slider-sim-days');
+        var spotEl = document.getElementById('slider-sim-spot');
+        var ivEl = document.getElementById('slider-sim-iv');
+
+        simMin = minEl ? parseFloat(minEl.value) : 0;
+        simDays = daysEl ? parseFloat(daysEl.value) : 0;
+        simSpotShock = spotEl ? parseFloat(spotEl.value) : 0;
+        simIVShock = ivEl ? parseFloat(ivEl.value) : 0;
+
+        var lblMin = document.getElementById('lbl-sim-min');
+        if (lblMin) lblMin.textContent = '+' + simMin + ' min';
+
+        var lblDays = document.getElementById('lbl-sim-days');
+        if (lblDays) lblDays.textContent = '+' + simDays.toFixed(1) + ' days';
+
+        var spotBase = 23450;
+        var spotElDisplay = document.getElementById('spot-display');
+        if (spotElDisplay) {{
+            var m = spotElDisplay.textContent.match(/[0-9,.]+/);
+            if (m) spotBase = parseFloat(m[0].replace(/,/g, '')) || spotBase;
+        }}
+
+        var em = 250.0;
+        var emEl = document.getElementById('attr-em-pts');
+        if (emEl) {{
+            var mEm = emEl.textContent.match(/[0-9,.]+/);
+            if (mEm) em = parseFloat(mEm[0].replace(/,/g, '')) || em;
+        }}
+        var zScore = (simSpotShock / Math.max(em, 1.0)).toFixed(1);
+
+        var lblSpot = document.getElementById('lbl-sim-spot');
+        if (lblSpot) lblSpot.textContent = (simSpotShock >= 0 ? '+' : '') + simSpotShock + ' pts (' + (zScore >= 0 ? '+' : '') + zScore + 'σ)';
+
+        var lblIv = document.getElementById('lbl-sim-iv');
+        if (lblIv) lblIv.textContent = (simIVShock >= 0 ? '+' : '') + simIVShock.toFixed(1) + '%';
+
+        recalcThetaSimClient();
+    }}
+
+    function setSimSpotPreset(pts) {{
+        var spotEl = document.getElementById('slider-sim-spot');
+        if (spotEl) spotEl.value = pts;
+        onThetaSimSliderChange();
+    }}
+
+    function setSimTimePreset(mins) {{
+        var minEl = document.getElementById('slider-sim-min');
+        if (minEl) minEl.value = mins;
+        onThetaSimSliderChange();
+    }}
+
+    function setSimDaysPreset(days) {{
+        var daysEl = document.getElementById('slider-sim-days');
+        if (daysEl) daysEl.value = days;
+        onThetaSimSliderChange();
+    }}
+
+    function setSimIVPreset(iv) {{
+        var ivEl = document.getElementById('slider-sim-iv');
+        if (ivEl) ivEl.value = iv;
+        onThetaSimSliderChange();
+    }}
+
+    function resetSimSpot() {{
+        var spotEl = document.getElementById('slider-sim-spot');
+        if (spotEl) spotEl.value = 0;
+        onThetaSimSliderChange();
+    }}
+
+    function resetSimIV() {{
+        var ivEl = document.getElementById('slider-sim-iv');
+        if (ivEl) ivEl.value = 0;
+        onThetaSimSliderChange();
+    }}
+
+    function resetSimShocks() {{
+        var minEl = document.getElementById('slider-sim-min');
+        var daysEl = document.getElementById('slider-sim-days');
+        var spotEl = document.getElementById('slider-sim-spot');
+        var ivEl = document.getElementById('slider-sim-iv');
+        if (minEl) minEl.value = 0;
+        if (daysEl) daysEl.value = 0;
+        if (spotEl) spotEl.value = 0;
+        if (ivEl) ivEl.value = 0;
+        onThetaSimSliderChange();
+    }}
+
+    function recalcThetaSimClient() {{
+        var container = document.getElementById('theta-table-container');
+        if (!container) return;
+
+        var targetRow = null;
+        if (activeSimStrike) {{
+            targetRow = container.querySelector('tr[data-strike="' + activeSimStrike + '"]');
+        }}
+        if (!targetRow) {{
+            targetRow = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]') || container.querySelector('tbody tr');
+        }}
+        if (!targetRow) return;
+
+        var stradLtp = parseFloat(targetRow.getAttribute('data-strad-ltp')) || 260.0;
+        var extPts = parseFloat(targetRow.getAttribute('data-ext-pts')) || (stradLtp * 0.9);
+        var thDayLot = parseFloat(targetRow.getAttribute('data-strad-theta')) || -3750.0;
+        var gamma = parseFloat(targetRow.getAttribute('data-strad-gam')) || 0.0032;
+        var delta = parseFloat(targetRow.getAttribute('data-delta')) || 0.0;
+        var vega = parseFloat(targetRow.getAttribute('data-vega')) || 30.0;
+        var cushion = parseFloat(targetRow.getAttribute('data-cushion')) || 120.0;
+        var lot = 65;
+
+        var dtTotalDays = (simMin / 375.0) + simDays;
+        var dS = simSpotShock;
+        var dSig = simIVShock;
+
+        // 2nd Order Greek Taylor Attribution:
+        // dP = (Theta/lot) * dt + Delta * dS + 0.5 * Gamma * (dS^2) + Vega * dSig
+        var dP_theta = (thDayLot / lot) * dtTotalDays; // theta is negative (burns premium)
+        var dP_delta = delta * dS;
+        var dP_gamma = 0.5 * gamma * (dS * dS);
+        var dP_vega = vega * dSig;
+
+        var dP_total = dP_theta + dP_delta + dP_gamma + dP_vega;
+        var newLtp = Math.max(0.05, stradLtp + dP_total);
+        var pnlSellerShare = stradLtp - newLtp;
+        var pnlSellerLot = pnlSellerShare * lot;
+        var pnlSellerPct = (pnlSellerShare / stradLtp) * 100.0;
+
+        var pnlBuyerLot = -pnlSellerLot;
+        var pnlBuyerPct = -pnlSellerPct;
+
+        // Projected Straddle LTP
+        var elPrice = document.getElementById('sim-res-price');
+        if (elPrice) elPrice.textContent = '₹' + newLtp.toFixed(1);
+        var elPriceSub = document.getElementById('sim-res-price-sub');
+        if (elPriceSub) elPriceSub.textContent = 'Base: ₹' + stradLtp.toFixed(1) + ' (Δ: ' + (dP_total >= 0 ? '+' : '') + dP_total.toFixed(1) + ')';
+
+        // Seller P&L
+        var elPnlS = document.getElementById('sim-res-seller-pnl');
+        if (elPnlS) {{
+            var signS = pnlSellerLot >= 0 ? '+' : '';
+            var colS = pnlSellerLot >= 0 ? '#10b981' : '#ef5350';
+            elPnlS.innerHTML = '<span style="color:' + colS + ';">' + signS + '₹' + Math.round(pnlSellerLot).toLocaleString('en-IN') + ' (' + signS + pnlSellerPct.toFixed(1) + '%)</span>';
+        }}
+
+        // Buyer P&L
+        var elPnlB = document.getElementById('sim-res-buyer-pnl');
+        if (elPnlB) {{
+            var signB = pnlBuyerLot >= 0 ? '+' : '';
+            var colB = pnlBuyerLot >= 0 ? '#10b981' : '#ef5350';
+            elPnlB.innerHTML = '<span style="color:' + colB + ';">' + signB + '₹' + Math.round(pnlBuyerLot).toLocaleString('en-IN') + ' (' + signB + pnlBuyerPct.toFixed(1) + '%)</span>';
+        }}
+
+        // Greek Attribution Cards
+        var elTh = document.getElementById('attr-th-val');
+        if (elTh) {{
+            var thGain = Math.abs(dP_theta * lot);
+            elTh.textContent = '+₹' + Math.round(thGain).toLocaleString('en-IN');
+        }}
+
+        var elDel = document.getElementById('attr-del-val');
+        if (elDel) {{
+            var delImpact = -dP_delta * lot; // from seller perspective
+            var sDel = delImpact >= 0 ? '+' : '-';
+            elDel.textContent = sDel + '₹' + Math.round(Math.abs(delImpact)).toLocaleString('en-IN');
+            elDel.style.color = delImpact >= 0 ? '#38bdf8' : '#ef5350';
+        }}
+
+        var elGam = document.getElementById('attr-gam-val');
+        if (elGam) {{
+            var gamCost = dP_gamma * lot;
+            elGam.textContent = '-₹' + Math.round(gamCost).toLocaleString('en-IN');
+        }}
+
+        var elVeg = document.getElementById('attr-veg-val');
+        if (elVeg) {{
+            var vegImpact = -dP_vega * lot;
+            var sVeg = vegImpact >= 0 ? '+' : '-';
+            elVeg.textContent = sVeg + '₹' + Math.round(Math.abs(vegImpact)).toLocaleString('en-IN');
+            elVeg.style.color = vegImpact >= 0 ? '#c084fc' : '#ef5350';
+        }}
+
+        // Attribution Formula Text
+        var elFormula = document.getElementById('formula-text');
+        if (elFormula) {{
+            var thSign = dP_theta <= 0 ? '+' : '-';
+            var thLotVal = Math.round(Math.abs(dP_theta * lot));
+            var delLotVal = Math.round(dP_delta * lot);
+            var gamLotVal = Math.round(dP_gamma * lot);
+            var vegLotVal = Math.round(dP_vega * lot);
+            var totLotVal = Math.round(pnlSellerLot);
+            elFormula.textContent = 'ΔP = Θ(' + thSign + '₹' + thLotVal.toLocaleString('en-IN') + ') + Δ(' + (delLotVal >= 0 ? '+' : '') + '₹' + delLotVal.toLocaleString('en-IN') + ') - ½Γ(₹' + gamLotVal.toLocaleString('en-IN') + ') + V(' + (vegLotVal >= 0 ? '+' : '') + '₹' + vegLotVal.toLocaleString('en-IN') + ') = ' + (totLotVal >= 0 ? '+' : '') + '₹' + totLotVal.toLocaleString('en-IN');
+        }}
+
+        // Position Retention Guide
+        var cardAction = document.getElementById('sim-res-action-card');
+        var titleAction = document.getElementById('sim-res-action-title');
+        var descAction = document.getElementById('sim-res-action-desc');
+
+        if (cardAction && titleAction && descAction) {{
+            var decayCaptured = (pnlSellerShare / Math.max(extPts, 1.0)) * 100.0;
+            if (Math.abs(dS) > cushion * 1.1) {{
+                titleAction.textContent = 'DEFEND / ROLL WINGS';
+                titleAction.style.color = '#ef5350';
+                cardAction.style.borderColor = 'rgba(239,68,68,0.5)';
+                cardAction.style.background = 'rgba(239,68,68,0.14)';
+                descAction.textContent = 'Spot breached cushion (±' + cushion.toFixed(0) + ' pts). Gamma hazard.';
+            }} else if (decayCaptured >= 75.0 || newLtp <= (stradLtp * 0.25)) {{
+                titleAction.textContent = 'TAKE PROFIT (HARVESTED)';
+                titleAction.style.color = '#ffd54f';
+                cardAction.style.borderColor = 'rgba(255,213,79,0.5)';
+                cardAction.style.background = 'rgba(255,213,79,0.14)';
+                descAction.textContent = 'Captured >75% of extrinsic decay. Risk/reward now favors closing.';
+            }} else {{
+                titleAction.textContent = 'STAY IN TRADE';
+                titleAction.style.color = '#10b981';
+                cardAction.style.borderColor = 'rgba(16,185,129,0.5)';
+                cardAction.style.background = 'rgba(16,185,129,0.14)';
+                descAction.textContent = 'Extrinsic burn active. Underlying within safe ±' + cushion.toFixed(0) + ' pts cushion.';
+            }}
+        }}
+
+        // Highlight matching row in Scenarios Table
+        var em = 250.0;
+        var emEl = document.getElementById('attr-em-pts');
+        if (emEl) {{
+            var mEm = emEl.textContent.match(/[0-9,.]+/);
+            if (mEm) em = parseFloat(mEm[0].replace(/,/g, '')) || em;
+        }}
+        var curZ = dS / Math.max(em, 1.0);
+        var scenTable = document.getElementById('scenarios-table');
+        if (scenTable) {{
+            var scenRows = scenTable.querySelectorAll('tbody tr');
+            var closestRow = null;
+            var minZDiff = 999;
+            scenRows.forEach(function(sr) {{
+                var zVal = parseFloat(sr.getAttribute('data-z'));
+                if (!isNaN(zVal)) {{
+                    var diff = Math.abs(zVal - curZ);
+                    if (diff < minZDiff) {{
+                        minZDiff = diff;
+                        closestRow = sr;
+                    }}
+                }}
+                sr.style.background = '';
+            }});
+            if (closestRow && minZDiff <= 0.3) {{
+                closestRow.style.background = 'rgba(2,132,199,0.25)';
+            }}
+        }}
+    }}
+
+    function applyThetaFilters() {{
+        var rangePct = parseFloat(currentThetaRange) || 10;
+        var spotEl = document.getElementById('spot-display');
+        var spot = 23450;
+        if (spotEl) {{
+            var m = spotEl.textContent.match(/[0-9,.]+/);
+            if (m) spot = parseFloat(m[0].replace(/,/g, '')) || spot;
+        }}
+
+        var tbl = document.getElementById('theta-decay-table');
+        if (tbl) {{
+            var allTrs = tbl.querySelectorAll('tr');
+            allTrs.forEach(function(r) {{
+                var cells = r.cells;
+                if (!cells || cells.length < 15) return;
+
+                // Column visibility according to Focus mode:
+                // 0: Strike, 1: Dist, 2: Strad LTP, 3: Expiry Horizon, 4: CE LTP, 5: CE Th, 6: PE LTP, 7: PE Th,
+                // 8: Strad Th, 9: 1-Hr, 10: Gamma, 11: Cushion, 12: Yield, 13: Edge, 14: Advice
+                if (currentThetaFocus === 'seller') {{
+                    cells[4].style.display = 'none';
+                    cells[5].style.display = 'none';
+                    cells[6].style.display = 'none';
+                    cells[7].style.display = 'none';
+                    cells[2].style.display = '';
+                    cells[3].style.display = '';
+                    cells[8].style.display = '';
+                    cells[9].style.display = '';
+                    cells[10].style.display = '';
+                    cells[11].style.display = '';
+                    cells[12].style.display = '';
+                    cells[13].style.display = '';
+                    cells[14].style.display = '';
+                }} else if (currentThetaFocus === 'buyer') {{
+                    cells[3].style.display = 'none';
+                    cells[4].style.display = 'none';
+                    cells[5].style.display = 'none';
+                    cells[6].style.display = 'none';
+                    cells[7].style.display = 'none';
+                    cells[11].style.display = 'none';
+                    cells[12].style.display = 'none';
+                    cells[2].style.display = '';
+                    cells[8].style.display = '';
+                    cells[9].style.display = '';
+                    cells[10].style.display = '';
+                    cells[13].style.display = '';
+                    cells[14].style.display = '';
+                }} else {{
+                    for (var c = 0; c < cells.length; c++) {{
+                        cells[c].style.display = '';
+                    }}
+                }}
+            }});
+
+            var rows = tbl.querySelectorAll('tbody tr');
+            rows.forEach(function(r) {{
+                var sVal = parseFloat(r.getAttribute('data-strike'));
+                if (!isNaN(sVal) && spot > 0) {{
+                    var inBand = (Math.abs(sVal - spot) / spot) <= (rangePct / 100.0) * 1.05;
+                    r.style.display = inBand ? '' : 'none';
+                }}
+                var ceCells = [r.cells[4], r.cells[5]];
+                var peCells = [r.cells[6], r.cells[7]];
+
+                if (currentThetaType === 'CE') {{
+                    if (ceCells[0]) ceCells[0].style.opacity = '1';
+                    if (ceCells[1]) ceCells[1].style.opacity = '1';
+                    if (peCells[0]) peCells[0].style.opacity = '0.35';
+                    if (peCells[1]) peCells[1].style.opacity = '0.35';
+                }} else if (currentThetaType === 'PE') {{
+                    if (ceCells[0]) ceCells[0].style.opacity = '0.35';
+                    if (ceCells[1]) ceCells[1].style.opacity = '0.35';
+                    if (peCells[0]) peCells[0].style.opacity = '1';
+                    if (peCells[1]) peCells[1].style.opacity = '1';
+                }} else {{
+                    if (ceCells[0]) ceCells[0].style.opacity = '1';
+                    if (ceCells[1]) ceCells[1].style.opacity = '1';
+                    if (peCells[0]) peCells[0].style.opacity = '1';
+                    if (peCells[1]) peCells[1].style.opacity = '1';
+                }}
+            }});
+
+            var ths = tbl.querySelectorAll('thead th');
+            if (ths.length >= 9) {{
+                ths[4].style.color = (currentThetaType === 'CE' || currentThetaType === 'STRADDLE') ? '{ACCENT}' : '{MUTED}';
+                ths[5].style.color = (currentThetaType === 'CE' || currentThetaType === 'STRADDLE') ? '{ACCENT}' : '{MUTED}';
+                ths[6].style.color = (currentThetaType === 'PE' || currentThetaType === 'STRADDLE') ? '#ff7043' : '{MUTED}';
+                ths[7].style.color = (currentThetaType === 'PE' || currentThetaType === 'STRADDLE') ? '#ff7043' : '{MUTED}';
+                ths[8].style.color = (currentThetaType === 'STRADDLE') ? '{YELLOW}' : '{MUTED}';
+            }}
+        }}
+
+        var sel = document.getElementById('sel-th-range');
+        if (sel) sel.value = currentThetaRange;
+    }}
+
+    function toggleThetaView(optType) {{
+        currentThetaType = optType;
+        try {{ sessionStorage.setItem('th_type', optType); }} catch(e) {{}}
+        ['ce', 'pe', 'straddle'].forEach(function(t) {{
+            var el = document.getElementById('btn-th-' + t);
+            if (el) el.classList.toggle('active', t.toUpperCase() === optType || (t === 'straddle' && optType === 'STRADDLE'));
+        }});
+        applyThetaFilters();
+        updateThetaChartTraces();
+        fetchAndRenderThetaCharts(currentThetaModel);
+        if (autoLockATM) {{
+            setTimeout(lockTableToATM, 60);
+        }}
+    }}
+
+    function updateThetaChartTraces() {{
+        if (!window.Plotly) return;
+        var row1 = document.getElementById('theta-chart-row1');
+        if (!row1) return;
+        var graphDiv = row1.querySelector('.plotly-graph-div');
+        if (!graphDiv || !graphDiv.data) return;
+
+        try {{
+            var ceOp = (currentThetaType === 'PE') ? 0.2 : 1.0;
+            var peOp = (currentThetaType === 'CE') ? 0.2 : 1.0;
+            var stOp = (currentThetaType === 'STRADDLE' || currentThetaType === 'CE' || currentThetaType === 'PE') ? 1.0 : 0.8;
+            Plotly.restyle(graphDiv, {{ 'opacity': [ceOp, peOp, stOp] }}, [1, 2, 3]);
+        }} catch(e) {{}}
+    }}
+
+    function toggleThetaModel(model) {{
+        currentThetaModel = model;
+        try {{ sessionStorage.setItem('th_model', model); }} catch(e) {{}}
+        ['bsm', 'heston', 'both'].forEach(function(m) {{
+            var el = document.getElementById('btn-th-' + m);
+            if (el) el.classList.toggle('active', m === model);
+        }});
+        fetchAndRenderThetaCharts(model);
+        if (autoLockATM) {{
+            setTimeout(lockTableToATM, 60);
+        }}
+    }}
+
+    function changeThetaRange(val) {{
+        currentThetaRange = val;
+        try {{ sessionStorage.setItem('th_range', val); }} catch(e) {{}}
+        applyThetaFilters();
+        fetchAndRenderThetaCharts(currentThetaModel);
+        if (autoLockATM) {{
+            setTimeout(lockTableToATM, 60);
+        }}
+    }}
+
+    function ensureThetaChartsRendered() {{
+        var row1 = document.getElementById('theta-chart-row1');
+        if (!row1) return;
+        var g = row1.querySelector('.plotly-graph-div');
+        if (!g || !g.querySelector('svg') || g.clientWidth === 0) {{
+            fetchAndRenderThetaCharts(currentThetaModel);
+        }}
+    }}
+
+    function fetchAndRenderThetaCharts(model, callback) {{
+        var url = '/api/theta_decay?opt_type=' + currentThetaType + '&model=' + (model || currentThetaModel) + '&range_pct=' + currentThetaRange + '&t=' + Date.now();
+        fetch(url)
+            .then(function(res) {{ return res.json(); }})
+            .then(function(data) {{
+                if (!data || !data.ok) return;
+                renderDynamicThetaCharts(data);
+                if (typeof callback === 'function') callback(data);
+            }})
+            .catch(function(e) {{
+                console.log('Theta fetch error:', e);
+                if (typeof callback === 'function') callback(null);
+            }});
+    }}
+
+    function renderDynamicThetaCharts(data) {{
+        if (!window.Plotly) return;
+        var spot = data.spot || 23450;
+        var strikes = data.strikes || [];
+        var dteSteps = data.dte_steps || [];
+        var series = data.series || {{}};
+        var bsm = series.bsm || {{}};
+
+        var row1El = document.getElementById('theta-chart-row1');
+        if (row1El) {{
+            var graph1 = row1El.querySelector('.plotly-graph-div');
+            if (!graph1) {{
+                graph1 = document.createElement('div');
+                graph1.className = 'plotly-graph-div';
+                graph1.style.width = '100%';
+                graph1.style.height = '350px';
+                row1El.innerHTML = '';
+                row1El.appendChild(graph1);
+            }}
+
+            var atmIdx = 0;
+            var minDiff = 999999;
+            strikes.forEach(function(s, i) {{
+                var diff = Math.abs(s - spot);
+                if (diff < minDiff) {{ minDiff = diff; atmIdx = i; }}
+            }});
+
+            var traces = [];
+            var atmThetaDte = [];
+            if (bsm.theta && bsm.theta[atmIdx]) {{
+                atmThetaDte = bsm.theta[atmIdx].map(function(v) {{ return Math.abs(v * 65); }});
+            }}
+
+            traces.push({{
+                x: dteSteps,
+                y: atmThetaDte,
+                mode: 'lines+markers',
+                name: 'ATM (' + (strikes[atmIdx] || spot) + ')',
+                line: {{ color: '{ACCENT}', width: 2.5 }},
+                marker: {{ size: 6 }},
+                xaxis: 'x',
+                yaxis: 'y'
+            }});
+
+            var strikeThetaVals = [];
+            if (bsm.theta) {{
+                strikes.forEach(function(s, i) {{
+                    var dte0Val = (bsm.theta[i] && bsm.theta[i][0] !== undefined) ? Math.abs(bsm.theta[i][0] * 65) : 0;
+                    strikeThetaVals.push(dte0Val);
+                }});
+            }}
+
+            traces.push({{
+                x: strikes,
+                y: strikeThetaVals,
+                mode: 'lines+markers',
+                name: (currentThetaType === 'PE' ? 'Put Theta' : currentThetaType === 'STRADDLE' ? 'Straddle Theta' : 'Call Theta') + ' (₹)',
+                line: {{ color: currentThetaType === 'PE' ? '{RED}' : '{ACCENT}', width: 2 }},
+                marker: {{ size: 5 }},
+                xaxis: 'x2',
+                yaxis: 'y2'
+            }});
+
+            var layout1 = {{
+                height: 350,
+                autosize: true,
+                paper_bgcolor: 'rgba(0,0,0,0)',
+                plot_bgcolor: 'rgba(0,0,0,0)',
+                font: {{ color: '{WHITE}', family: 'Inter, sans-serif', size: 10 }},
+                grid: {{ rows: 1, columns: 2, pattern: 'independent' }},
+                xaxis: {{ title: 'Days to Expiry (DTE)', autorange: 'reversed', gridcolor: 'rgba(255,255,255,0.05)' }},
+                yaxis: {{ title: 'Decay (₹/lot/day)', gridcolor: 'rgba(255,255,255,0.05)' }},
+                xaxis2: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
+                yaxis2: {{ title: 'Decay (₹/lot/day)', gridcolor: 'rgba(255,255,255,0.05)' }},
+                legend: {{ bgcolor: 'rgba(18,18,42,0.85)', font: {{ size: 9 }}, orientation: 'h', y: 1.05, x: 1, xanchor: 'right' }},
+                margin: {{ l: 40, r: 20, t: 40, b: 30 }},
+                hovermode: 'x unified'
+            }};
+
+            Plotly.react(graph1, traces, layout1, {{ responsive: true }});
+        }}
+
+        var row2El = document.getElementById('theta-chart-row2');
+        if (row2El) {{
+            var graph2 = row2El.querySelector('.plotly-graph-div');
+            if (!graph2) {{
+                graph2 = document.createElement('div');
+                graph2.className = 'plotly-graph-div';
+                graph2.style.width = '100%';
+                graph2.style.height = '350px';
+                row2El.innerHTML = '';
+                row2El.appendChild(graph2);
+            }}
+
+            var effVals = [];
+            if (bsm.theta && bsm.gamma) {{
+                strikes.forEach(function(s, i) {{
+                    var th = (bsm.theta[i] && bsm.theta[i][0]) ? Math.abs(bsm.theta[i][0]) : 0;
+                    var ga = (bsm.gamma[i] && bsm.gamma[i][0]) ? Math.abs(bsm.gamma[i][0]) : 1e-6;
+                    var cushion = Math.sqrt(Math.max(2.0 * th / Math.max(ga, 1e-7), 0.0));
+                    effVals.push(Math.round(cushion));
+                }});
+            }}
+
+            var traceEff = {{
+                x: strikes,
+                y: effVals,
+                mode: 'lines+markers',
+                name: 'Daily Cushion (±pts)',
+                line: {{ color: '{GREEN}', width: 2.5 }},
+                fill: 'tozeroy',
+                fillcolor: 'rgba(16,185,129,0.1)',
+                xaxis: 'x',
+                yaxis: 'y'
+            }};
+
+            var zMatrix = [];
+            if (bsm.theta) {{
+                strikes.forEach(function(s, i) {{
+                    var rowZ = [];
+                    dteSteps.forEach(function(d, j) {{
+                        var val = (bsm.theta[i] && bsm.theta[i][j]) ? Math.abs(bsm.theta[i][j] * 65) : 0;
+                        rowZ.push(Math.round(val));
+                    }});
+                    zMatrix.push(rowZ);
+                }});
+            }}
+
+            var traceHeat = {{
+                z: zMatrix,
+                x: dteSteps.map(function(d) {{ return d + 'd'; }}),
+                y: strikes,
+                type: 'heatmap',
+                colorscale: 'Viridis',
+                colorbar: {{ title: {{ text: '₹/day', font: {{ size: 10 }} }}, len: 0.8, x: 1.02 }},
+                xaxis: 'x2',
+                yaxis: 'y2'
+            }};
+
+            var layout2 = {{
+                height: 350,
+                autosize: true,
+                paper_bgcolor: 'rgba(0,0,0,0)',
+                plot_bgcolor: 'rgba(0,0,0,0)',
+                font: {{ color: '{WHITE}', family: 'Inter, sans-serif', size: 10 }},
+                grid: {{ rows: 1, columns: 2, pattern: 'independent' }},
+                xaxis: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
+                yaxis: {{ title: 'Breakeven Cushion (± pts)', gridcolor: 'rgba(255,255,255,0.05)' }},
+                xaxis2: {{ title: 'DTE Horizon', gridcolor: 'rgba(255,255,255,0.05)' }},
+                yaxis2: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
+                legend: {{ bgcolor: 'rgba(18,18,42,0.85)', font: {{ size: 9 }}, orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center' }},
+                margin: {{ l: 40, r: 20, t: 40, b: 30 }},
+                hovermode: 'closest'
+            }};
+
+            Plotly.react(graph2, [traceEff, traceHeat], layout2, {{ responsive: true }});
+        }}
     }}
 
     window.isScrubbing = false;
@@ -4329,8 +6343,8 @@ class VolatilityAnalyzer:
     // ──────────────── GEX & DEALER POLLING (15s) ────────────────
     function pollGexAndDealer() {{
         Promise.all([
-            fetch('http://127.0.0.1:8082/api/gex').then(function(r) {{ return r.ok ? r.json() : null; }}),
-            fetch('http://127.0.0.1:8082/api/dealer').then(function(r) {{ return r.ok ? r.json() : null; }})
+            fetch('/api/gex').then(function(r) {{ return r.ok ? r.json() : null; }}),
+            fetch('/api/dealer').then(function(r) {{ return r.ok ? r.json() : null; }})
         ]).then(function(results) {{
             var gexData = results[0];
             var dealerData = results[1];
@@ -4435,11 +6449,16 @@ class VolatilityAnalyzer:
     pollHealth();
     
     if ('serviceWorker' in navigator) {{
-        window.addEventListener('load', function() {{
-            navigator.serviceWorker.register('/static/sw.js').then(function(registration) {{
-                console.log('ServiceWorker registration successful with scope: ', registration.scope);
-            }}, function(err) {{
-                console.log('ServiceWorker registration failed: ', err);
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {{
+            registrations.forEach(function(registration) {{
+                registration.unregister();
+            }});
+        }});
+    }}
+    if ('caches' in window) {{
+        caches.keys().then(function(names) {{
+            names.forEach(function(name) {{
+                caches.delete(name);
             }});
         }});
     }}
