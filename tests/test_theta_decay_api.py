@@ -1,17 +1,17 @@
 import unittest
 import json
-import urllib.request
 import urllib.parse
+from DataServer import app
 
 class TestThetaDecayAPI(unittest.TestCase):
-    BASE_URL = "http://localhost:8082/api/theta_decay"
+    def setUp(self):
+        self.client = app.test_client()
 
     def _fetch(self, params):
-        url = f"{self.BASE_URL}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            self.assertEqual(resp.status, 200)
-            return json.loads(resp.read().decode('utf-8'))
+        url = f"/api/theta_decay?{urllib.parse.urlencode(params)}"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        return json.loads(resp.data.decode('utf-8'))
 
     def test_call_bsm(self):
         data = self._fetch({"opt_type": "CE", "model": "bsm", "range_pct": 5})
@@ -44,6 +44,20 @@ class TestThetaDecayAPI(unittest.TestCase):
         atm_idx = data["strikes"].index(data["atm_strike"])
         atm_theta = data["series"]["bsm"]["theta"][atm_idx][0]
         self.assertLess(atm_theta, 0)
+
+    def test_theta_asymmetry(self):
+        data = self._fetch({"opt_type": "STRADDLE", "model": "bsm", "range_pct": 5})
+        self.assertTrue(data.get("ok"))
+        self.assertIn("theta_asymmetry", data)
+        asym = data["theta_asymmetry"]
+        self.assertIn("leader", asym)
+        self.assertIn(asym["leader"], ["CALLS", "PUTS", "BALANCED"])
+        self.assertIn("ce_pct", asym)
+        self.assertIn("pe_pct", asym)
+        self.assertAlmostEqual(asym["ce_pct"] + asym["pe_pct"], 100.0, places=0)
+        self.assertIn("chain_totals", asym)
+        self.assertGreater(asym["chain_totals"]["ce_total_inr"], 0)
+        self.assertGreater(asym["chain_totals"]["pe_total_inr"], 0)
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ import time
 import json
 import threading
 import pandas as pd
-from flask import Flask, jsonify, send_file, request
+from flask import Flask, jsonify, send_file, request, render_template, make_response
 from flask_cors import CORS
 from flask_sock import Sock
 from datetime import datetime
@@ -35,6 +35,8 @@ PORT = 8082
 CHAIN_REFRESH_INTERVAL = 60 # Seconds (Option chain rate limits are strict, 1 per min)
 
 app = Flask(__name__)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+app.jinja_env.auto_reload = True
 CORS(app)  # type: ignore
 sock = Sock(app)
 
@@ -228,7 +230,14 @@ def get_data():
 @app.route('/', methods=['GET'])
 @app.route('/unified_dashboard.html', methods=['GET'])
 def index():
-    response = send_file('unified_dashboard.html')
+    tpl_path = os.path.join(os.path.dirname(__file__), 'templates', 'unified_dashboard.html')
+    if os.path.exists(tpl_path):
+        with open(tpl_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        response = make_response(content)
+        response.mimetype = 'text/html'
+    else:
+        response = send_file('unified_dashboard.html')
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
@@ -662,6 +671,19 @@ _dealer_snapshot: dict = {
 }
 _dealer_lock = threading.Lock()
 
+# In-memory Gamma Explosion & Absorption snapshot
+_gamma_explosion_snapshot: dict = {
+    "ok": True, "active_pins": [], "retest_absorptions": [], "explosion_targets": {}, "recent_history": []
+}
+_gamma_explosion_lock = threading.Lock()
+try:
+    from calculations.GammaExplosionEngine import GammaExplosionEngine
+    _ge_lot = config.get("nifty_lot_size", 65) if config else 65
+    _gamma_explosion_engine = GammaExplosionEngine(lot_size=_ge_lot)
+except Exception as _ge_init_e:
+    _gamma_explosion_engine = None
+    print(f"[GAMMA_EXPLOSION] Init warning: {_ge_init_e}")
+
 
 def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
     """Convert Fyers optionsChain dict to a clean DataFrame for calculations/."""
@@ -678,6 +700,37 @@ def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
         "price":  float(r.get("ltp", 0) or 0),  # type: ignore
         "dte":    float(r.get("dte", 1) or 1),  # type: ignore
     } for r in rows])
+
+
+_candles_cache = []
+_candles_last_fetch = 0.0
+_candles_lock = threading.Lock()
+
+
+def _get_recent_1min_candles():
+    """Returns the last 60 1-minute candles from Fyers with thread-safe caching."""
+    global _candles_cache, _candles_last_fetch
+    now = time.time()
+    with _candles_lock:
+        if hub.fyers and (now - _candles_last_fetch > 45.0 or not _candles_cache):
+            try:
+                today_str = datetime.today().strftime("%Y-%m-%d")
+                res = hub.fyers.history({
+                    "symbol": SYMBOL,
+                    "resolution": "1",
+                    "date_format": "1",
+                    "range_from": today_str,
+                    "range_to": today_str,
+                    "cont_flag": "1"
+                })
+                if res and res.get('s') == 'ok':
+                    candles = res.get('candles', [])
+                    if candles:
+                        _candles_cache = candles
+                        _candles_last_fetch = now
+            except Exception as e:
+                print(f"[Candles] History fetch warning: {e}")
+        return list(_candles_cache)
 
 
 def _gex_refresh_loop(interval: int = 60):
@@ -776,6 +829,25 @@ def _gex_refresh_loop(interval: int = 60):
                     except Exception as _de:
                         print(f"[DEALER] Error (non-fatal): {_de}")
 
+                    # ── Gamma Explosion & Pinning via calculations/GammaExplosionEngine ──
+                    if _gamma_explosion_engine is not None:
+                        try:
+                            recent_c = _get_recent_1min_candles()
+                            ge_payload = _gamma_explosion_engine.get_full_status_payload(df, spot, recent_candles=recent_c)
+                            with _gamma_explosion_lock:
+                                _gamma_explosion_snapshot.clear()
+                                _gamma_explosion_snapshot.update(ge_payload)
+
+                            # Broadcast if any active pin or confirmed absorption
+                            if ge_payload.get("active_pins") or any(e.get("status") == "CONFIRMED" for e in ge_payload.get("retest_absorptions", [])):
+                                hub.broadcast({
+                                    "type": "gamma_explosion_update",
+                                    "payload": ge_payload
+                                })
+                            print(f"[GAMMA_EXPLOSION] Active pins: {len(ge_payload.get('active_pins', []))}, Absorptions: {len(ge_payload.get('retest_absorptions', []))}")
+                        except Exception as _ge_e:
+                            print(f"[GAMMA_EXPLOSION] Error (non-fatal): {_ge_e}")
+
         except Exception as _e:
             print(f"[GEX] Refresh error (non-fatal): {_e}")
         time.sleep(interval)
@@ -805,6 +877,30 @@ def api_dealer():
     with _dealer_lock:
         snap = dict(_dealer_snapshot)
     return jsonify({"ok": True, **snap})
+
+
+@app.route('/api/gamma/explosion', methods=['GET'])
+def api_gamma_explosion():
+    """
+    GET /api/gamma/explosion — Strike GEX switch-on pins, retest absorption, and cascade targets.
+    """
+    with _gamma_explosion_lock:
+        snap = dict(_gamma_explosion_snapshot)
+    if not snap or not snap.get('active_pins'):
+        spot = hub.latest_data.get("spot", 0)
+        chain = hub.latest_data.get("chain", {})
+        if spot > 0 and chain and _gamma_explosion_engine is not None:
+            try:
+                df = _parse_chain_to_df(chain)
+                if not df.empty:
+                    recent_c = _get_recent_1min_candles()
+                    snap = _gamma_explosion_engine.get_full_status_payload(df, spot, recent_candles=recent_c)
+                    with _gamma_explosion_lock:
+                        _gamma_explosion_snapshot.clear()
+                        _gamma_explosion_snapshot.update(snap)
+            except Exception:
+                pass
+    return jsonify(snap or {'ok': True, 'active_pins': [], 'retest_absorptions': [], 'explosion_targets': {}})
 
 
 
@@ -1050,6 +1146,7 @@ def api_portfolio_exit():
 # ─────────────────────────────────────────────────────────────────────────────
 _FINTEL_TOKEN = os.getenv("FINTEL_TOKEN", "").strip()
 _AUTH_EXEMPT  = {"/", "/fragment", "/builder", "/health", "/ready",
+                 "/api/gamma/explosion", "/api/gex", "/api/dealer",
                  "/static/manifest.json", "/static/sw.js", "/static/icon.png"}
 
 @app.before_request
@@ -1662,7 +1759,7 @@ def api_theta_decay():
         # ── Extended Decision, Straddle & Forward Simulation Analytics ────────
         strikes_analytics = {}
         target_dT = (dt_days + (dt_min / 375.0)) / 365.0
-        T_proj = max(float(T_current or (7.0 / 365.0)) - target_dT, 1e-6)
+        T_proj = max((T_current or (7.0 / 365.0)) - target_dT, 1e-6)
         spot_proj = max(spot + d_spot, 10.0)
 
         # Baseline RV for edge assessment
@@ -1676,7 +1773,7 @@ def api_theta_decay():
             pass
 
         # Expected Move (1 standard deviation move based on ATM IV and DTE)
-        atm_dte_years = max(float(T_current or (7.0 / 365.0)), 1e-4)
+        atm_dte_years = max(T_current or (7.0 / 365.0), 1e-4)
         atm_iv_dec = (default_iv / 100.0)
         expected_move_pts = round(float(spot * atm_iv_dec * np.sqrt(atm_dte_years)), 1)
         if expected_move_pts < 10.0:
@@ -1719,12 +1816,12 @@ def api_theta_decay():
             k_sig_proj = max(0.02, (iv_per_strike[K] + d_iv) / 100.0)
             
             if opt_type == 'STRADDLE':
-                p_curr_model = _bsm_calc_price(spot, K, max(float(T_current or 0.01), 1e-5), r, k_sig_base, 'CE', q) + \
-                               _bsm_calc_price(spot, K, max(float(T_current or 0.01), 1e-5), r, k_sig_base, 'PE', q)
+                p_curr_model = _bsm_calc_price(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'CE', q) + \
+                               _bsm_calc_price(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'PE', q)
                 p_proj_model = _bsm_calc_price(spot_proj, K, T_proj, r, k_sig_proj, 'CE', q) + \
                                _bsm_calc_price(spot_proj, K, T_proj, r, k_sig_proj, 'PE', q)
             else:
-                p_curr_model = _bsm_calc_price(spot, K, max(float(T_current or 0.01), 1e-5), r, k_sig_base, opt_type, q)
+                p_curr_model = _bsm_calc_price(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, opt_type, q)
                 p_proj_model = _bsm_calc_price(spot_proj, K, T_proj, r, k_sig_proj, opt_type, q)
 
             model_dp = round(p_proj_model - p_curr_model, 2)
@@ -1739,8 +1836,8 @@ def api_theta_decay():
             taylor_dp_pts = round(th_attr_pts + del_attr_pts + gam_attr_pts + veg_attr_pts, 2)
 
             # Granular Call & Put Greeks and Decays
-            g_ce = _bsm_calc_greeks(spot, K, max(float(T_current or 0.01), 1e-5), r, k_sig_base, 'CE', q)
-            g_pe = _bsm_calc_greeks(spot, K, max(float(T_current or 0.01), 1e-5), r, k_sig_base, 'PE', q)
+            g_ce = _bsm_calc_greeks(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'CE', q)
+            g_pe = _bsm_calc_greeks(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'PE', q)
             ce_th_day = abs(g_ce['theta'])
             pe_th_day = abs(g_pe['theta'])
             strad_th_day = round(ce_th_day + pe_th_day, 2)
@@ -1798,14 +1895,14 @@ def api_theta_decay():
             s_yield_score = min(40.0, decay_yield * 2.5)
             s_cushion_score = min(35.0, (cushion_pts / max(spot * 0.008, 1.0)) * 25.0)
             s_vol_score = min(25.0, max(0.0, (iv_per_strike[K] - rv_consensus) * 6.0))
-            sell_edge_score = int(round(s_yield_score + s_cushion_score + s_vol_score))
+            sell_edge_score = round(s_yield_score + s_cushion_score + s_vol_score)
 
             convexity = (gamma_val / max(active_ltp, 0.5)) * 1000.0
             b_conv_score = min(45.0, convexity * 15.0)
             vel_req = th_day_pts / (max(abs(delta_val), 0.08) * 6.25)
             b_vel_score = max(0.0, 35.0 - vel_req * 1.2)
             b_vol_score = min(20.0, max(0.0, (rv_consensus - iv_per_strike[K]) * 5.0))
-            buy_edge_score = int(round(b_conv_score + b_vel_score + b_vol_score))
+            buy_edge_score = round(b_conv_score + b_vel_score + b_vol_score)
 
             if sell_edge_score >= 70:
                 trade_verdict = 'STRONG SELL'
@@ -1864,7 +1961,7 @@ def api_theta_decay():
                 'pe_decay': pe_decay,
                 'straddle_decay': straddle_decay,
                 'renorm_alpha': renorm_alpha,
-                'normalized_moneyness': round(float((K - spot) / max(expected_move_pts, 1.0)), 2),
+                'normalized_moneyness': round((K - spot) / max(expected_move_pts, 1.0), 2),
                 'proj_ltp': proj_ltp,
                 'model_dp_pts': model_dp,
                 'model_dp_inr': model_dp_inr,
@@ -1906,7 +2003,7 @@ def api_theta_decay():
         base_pe_m = _bsm_calc_price(spot, atm_strike, atm_dte_years, r, atm_sig, 'PE', q)
 
         for z in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]:
-            ds_sim = round(float(z * expected_move_pts), 1)
+            ds_sim = round(z * expected_move_pts, 1)
             s_sim = max(spot + ds_sim, 10.0)
             p_ce_sim = _bsm_calc_price(s_sim, atm_strike, T_proj, r, atm_sig_proj, 'CE', q)
             p_pe_sim = _bsm_calc_price(s_sim, atm_strike, T_proj, r, atm_sig_proj, 'PE', q)
@@ -1958,6 +2055,54 @@ def api_theta_decay():
                 'color': scen_color
             })
 
+        # ── Compute Theta Asymmetry & Chain Totals ─────────────────────────
+        c_day_inr = atm_analytics['ce_decay']['per_day_inr']
+        p_day_inr = atm_analytics['pe_decay']['per_day_inr']
+        tot_th_inr = c_day_inr + p_day_inr
+        c_pct = round((c_day_inr / max(tot_th_inr, 1.0)) * 100.0, 1)
+        p_pct = round((p_day_inr / max(tot_th_inr, 1.0)) * 100.0, 1)
+        th_ratio = round(c_day_inr / max(p_day_inr, 1.0), 2)
+        diff_inr = abs(p_day_inr - c_day_inr)
+        diff_pct = round((diff_inr / max(min(c_day_inr, p_day_inr), 1.0)) * 100.0, 1)
+
+        if p_day_inr > c_day_inr * 1.02:
+            th_leader = 'PUTS'
+            th_verdict = f'PUT THETA IS HIGHER (+{diff_pct:.1f}% vs Calls)'
+            th_insight = f'Put buyers bleeding faster (-₹{diff_inr:,.0f}/d more). Put writing offers higher time-decay harvest than Call writing.'
+        elif c_day_inr > p_day_inr * 1.02:
+            th_leader = 'CALLS'
+            th_verdict = f'CALL THETA IS HIGHER (+{diff_pct:.1f}% vs Puts)'
+            th_insight = f'Call buyers bleeding faster (-₹{diff_inr:,.0f}/d more). Call writing offers higher time-decay harvest than Put writing.'
+        else:
+            th_leader = 'BALANCED'
+            th_verdict = 'THETA DECAY IS SYMMETRICAL'
+            th_insight = 'Time bleed is evenly matched between Calls and Puts.'
+
+        chain_ce_tot = sum([sa['ce_decay']['per_day_inr'] for sa in strikes_analytics.values()])
+        chain_pe_tot = sum([sa['pe_decay']['per_day_inr'] for sa in strikes_analytics.values()])
+        chain_tot = chain_ce_tot + chain_pe_tot
+        chain_ce_pct = round((chain_ce_tot / max(chain_tot, 1.0)) * 100.0, 1)
+        chain_pe_pct = round((chain_pe_tot / max(chain_tot, 1.0)) * 100.0, 1)
+
+        theta_asymmetry = {
+            'leader': th_leader,
+            'verdict': th_verdict,
+            'insight': th_insight,
+            'ce_pct': c_pct,
+            'pe_pct': p_pct,
+            'ce_day_inr': c_day_inr,
+            'pe_day_inr': p_day_inr,
+            'ratio': th_ratio,
+            'diff_inr': diff_inr,
+            'diff_pct': diff_pct,
+            'chain_totals': {
+                'ce_total_inr': chain_ce_tot,
+                'pe_total_inr': chain_pe_tot,
+                'ce_pct': chain_ce_pct,
+                'pe_pct': chain_pe_pct,
+            }
+        }
+
         # ── Build response payload ───────────────────────────────────────────
         series_out = {'bsm': bsm_series}
         if heston_series is not None:
@@ -1979,6 +2124,7 @@ def api_theta_decay():
             'series':               series_out,
             'strikes_analytics':    strikes_analytics,
             'atm_analytics':        atm_analytics,
+            'theta_asymmetry':      theta_asymmetry,
             'normalized_scenarios': normalized_scenarios,
             'simulation_params': {
                 'dt_min':   dt_min,

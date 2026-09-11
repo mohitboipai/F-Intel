@@ -169,10 +169,18 @@ def _step1_splash(session_ts: str):
 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
-def _prompt_date(label: str) -> str:
-    """Loop until a valid YYYY-MM-DD date is entered."""
+def _prompt_date(label: str, default: str = "") -> str:
+    """Loop until a valid YYYY-MM-DD date is entered. Pressing Enter accepts default if provided."""
+    prompt_suffix = f" [{default}]" if default else ""
     while True:
-        raw = input(f"  {label}: ").strip()
+        try:
+            raw = input(f"  {label}{prompt_suffix}: ").strip()
+        except EOFError:
+            if default:
+                return default
+            raise
+        if not raw and default:
+            return default
         if _DATE_RE.match(raw):
             try:
                 datetime.date.fromisoformat(raw)
@@ -187,8 +195,18 @@ def _step2_expiry(launcher_log) -> tuple[str, str]:
     print(_white("─── Session Configuration ───"))
     print()
 
-    near = _prompt_date("Near Expiry (weekly,  YYYY-MM-DD)")
-    far  = _prompt_date("Far  Expiry (monthly, YYYY-MM-DD)")
+    def_near, def_far = "", ""
+    try:
+        session_path = PROJECT_ROOT / "fintel_session.json"
+        if session_path.exists():
+            saved = json.loads(session_path.read_text(encoding="utf-8"))
+            def_near = saved.get("near_expiry", "")
+            def_far = saved.get("far_expiry", "")
+    except Exception:
+        pass
+
+    near = _prompt_date("Near Expiry (weekly,  YYYY-MM-DD)", default=def_near)
+    far  = _prompt_date("Far  Expiry (monthly, YYYY-MM-DD)", default=def_far)
 
     print()
     print(_green(f"  ✓ Expiries set — Near: {near}  Far: {far}"))
@@ -274,7 +292,13 @@ def _step4_tunnel(launcher_log) -> subprocess.Popen:
 
     print(_cyan(f"  ✓ Tunnel process launched (PID: {tunnel_proc.pid}). Waiting for URL..."))
 
-    url_found_event.wait(timeout=30)
+    # Wait for URL or process exit (avoid waiting 30s if cloudflared is absent)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if url_found_event.wait(timeout=0.5):
+            break
+        if tunnel_proc.poll() is not None:
+            break
 
     url = _TUNNEL_URL_HOLDER[0]
 

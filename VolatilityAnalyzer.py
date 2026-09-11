@@ -4033,6 +4033,46 @@ class VolatilityAnalyzer:
                                 _atm_pe_yield = (abs(_atm_pe_inr / _lot_th) / max(_atm_pe_ltp, 0.1)) * 100.0
                                 _atm_strad_yield = (abs(_atm_strad_inr / _lot_th) / max(_atm_strad_prem, 0.1)) * 100.0
 
+                                # ── Theta Asymmetry & Bleed Dominance Comparator ──
+                                _atm_ce_inr_abs = abs(_atm_ce_inr)
+                                _atm_pe_inr_abs = abs(_atm_pe_inr)
+                                _atm_th_tot = _atm_ce_inr_abs + _atm_pe_inr_abs
+                                _atm_ce_pct = (_atm_ce_inr_abs / max(_atm_th_tot, 1e-6)) * 100.0
+                                _atm_pe_pct = (_atm_pe_inr_abs / max(_atm_th_tot, 1e-6)) * 100.0
+                                _atm_th_ratio = _atm_ce_inr_abs / max(_atm_pe_inr_abs, 1e-6)
+
+                                if _atm_pe_inr_abs > _atm_ce_inr_abs * 1.02:
+                                    _th_leader = "PUTS"
+                                    _th_diff_inr = _atm_pe_inr_abs - _atm_ce_inr_abs
+                                    _th_diff_pts = _th_diff_inr / _lot_th
+                                    _th_diff_pct = (_th_diff_inr / max(_atm_ce_inr_abs, 1.0)) * 100.0
+                                    _th_verdict_col = "#ff7043"
+                                    _th_verdict_text = f"PUT THETA IS HIGHER (+{_th_diff_pct:.1f}% vs Calls)"
+                                    _th_insight = f"Put buyers bleeding faster (-₹{_th_diff_inr:,.0f}/d more). Put writing offers higher time-decay harvest than Call writing."
+                                elif _atm_ce_inr_abs > _atm_pe_inr_abs * 1.02:
+                                    _th_leader = "CALLS"
+                                    _th_diff_inr = _atm_ce_inr_abs - _atm_pe_inr_abs
+                                    _th_diff_pts = _th_diff_inr / _lot_th
+                                    _th_diff_pct = (_th_diff_inr / max(_atm_pe_inr_abs, 1.0)) * 100.0
+                                    _th_verdict_col = "#38bdf8"
+                                    _th_verdict_text = f"CALL THETA IS HIGHER (+{_th_diff_pct:.1f}% vs Puts)"
+                                    _th_insight = f"Call buyers bleeding faster (-₹{_th_diff_inr:,.0f}/d more). Call writing offers higher time-decay harvest than Put writing."
+                                else:
+                                    _th_leader = "BALANCED"
+                                    _th_diff_inr = 0.0
+                                    _th_diff_pts = 0.0
+                                    _th_diff_pct = 0.0
+                                    _th_verdict_col = "#ffd54f"
+                                    _th_verdict_text = "THETA DECAY IS SYMMETRICAL"
+                                    _th_insight = "Time bleed is evenly matched between Calls and Puts (neutral decay bias)."
+
+                                # Chain-wide total decay (sum across all valid strikes)
+                                _chain_ce_th_tot = sum([abs(x) for x in _ce_thetas_inr])
+                                _chain_pe_th_tot = sum([abs(x) for x in _pe_thetas_inr])
+                                _chain_tot_th = _chain_ce_th_tot + _chain_pe_th_tot
+                                _chain_ce_pct = (_chain_ce_th_tot / max(_chain_tot_th, 1e-6)) * 100.0
+                                _chain_pe_pct = (_chain_pe_th_tot / max(_chain_tot_th, 1e-6)) * 100.0
+
                                 # Expected Move (1-sigma, Gatheral 2006 / Merton 1973)
                                 _em_pts = spot * (_atm_iv_th / 100.0) * np.sqrt(max(_curr_dte_th / 365.0, 1e-4))
                                 if _em_pts < 10.0: _em_pts = spot * 0.008
@@ -4159,6 +4199,61 @@ class VolatilityAnalyzer:
                                         </div>
                                     </div>
 
+                                    <!-- DEDICATED CALL vs PUT THETA COMPARISON CARD -->
+                                    <div class="card" id="card-theta-comparison" style="border-left:4px solid {_th_verdict_col}; background:linear-gradient(135deg, rgba(18,18,42,0.95), rgba(10,14,28,0.95)); padding:14px; margin-bottom:4px;">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+                                            <div style="display:flex; align-items:center; gap:10px;">
+                                                <span style="font-size:18px;">⚖️</span>
+                                                <div>
+                                                    <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px;">CALL vs PUT THETA ASYMMETRY COMPARATOR</div>
+                                                    <div id="th-asymmetry-verdict" style="font-size:16px; font-weight:900; color:{_th_verdict_col}; display:flex; align-items:center; gap:8px;">
+                                                        <span id="th-verdict-title">{_th_verdict_text}</span>
+                                                        <span id="th-leader-badge" style="font-size:10px; font-weight:800; padding:2px 8px; border-radius:4px; background:{_th_verdict_col}22; border:1px solid {_th_verdict_col}66; color:{_th_verdict_col};">{_th_leader} BLEED DOMINANCE</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div style="text-align:right;">
+                                                <div style="font-size:11px; color:{MUTED};">Call / Put Ratio (CE/PE)</div>
+                                                <div id="th-ratio-display" style="font-size:18px; font-weight:900; color:{WHITE}; font-family:'JetBrains Mono', monospace;">{_atm_th_ratio:.2f}x</div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Visual 2-Tone Asymmetry Gauge Bar -->
+                                        <div style="margin-bottom:10px;">
+                                            <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:700; margin-bottom:4px;">
+                                                <span style="color:#38bdf8;">CALL DECAY: <span id="th-ce-gauge-lbl">{_atm_ce_pct:.1f}%</span> (₹<span id="th-ce-val-lbl">{_atm_ce_inr_abs:,.0f}</span>/d)</span>
+                                                <span id="th-gauge-center-strike" style="color:{MUTED}; font-size:10px;">TARGET STRIKE {_atm_strike_th:,.0f}</span>
+                                                <span style="color:#ff7043;">PUT DECAY: <span id="th-pe-gauge-lbl">{_atm_pe_pct:.1f}%</span> (₹<span id="th-pe-val-lbl">{_atm_pe_inr_abs:,.0f}</span>/d)</span>
+                                            </div>
+                                            <div style="height:12px; border-radius:6px; background:#121226; overflow:hidden; display:flex; border:1px solid #2a2a4a; position:relative;">
+                                                <div id="th-gauge-ce" style="width:{_atm_ce_pct:.1f}%; height:100%; background:linear-gradient(90deg, #0284c7, #38bdf8); transition:width 0.3s ease;"></div>
+                                                <div id="th-gauge-pe" style="width:{_atm_pe_pct:.1f}%; height:100%; background:linear-gradient(90deg, #ff7043, #ef4444); transition:width 0.3s ease;"></div>
+                                                <!-- Center 50% marker line -->
+                                                <div style="position:absolute; left:50%; top:0; bottom:0; width:2px; background:rgba(255,255,255,0.4); transform:translateX(-50%); pointer-events:none;"></div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 3 Actionable Summary Boxes -->
+                                        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
+                                            <div class="metric-box" style="padding:8px 10px; text-align:left; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06);">
+                                                <div class="metric-label" style="color:{MUTED}; font-size:10px;">DECAY SPREAD (STRIKE)</div>
+                                                <div id="th-diff-detail" style="font-size:13px; font-weight:800; color:{WHITE}; margin:2px 0;">Δ ₹{_th_diff_inr:,.0f} / lot ({_th_diff_pts:.1f} pts)</div>
+                                                <div style="font-size:10px; color:{_th_verdict_col};" id="th-diff-sub">{_th_leader} bleeding faster</div>
+                                            </div>
+                                            <div class="metric-box" style="padding:8px 10px; text-align:left; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06);">
+                                                <div class="metric-label" style="color:{MUTED}; font-size:10px;">TRADER PLAYBOOK</div>
+                                                <div id="th-insight-detail" style="font-size:11px; color:#e2e8f0; line-height:1.3; margin-top:2px;">{_th_insight}</div>
+                                            </div>
+                                            <div class="metric-box" style="padding:8px 10px; text-align:left; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06);">
+                                                <div class="metric-label" style="color:{MUTED}; font-size:10px;">CHAIN-WIDE MACRO THETA</div>
+                                                <div style="font-size:12px; font-weight:800; color:{WHITE}; margin:2px 0;">
+                                                    <span style="color:#38bdf8;">CE: {_chain_ce_pct:.0f}%</span> vs <span style="color:#ff7043;">PE: {_chain_pe_pct:.0f}%</span>
+                                                </div>
+                                                <div style="font-size:10px; color:{MUTED};">₹{_chain_ce_th_tot/1e5:.1f}L CE vs ₹{_chain_pe_th_tot/1e5:.1f}L PE total</div>
+                                            </div>
+                                        </div>
+                                    </div>
+
                                     <!-- EXECUTIVE 3-WAY DECAY PANEL (Call vs Put vs Straddle) -->
                                     <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
                                         <!-- CALL CARD -->
@@ -4167,6 +4262,7 @@ class VolatilityAnalyzer:
                                                 <div style="display:flex; align-items:center; gap:6px;">
                                                     <span style="font-size:13px; font-weight:900; color:#38bdf8; letter-spacing:1px;">CALL (CE) DECAY</span>
                                                     <span id="card-ce-strike" style="font-size:11px; color:#94a3b8; font-weight:700;">{_atm_strike_th:,.0f}</span>
+                                                    <span id="card-ce-leader-tag" style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; {'background:rgba(56,189,248,0.2); color:#38bdf8; border:1px solid #38bdf8;' if _th_leader == 'CALLS' else 'background:rgba(255,255,255,0.06); color:#94a3b8;'}">{'🔥 HIGHER' if _th_leader == 'CALLS' else 'LOWER DECAY'}</span>
                                                 </div>
                                                 <div style="font-size:14px; font-weight:800; color:{WHITE};" id="card-ce-price">LTP: ₹{_atm_ce_ltp:.1f}</div>
                                             </div>
@@ -4206,6 +4302,7 @@ class VolatilityAnalyzer:
                                                 <div style="display:flex; align-items:center; gap:6px;">
                                                     <span style="font-size:13px; font-weight:900; color:#ff7043; letter-spacing:1px;">PUT (PE) DECAY</span>
                                                     <span id="card-pe-strike" style="font-size:11px; color:#94a3b8; font-weight:700;">{_atm_strike_th:,.0f}</span>
+                                                    <span id="card-pe-leader-tag" style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; {'background:rgba(255,112,67,0.2); color:#ff7043; border:1px solid #ff7043;' if _th_leader == 'PUTS' else 'background:rgba(255,255,255,0.06); color:#94a3b8;'}">{'🔥 HIGHER' if _th_leader == 'PUTS' else 'LOWER DECAY'}</span>
                                                 </div>
                                                 <div style="font-size:14px; font-weight:800; color:{WHITE};" id="card-pe-price">LTP: ₹{_atm_pe_ltp:.1f}</div>
                                             </div>
@@ -4936,6 +5033,90 @@ class VolatilityAnalyzer:
                                 )
 
                             mm_tab_html = f'''
+                            <!-- Market Maker Gamma Pinning & Order Flow Absorption Terminal -->
+                            <div id="gamma-explosion-root" class="gamma-explosion-wrap">
+                                <!-- 1. Interactive Real-Time Candlesticks & GEX Bands Chart (Plotly) -->
+                                <div class="ge-chart-card">
+                                    <div class="ge-card-header" style="margin-bottom:8px;">
+                                        <div class="ge-card-title">
+                                            <span style="letter-spacing:1px; font-weight:700;">LIVE NIFTY CANDLESTICKS &amp; INSTITUTIONAL GEX BANDS</span>
+                                        </div>
+                                        <div id="ge-chart-legend" style="display:flex; gap:12px; font-size:11px; font-family:var(--font-mono);">
+                                            <span style="color:#00e676;">🟩 Call Wall</span>
+                                            <span style="color:#ff3366;">🟥 Put Wall</span>
+                                            <span style="color:#00e5ff;">🟦 Gamma Flip</span>
+                                            <span style="color:#ffd54f;">🟨 Pin Corridor</span>
+                                        </div>
+                                    </div>
+                                    <div id="ge-interactive-chart" style="width:100%; height:380px;"></div>
+                                </div>
+
+                                <!-- 2. Dual Spotlight Grid: Reel 1 & Reel 2 Models -->
+                                <div class="ge-grid">
+                                    <!-- Reel 1 Spotlight: Dominant Pin & Duration Timer (quantedoptions) -->
+                                    <div id="ge-reel1-spotlight" class="ge-card" style="border-left: 3px solid var(--accent-amber);">
+                                        <div class="ge-card-header">
+                                            <div class="ge-card-title">
+                                                <span style="color:var(--accent-amber); font-weight:800;">⚡ REEL 1: SESSION DOMINANT GAMMA PIN</span>
+                                            </div>
+                                            <span id="ge-reel1-status-pill" class="ge-pin-badge low">HOLDING CEILING</span>
+                                        </div>
+                                        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap:10px; margin-top:6px;">
+                                            <div class="ge-stat-box"><span class="lbl">PINNED STRIKE</span><span id="ge-r1-strike" class="val" style="color:#ffd54f;">--</span><span class="sub">MAGNETIC ANCHOR</span></div>
+                                            <div class="ge-stat-box"><span class="lbl">PIN DURATION</span><span id="ge-r1-duration" class="val" style="color:#00e5ff;">--</span><span class="sub">SESSION CLOCK</span></div>
+                                            <div class="ge-stat-box"><span class="lbl">MM GAMMA</span><span id="ge-r1-gamma" class="val" style="color:#00e676;">--</span><span class="sub">STABILIZING FLOW</span></div>
+                                            <div class="ge-stat-box"><span class="lbl">PULL FORCE</span><span id="ge-r1-pull" class="val">--</span><span class="sub">PROXIMITY SCORE</span></div>
+                                            <div class="ge-stat-box"><span class="lbl">CORRIDOR</span><span id="ge-r1-corridor" class="val">--</span><span class="sub">±50 PT RANGE</span></div>
+                                        </div>
+                                        <div id="ge-r1-unwind-alert" style="margin-top:10px; padding:10px 14px; background:rgba(0, 229, 255, 0.05); border-radius:6px; border:1px solid rgba(0, 229, 255, 0.25); font-size:12px; color:#ddd;">
+                                            Scanning session dominant pin...
+                                        </div>
+                                    </div>
+
+                                    <!-- Reel 2 Spotlight: Retest & 100-Point Squeeze Setup (aleksrosme) -->
+                                    <div id="ge-reel2-spotlight" class="ge-card" style="border-left: 3px solid var(--accent-cyan);">
+                                        <div class="ge-card-header">
+                                            <div class="ge-card-title">
+                                                <span style="color:var(--accent-cyan); font-weight:800;">⚡ REEL 2: GEX RETEST &amp; 100-PT SQUEEZE</span>
+                                            </div>
+                                            <div id="ge-radar-status" class="ge-status-pill monitoring">MONITORING</div>
+                                        </div>
+                                        <div id="ge-r2-headline" style="font-size:13px; font-weight:700; color:#fff; min-height:36px;">
+                                            Monitoring GEX Barrier Retest...
+                                        </div>
+                                        <div class="ge-target-ladder" style="margin-top:8px;">
+                                            <div class="ge-target-box trigger"><span class="lbl">TRIGGER ENTRY</span><span id="ge-target-trigger" class="val">--</span><span class="sub">BREAKOUT</span></div>
+                                            <div class="ge-target-box" style="border-color:rgba(255,51,102,0.3);"><span class="lbl" style="color:#ff3366;">STOP LOSS</span><span id="ge-target-stop" class="val" style="color:#ff3366;">--</span><span class="sub">15-20 PT RISK</span></div>
+                                            <div class="ge-target-box t1"><span class="lbl">PRIMARY T1</span><span id="ge-target-t1" class="val">--</span><span class="sub">+50 PTS</span></div>
+                                            <div class="ge-target-box t2"><span class="lbl">EXPLOSION T2</span><span id="ge-target-t2" class="val">--</span><span class="sub">+100 PTS</span></div>
+                                        </div>
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; padding:8px 12px; background:rgba(0,0,0,0.3); border-radius:6px;">
+                                            <div style="font-size:12px; color:#ccc;">R:R Expectancy: <span id="ge-target-rr" class="num-mono" style="color:#00e676; font-weight:800; font-size:14px;">--</span></div>
+                                            <div id="ge-hedge-flow" class="num-mono" style="font-size:11px;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 3. Strike GEX Ladder & Pin Corridor -->
+                                <div class="ge-card">
+                                    <div class="ge-card-header">
+                                        <div class="ge-card-title">
+                                            <span style="font-weight:700;">STRIKE GEX LADDER &amp; INSTITUTIONAL DISTRIBUTION</span>
+                                        </div>
+                                        <span class="num-mono" style="font-size:11px; color:{MUTED};">Signed Dealer Gamma (₹ Cr)</span>
+                                    </div>
+                                    <div id="ge-ladder-container" class="ge-ladder-wrap">
+                                        <div style="color:{MUTED}; font-size:12px; padding:10px;">Loading strike GEX ladder...</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div style="margin-top: 24px; margin-bottom: 12px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
+                                <div style="font-size: 13px; font-weight: 800; letter-spacing: 1.2px; color: {ACCENT}; text-transform: uppercase;">
+                                    TRI-MODEL DEALER POSITIONING COMPARISON
+                                </div>
+                            </div>
+
                             <!-- Tri-Model Comparative Cards -->
                             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px;">
                                 <!-- Model A: Standard -->
@@ -5070,68 +5251,141 @@ class VolatilityAnalyzer:
                     except Exception as _mm_e:
                         mm_tab_html = f'<div class="card"><p style="color:#ff4444;">Dealer positioning error: {str(_mm_e)}</p></div>'
 
-                    # ── REGIME TAB HTML ──
+                    # ── REGIME TAB HTML (SIMPLIFIED ACTIONABLE VOLATILITY PLAYBOOK) ──
                     if regime_snapshot:
+                        _vrp_val = regime_snapshot['vrp']['iv_rv']
+                        if _vrp_val > 1.5:
+                            _vrp_badge = "OPTIONS EXPENSIVE · SELLERS FAVORED"
+                            _vrp_badge_col = GREEN
+                            _vrp_sub = "Implied Vol is higher than actual market movement. Theta harvesting & credit spreads favored."
+                            _rec_trades = "Delta-Neutral Short Straddles, Iron Condors, OTM Credit Spreads"
+                            _rec_risk = "Favorable decay backdrop; hedge delta if spot breaches Call/Put walls."
+                        elif _vrp_val < -1.5:
+                            _vrp_badge = "OPTIONS CHEAP · BUYERS FAVORED"
+                            _vrp_badge_col = RED
+                            _vrp_sub = "Implied Vol is cheaper than actual price movement. Directional & breakout setups favored."
+                            _rec_trades = "Long Straddles, Directional Debit Spreads, Gamma Squeeze breakout calls/puts"
+                            _rec_risk = "Avoid naked option selling; volatility expansion risk is elevated."
+                        else:
+                            _vrp_badge = "FAIR VALUE VOLATILITY · BALANCED"
+                            _vrp_badge_col = YELLOW
+                            _vrp_sub = "IV closely tracks Realized Vol. Play selective tactical setups with disciplined stops."
+                            _rec_trades = "Calendar Spreads, Ratio Spreads, Defined-Risk Rangebound plays"
+                            _rec_risk = "Monitor dealer Gamma Flip strike for regime inflection."
+
+                        _rv_cons = regime_snapshot['rv']['consensus']
+                        _rv_intra = regime_snapshot['rv'].get('intraday', 0.0)
+                        _rv_5d = regime_snapshot['rv'].get('5d', 0.0)
+                        _rv_20d = regime_snapshot['rv'].get('20d', 0.0)
+                        _rv_60d = regime_snapshot['rv'].get('60d', 0.0)
+                        _hv_20d = regime_snapshot['hv']['20d']
+                        _hv_pctile = regime_snapshot['hv']['percentile']
+                        _rv_trend = regime_snapshot['rv']['trend']
+                        _rv_trend_col = GREEN if 'COMPRESS' in _rv_trend.upper() or 'FALL' in _rv_trend.upper() else RED if 'EXPAND' in _rv_trend.upper() or 'RIS' in _rv_trend.upper() else YELLOW
+
                         regime_tab_html = f'''
-                        <div style="display:flex; flex-direction:column; gap:16px;">
-                            <div class="card" style="border-left: 4px solid {ACCENT};">
-                                <h2 style="color:{ACCENT}; margin-bottom: 8px;">MARKET REGIME: {regime_snapshot['regime']['name']}</h2>
-                                <p style="color:{WHITE}; font-size:14px; margin-bottom: 12px;">{regime_snapshot['regime']['description']}</p>
-                                <div style="color:{MUTED}; font-size:12px;">ACTION BIAS: <strong style="color:{WHITE};">{regime_snapshot['regime']['bias']}</strong> &nbsp;|&nbsp; VOL ACTION: <strong style="color:{GREEN}">{regime_snapshot['regime']['vol_action']}</strong></div>
-                            </div>
-                            
-                            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px;">
-                                <div class="metric-box">
-                                    <div class="metric-label">Consensus Realized Vol</div>
-                                    <div style="font-size:24px; font-weight:700; color:{WHITE};">{regime_snapshot['rv']['consensus']:.2f}%</div>
-                                    <div class="metric-sub">Trend: {regime_snapshot['rv']['trend']}</div>
+                        <div style="display:flex; flex-direction:column; gap:14px;">
+                            <!-- Institutional Gamma Explosion Quick-Launch Banner -->
+                            <div class="ge-quick-banner" onclick="switchTab('mm')">
+                                <div style="display:flex; align-items:center; gap:14px;">
+                                    <span style="display:inline-flex; width:10px; height:10px; border-radius:50%; background:#00f0ff; box-shadow:0 0 10px #00f0ff; animation:pulseBadgeCyan 1.5s infinite;"></span>
+                                    <div>
+                                        <div style="font-weight:800; font-size:13px; color:#00f0ff; letter-spacing:0.5px; display:flex; align-items:center; gap:8px;">
+                                            <span>⚡ NEW: MARKET MAKER GAMMA EXPLOSION & PINNING TERMINAL</span>
+                                            <span style="font-size:10px; background:rgba(0,240,255,0.25); color:#00f0ff; padding:2px 8px; border-radius:4px; font-weight:700;">LIVE MODEL</span>
+                                        </div>
+                                        <div style="font-size:12px; color:#cbd5e1; margin-top:3px;">
+                                            Real-time Dealer Gamma Pins, Duration Timer (4h+), GEX Retest Absorption & Directional Squeeze Targets.
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="metric-box">
-                                    <div class="metric-label">Volatility Risk Premium</div>
-                                    <div style="font-size:24px; font-weight:700; color:{GREEN if regime_snapshot['vrp']['iv_rv'] > 0 else RED};">{regime_snapshot['vrp']['iv_rv']:+.2f}%</div>
-                                    <div class="metric-sub">IV vs Consensus RV</div>
-                                </div>
-                                <div class="metric-box">
-                                    <div class="metric-label">Historical Vol (20d)</div>
-                                    <div style="font-size:24px; font-weight:700; color:{WHITE};">{regime_snapshot['hv']['20d']:.2f}%</div>
-                                    <div class="metric-sub">Percentile: {regime_snapshot['hv']['percentile']:.0f}%</div>
+                                <div style="display:flex; align-items:center; gap:6px; background:#00f0ff; color:#060812; font-weight:800; font-size:11px; padding:8px 16px; border-radius:6px; letter-spacing:0.5px; text-transform:uppercase;">
+                                    LAUNCH TERMINAL &rarr;
                                 </div>
                             </div>
-                            
-                            <div class="card">
-                                <h3 style="color:{ACCENT}; font-size:14px; margin-bottom:12px; border-bottom: 1px solid #333; padding-bottom:6px;">Realized Volatility Term Structure</h3>
-                                <table class="data-table">
-                                    <thead><tr><th style="text-align:left;">Estimator</th><th>5-Day</th><th>10-Day</th><th>20-Day</th><th>60-Day</th></tr></thead>
-                                    <tbody>
-                                        <tr>
-                                            <td style="text-align:left; color:{WHITE};">Close-to-Close</td>
-                                            <td>{regime_snapshot['rv']['5d']:.2f}%</td>
-                                            <td>{regime_snapshot['rv']['10d']:.2f}%</td>
-                                            <td>{regime_snapshot['rv']['20d']:.2f}%</td>
-                                            <td>{regime_snapshot['rv']['60d']:.2f}%</td>
-                                        </tr>
-                                        <tr>
-                                            <td style="text-align:left; color:{WHITE};">Parkinson (High/Low)</td>
-                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['parkinson_20d']:.2f}%</td><td>-</td>
-                                        </tr>
-                                        <tr>
-                                            <td style="text-align:left; color:{WHITE};">Garman-Klass (OHLC)</td>
-                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['garman_klass_20d']:.2f}%</td><td>-</td>
-                                        </tr>
-                                        <tr>
-                                            <td style="text-align:left; color:{WHITE};">Yang-Zhang (Gap+OHLC)</td>
-                                            <td>-</td><td>-</td><td>{regime_snapshot['rv']['yang_zhang_20d']:.2f}%</td><td>-</td>
-                                        </tr>
-                                        <tr style="background:rgba(79,195,247,0.1);">
-                                            <td style="text-align:left; font-weight:600; color:{ACCENT};">CONSENSUS (Avg)</td>
-                                            <td colspan="4" style="text-align:center; font-weight:600; font-size:16px; color:{ACCENT};">{regime_snapshot['rv']['consensus']:.2f}%</td>
-                                        </tr>
-                                    </tbody>
-                                </table>
+
+                            <!-- Executive Market Regime Banner -->
+                            <div class="card" style="border-left: 4px solid {ACCENT}; background:linear-gradient(135deg, rgba(18,18,42,0.95), rgba(10,14,28,0.95)); padding:16px;">
+                                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
+                                    <div>
+                                        <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px; margin-bottom:3px;">ACTIVE MARKET REGIME</div>
+                                        <h2 style="color:{ACCENT}; font-size:22px; font-weight:900; margin:0 0 4px 0;">{regime_snapshot['regime']['name']}</h2>
+                                    </div>
+                                    <div style="display:flex; gap:8px; align-items:center;">
+                                        <span style="background:rgba(255,255,255,0.06); color:{WHITE}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid #2a2a4a;">BIAS: <strong style="color:{ACCENT};">{regime_snapshot['regime']['bias']}</strong></span>
+                                        <span style="background:{GREEN}18; color:{GREEN}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {GREEN}44;">VOL: {regime_snapshot['regime']['vol_action']}</span>
+                                    </div>
+                                </div>
+                                <p style="color:#cbd5e1; font-size:13px; line-height:1.5; margin:0 0 10px 0;">{regime_snapshot['regime']['description']}</p>
                             </div>
-                            
-                            <div class="card" style="margin-top:4px;">
-                                <div style="color:{MUTED}; font-size:12px; text-align:center;">Intraday Consensus RV: {regime_snapshot['rv']['intraday']:.2f}%</div>
+
+                            <!-- 3 Core Quantitative Metrics Grid -->
+                            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px;">
+                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid {ACCENT};">
+                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">CONSENSUS REALIZED VOL</div>
+                                    <div style="font-size:26px; font-weight:900; color:{WHITE}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_rv_cons:.2f}%</div>
+                                    <div class="metric-sub" style="color:{_rv_trend_col}; font-weight:700;">Trend: {_rv_trend}</div>
+                                </div>
+                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid {_vrp_badge_col};">
+                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">VOLATILITY RISK PREMIUM (VRP)</div>
+                                    <div style="font-size:26px; font-weight:900; color:{_vrp_badge_col}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_vrp_val:+.2f}%</div>
+                                    <div class="metric-sub" style="color:{_vrp_badge_col}; font-weight:700;">{_vrp_badge}</div>
+                                </div>
+                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid #ffd54f;">
+                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">HISTORICAL VOLATILITY (20D)</div>
+                                    <div style="font-size:26px; font-weight:900; color:{WHITE}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_hv_20d:.2f}%</div>
+                                    <div class="metric-sub" style="color:#ffd54f; font-weight:700;">Rank: {_hv_pctile:.0f}th Percentile (1-Yr)</div>
+                                </div>
+                            </div>
+
+                            <!-- Actionable Trading Playbook (3 Clean Pillars) -->
+                            <div class="card" style="padding:14px; background:rgba(18,18,42,0.85);">
+                                <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">🎯 ACTIONABLE TRADING PLAYBOOK FOR THIS REGIME</div>
+                                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
+                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
+                                        <div style="font-size:11px; font-weight:800; color:{GREEN}; margin-bottom:4px;">1. RECOMMENDED STRATEGIES</div>
+                                        <div style="font-size:13px; font-weight:700; color:{WHITE}; line-height:1.4;">{_rec_trades}</div>
+                                        <div style="font-size:11px; color:{MUTED}; margin-top:4px;">Aligned with current VRP and regime dynamics.</div>
+                                    </div>
+                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
+                                        <div style="font-size:11px; font-weight:800; color:#ffd54f; margin-bottom:4px;">2. RISK & DEFENSE BOUNDARY</div>
+                                        <div style="font-size:12px; color:#e2e8f0; line-height:1.4;">{_rec_risk}</div>
+                                    </div>
+                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
+                                        <div style="font-size:11px; font-weight:800; color:#38bdf8; margin-bottom:4px;">3. TIMING & INTRADAY CONTEXT</div>
+                                        <div style="font-size:12px; color:#e2e8f0; line-height:1.4;">Intraday RV: <strong style="color:{WHITE};">{_rv_intra:.2f}%</strong>. {_vrp_sub}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Streamlined Volatility Horizon Strip -->
+                            <div class="card" style="padding:14px; background:rgba(18,18,42,0.85);">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                    <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">📊 REALIZED VOLATILITY TERM STRUCTURE HORIZON</div>
+                                    <div style="font-size:11px; color:{MUTED};">Consensus Benchmark: <strong style="color:{ACCENT};">{_rv_cons:.2f}%</strong></div>
+                                </div>
+                                <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px;">
+                                    <div class="metric-box" style="padding:10px; text-align:center;">
+                                        <div class="metric-label" style="font-size:10px;">INTRADAY (1D)</div>
+                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_intra:.2f}%</div>
+                                        <div class="metric-sub">Session Realized</div>
+                                    </div>
+                                    <div class="metric-box" style="padding:10px; text-align:center;">
+                                        <div class="metric-label" style="font-size:10px;">SHORT-TERM (5D)</div>
+                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_5d:.2f}%</div>
+                                        <div class="metric-sub">Weekly Trend</div>
+                                    </div>
+                                    <div class="metric-box" style="padding:10px; text-align:center;">
+                                        <div class="metric-label" style="font-size:10px;">MEDIUM-TERM (20D)</div>
+                                        <div style="font-size:18px; font-weight:800; color:{ACCENT}; margin:2px 0;">{_rv_20d:.2f}%</div>
+                                        <div class="metric-sub">Monthly Base</div>
+                                    </div>
+                                    <div class="metric-box" style="padding:10px; text-align:center;">
+                                        <div class="metric-label" style="font-size:10px;">QUARTERLY (60D)</div>
+                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_60d:.2f}%</div>
+                                        <div class="metric-sub">Quarterly Anchor</div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         '''
@@ -5165,1307 +5419,114 @@ class VolatilityAnalyzer:
                     with open(frag_path, 'w', encoding='utf-8') as f:
                         f.write(fragment_html)
 
-                    if first_run:
-                        # Write full page only once (stable shell + live JS fetcher)
-                        full_html = f'''<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#0d1117">
-<title>Unified Vol Dashboard | {self.symbol}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
-<style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ background:{DARK_BG}; font-family:Inter,'Segoe UI',sans-serif; color:{WHITE}; padding:8px 16px; }}
-    .header {{ display:flex; justify-content:space-between; align-items:center; padding:10px 20px;
-               background:{CARD_BG}; border-radius:12px; margin-bottom:8px; border:1px solid #2a2a4a; }}
-    .title {{ font-size:16px; font-weight:700; color:{ACCENT}; letter-spacing:2px; }}
-    .tab-bar {{ display:flex; gap:4px; margin-bottom:8px; }}
-    .tab-btn {{ padding:10px 24px; background:{CARD_BG}; border:1px solid #2a2a4a; border-bottom:none;
-                border-radius:10px 10px 0 0; cursor:pointer; color:{MUTED}; font-size:13px;
-                font-weight:600; letter-spacing:1px; transition:all 0.2s; }}
-    .tab-btn:hover {{ color:{WHITE}; background:#1e1e38; }}
-    .tab-btn.active {{ color:{ACCENT}; background:#12122a; border-color:{ACCENT}; border-bottom:2px solid {ACCENT}; }}
-    .tab-content {{ display:none; }}
-    .tab-content.active {{ display:block; }}
-    .card {{ background:{CARD_BG}; border-radius:12px; padding:16px; border:1px solid #2a2a4a; }}
-    .metric-box {{ background:#12122a; border-radius:8px; padding:12px 16px; text-align:center; border:1px solid #2a2a4a; flex:1; min-width:130px; }}
-    .metric-label {{ color:{MUTED}; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:1px; }}
-    .metric-sub {{ color:{MUTED}; font-size:11px; }}
-    .action-bar {{ display:flex; align-items:center; padding:10px 16px; background:#12122a; border-radius:8px; border:1px solid #2a2a4a; flex-wrap:wrap; gap:8px; }}
-    .theta-type-btn, .theta-model-btn, .theta-focus-btn {{ padding: 6px 12px; background: {CARD_BG}; border: 1px solid #2a2a4a; border-radius: 6px; cursor: pointer; color: {MUTED}; font-size: 11px; font-weight: 600; transition: all 0.2s; }}
-    .theta-type-btn:hover, .theta-model-btn:hover, .theta-focus-btn:hover {{ color: {WHITE}; background: #1e1e38; }}
-    .theta-type-btn.active, .theta-model-btn.active, .theta-focus-btn.active {{ color: {ACCENT}; background: #12122a; border-color: {ACCENT}; }}
-    .th-quick-btn {{ background: rgba(255,255,255,0.06); color: #cbd5e1; border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; font-size: 10px; font-weight: 600; padding: 2px 7px; cursor: pointer; transition: all 0.15s ease; }}
-    .th-quick-btn:hover {{ background: #0284c7; color: #ffffff; border-color: #0284c7; }}
-    .data-table {{ width:100%; border-collapse:collapse; font-size:12px; }}
-    .data-table th {{ color:{MUTED}; font-size:11px; text-transform:uppercase; padding:6px 8px; border-bottom:1px solid #2a2a4a; text-align:right; }}
-    .data-table td {{ padding:5px 8px; border-bottom:1px solid #1a1a2a; color:{WHITE}; text-align:right; }}
-    .data-table tr:hover {{ background:rgba(79,195,247,0.04); }}
-    #live-pulse {{ display:inline-block; width:8px; height:8px; border-radius:50%; background:{GREEN};
-                   animation:pulse 1.5s infinite; margin-right:6px; }}
-    @keyframes pulse {{ 0% {{opacity:1;}} 50% {{opacity:0.2;}} 100% {{opacity:1;}} }}
-    #refresh-indicator {{ opacity:0; transition:opacity 0.3s; }}
-    #refresh-indicator.show {{ opacity:1; }}
+                    # Write full page (clean modular shell + live client controllers)
+                    full_html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#06080d">
+    <title>F-Intel | Quantitative Volatility & Options Terminal</title>
     
-    @media (max-width: 768px) {{
-        body {{ padding: 4px; font-size: 13px; }}
-        .header {{ flex-direction: column; align-items: flex-start; gap: 10px; }}
-        .header > div {{ flex-direction: column; align-items: flex-start !important; gap: 5px !important; }}
-        .title {{ font-size: 14px; }}
-        #spot-display {{ font-size: 26px !important; }}
-        .tab-bar {{ overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }}
-        .tab-btn {{ flex: 0 0 auto; padding: 12px 16px; min-height: 44px; }}
-        .card > div {{ grid-template-columns: 1fr !important; }}
-        .metric-box {{ min-width: 100%; margin-bottom: 8px; }}
-        .data-table {{ display: block; overflow-x: auto; white-space: nowrap; }}
-        .plotly-graph-div {{ width: 100% !important; min-height: 300px; }}
-        button, input {{ min-height: 44px; font-size: 16px; }}
-        #verdict-container {{ margin-left: 0 !important; width: 100%; }}
-        #verdict-container > div {{ width: 100%; }}
-    }}
-</style>
-</head><body>
-    <div class="header">
-        <div style="display:flex;align-items:center;gap:20px;">
-            <div><span class="title">UNIFIED VOLATILITY DASHBOARD</span>
-                 <span style="color:{MUTED};font-size:13px;">  |  {self.symbol}</span></div>
-        </div>
-        <div style="display:flex;align-items:center;gap:20px;">
-            <div id="spot-display" style="font-size:22px;font-weight:900;color:{ACCENT};">SPOT: {spot:,.2f}</div>
-            <div style="display:flex;flex-direction:column;align-items:center;border-left:1px solid #333;padding-left:15px;">
-                <div style="font-size:10px;color:{MUTED};font-weight:700;text-transform:uppercase;">Intraday Momentum</div>
-                <div style="font-size:14px;font-weight:700;color:{GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">
-                    {momentum_data['status']} (V:{momentum_data['vwap']} | E:{momentum_data['ema']})
-                </div>
+    <!-- Google Fonts & Plotly -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/static/manifest.json">
+
+    <!-- Stylesheets -->
+    <link rel="stylesheet" href="/static/css/theme.css">
+    <link rel="stylesheet" href="/static/css/layout.css">
+    <link rel="stylesheet" href="/static/css/gamma_explosion.css">
+</head>
+<body>
+    <!-- Hardware-Accelerated Quant Lattice Background -->
+    <canvas id="quant-bg-canvas"></canvas>
+
+    <!-- Top Navigation Header -->
+    <header class="top-nav">
+        <div class="brand-section">
+            <div class="brand-logo">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent-cyan);">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                </svg>
+                <span>F-INTEL</span>
             </div>
-            <div id="verdict-container" style="margin-left:10px;">
-                {verdict_html}
+            <span class="brand-badge">PRO QUANT</span>
+            <div id="top-verdict-pill" style="display:inline-flex;">{verdict_html}</div>
+        </div>
+
+        <div class="market-strip">
+            <div id="spot-display" class="spot-pill">
+                SPOT: <span class="spot-val">{spot:,.2f}</span>
+            </div>
+
+            <div class="system-badges">
+                <span id="ws-status-badge" class="status-indicator" style="background:rgba(255,255,255,0.08); color:var(--text-muted); border:1px solid var(--border-subtle);">
+                    <span class="pulse-dot"></span> LIVE
+                </span>
+                <span id="time-display" class="num-mono" style="font-size:12px; color:var(--text-muted);">
+                    &#128339; {now_str}
+                </span>
+            </div>
+
+            <div class="fx-toggle-wrap">
+                <span>FX</span>
+                <label class="fx-toggle" title="Toggle Ambient Background Animation">
+                    <input type="checkbox" id="fx-toggle-input" checked>
+                    <span class="fx-slider"></span>
+                </label>
             </div>
         </div>
-        <div>
-            <span id="live-pulse"></span>
-            <span style="color:{GREEN};font-size:12px;font-weight:700;">LIVE</span>
-            <span id="time-display" style="color:{MUTED};font-size:11px;"> {now_str} | 15s refresh</span>
-            <span id="refresh-indicator" style="color:{ACCENT};font-size:11px;margin-left:8px;">&#8635; Updating...</span>
-        </div>
-    </div>
-
-    <div class="tab-bar">
-        <div class="tab-btn active" onclick="switchTab('regime')">Regime Engine</div>
-        <div class="tab-btn" onclick="switchTab('iv')">IV Surface</div>
-        <div class="tab-btn" onclick="switchTab('vol')">Vol Intelligence</div>
-        <div class="tab-btn" onclick="switchTab('chain')">Option Chain Analyser</div>
-        <div class="tab-btn" onclick="switchTab('theta')">Theta Decay</div>
-        <div class="tab-btn" onclick="switchTab('prob')">Prob Density</div>
-        <div class="tab-btn" onclick="switchTab('mm')">Market Maker Positioning</div>
-    </div>
-
-    <div id="tab-regime" class="tab-content active">{regime_tab_html}</div>
-    <div id="tab-iv" class="tab-content">{iv_tab_html}</div>
-    <div id="tab-vol" class="tab-content">{vol_tab_html}</div>
-    <div id="tab-chain" class="tab-content">{chain_tab_html}</div>
-    <div id="tab-theta" class="tab-content">{theta_tab_html}</div>
-    <div id="tab-prob" class="tab-content">{prob_tab_html}</div>
-    <div id="tab-mm" class="tab-content">{mm_tab_html}</div>
-
-    <script>
-    var tabMap = {{'regime':0, 'iv':1,'vol':2,'chain':3,'theta':4,'prob':5, 'mm':6}};
-    var activeTab = localStorage.getItem('volDashActiveTab') || 'regime';
-
-    function resizePlots(tabId) {{
-        var target = tabId || activeTab;
-        var el = document.getElementById('tab-' + target);
-        if (!el) return;
-        window.dispatchEvent(new Event('resize'));
-        el.querySelectorAll('.plotly-graph-div').forEach(function(g) {{
-            if (window.Plotly && Plotly.Plots) {{
-                try {{
-                    Plotly.Plots.resize(g);
-                    Plotly.relayout(g, {{autosize: true}});
-                }} catch(e) {{}}
-            }}
-        }});
-    }}
-
-    function switchTab(id) {{
-        document.querySelectorAll('.tab-content').forEach(function(t) {{ t.classList.remove('active'); }});
-        document.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
-        var el = document.getElementById('tab-' + id);
-        if (el) el.classList.add('active');
-        var idx = tabMap[id];
-        if (idx !== undefined) {{
-            var btns = document.querySelectorAll('.tab-btn');
-            if (btns[idx]) btns[idx].classList.add('active');
-        }}
-        activeTab = id;
-        try {{ localStorage.setItem('volDashActiveTab', id); }} catch(e) {{}}
-
-        if (typeof requestAnimationFrame !== 'undefined') {{
-            requestAnimationFrame(function() {{ resizePlots(id); }});
-        }}
-        setTimeout(function() {{ resizePlots(id); }}, 40);
-        setTimeout(function() {{ resizePlots(id); }}, 150);
-
-        if (id === 'theta') {{
-            applyThetaFilters();
-            ensureThetaChartsRendered();
-            updateAutoLockBtn();
-            recalcThetaSimClient();
-            if (autoLockATM) {{
-                setTimeout(lockTableToATM, 60);
-                setTimeout(lockTableToATM, 200);
-            }}
-        }}
-    }}
-
-    // Restore active tab on first load
-    (function() {{
-        var saved = localStorage.getItem('volDashActiveTab');
-        if (saved && document.getElementById('tab-' + saved)) {{
-            switchTab(saved);
-        }}
-    }})();
-
-    // Seamless refresh — fetch fragment from DataServer (works locally and via Cloudflare tunnel)
-    var FRAG_URL = '/fragment';
-
-    function refreshContent() {{
-        var indicator = document.getElementById('refresh-indicator');
-        if (indicator) indicator.classList.add('show');
-
-        // Capture scroll position before fragment replacement to eliminate jumping
-        var prevThetaContainer = document.getElementById('theta-table-container');
-        var prevThetaScroll = prevThetaContainer ? prevThetaContainer.scrollTop : null;
-
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', FRAG_URL + '?t=' + Date.now(), true);
-        xhr.onload = function() {{
-            if (xhr.status === 200) {{
-                var tmp = document.createElement('div');
-                tmp.innerHTML = xhr.responseText;
-                // Swap each tab's content
-                ['regime', 'iv', 'vol', 'chain', 'theta', 'prob', 'mm'].forEach(function(id) {{
-                    var fragEl = tmp.querySelector('#frag-' + id);
-                    var tabEl = document.getElementById('tab-' + id);
-                    if (fragEl && tabEl) {{
-                        if (id === 'theta' && !fragEl.querySelector('#btn-th-recalc')) {{
-                            // Preserve modern tab-theta DOM and refresh data dynamically
-                            if (activeTab === 'theta') {{
-                                fetchAndRenderThetaCharts(currentThetaModel);
-                            }}
-                        }} else {{
-                            tabEl.innerHTML = fragEl.innerHTML;
-                            executeScripts(tabEl);
-                        }}
-                    }}
-                }});
-                // Update header spot + time from fragment metadata
-                var meta = tmp.querySelector('#frag-spot');
-                if (meta) {{
-                    var sVal = meta.getAttribute('data-spot');
-                    var tVal = meta.getAttribute('data-time');
-                    document.getElementById('spot-display').innerHTML = 'SPOT: ' + Number(sVal).toLocaleString(undefined, {{minimumFractionDigits: 2}});
-                    var timeEl = document.getElementById('time-display');
-                    if (timeEl && tVal) timeEl.innerHTML = '&#128339; ' + tVal + ' &nbsp;|&nbsp; &#8635; Updated';
-                }}
-                // Re-activate current tab (restores button highlight after DOM swap)
-                switchTab(activeTab);
-
-                // Preserve or auto-lock table scroll position around ATM
-                var newThetaContainer = document.getElementById('theta-table-container');
-                if (newThetaContainer) {{
-                    if (autoLockATM) {{
-                        lockTableToATM();
-                    }} else if (prevThetaScroll !== null) {{
-                        newThetaContainer.scrollTop = prevThetaScroll;
-                    }}
-                }}
-                updateAutoLockBtn();
-            }}
-            if (indicator) setTimeout(function(){{ indicator.classList.remove('show'); }}, 500);
-        }};
-        xhr.onerror = function() {{
-            if (indicator) indicator.classList.remove('show');
-        }};
-        xhr.send();
-    }}
-
-    // Re-execute scripts injected via innerHTML (needed for Plotly charts to render)
-    function executeScripts(container) {{
-        container.querySelectorAll('script').forEach(function(old) {{
-            var s = document.createElement('script');
-            Array.from(old.attributes).forEach(function(a) {{ s.setAttribute(a.name, a.value); }});
-            s.textContent = old.textContent;
-            old.parentNode.replaceChild(s, old);
-        }});
-    }}
-
-    // ── Theta Decay Dynamic Interactive Handlers ──
-    var currentThetaType = sessionStorage.getItem('th_type') || 'CE';
-    var currentThetaModel = sessionStorage.getItem('th_model') || 'bsm';
-    var currentThetaRange = sessionStorage.getItem('th_range') || '10';
-    var currentThetaFocus = sessionStorage.getItem('th_focus') || 'all';
-    var autoLockATM = (localStorage.getItem('th_autolock') !== 'false');
-    var activeSimStrike = null;
-    var simMin = 0;
-    var simDays = 0;
-    var simSpotShock = 0;
-    var simIVShock = 0;
-
-    function lockTableToATM() {{
-        var container = document.getElementById('theta-table-container');
-        if (!container) return;
-        var atmRow = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]');
-        if (atmRow) {{
-            var rowTop = atmRow.offsetTop;
-            var targetScroll = Math.max(0, rowTop - (container.clientHeight / 2) + (atmRow.clientHeight / 2));
-            container.scrollTop = targetScroll;
-        }}
-    }}
-
-    function toggleAutoLockATM(btn) {{
-        autoLockATM = !autoLockATM;
-        try {{ localStorage.setItem('th_autolock', autoLockATM ? 'true' : 'false'); }} catch(e) {{}}
-        updateAutoLockBtn(btn);
-        if (autoLockATM) {{
-            lockTableToATM();
-        }}
-    }}
-
-    function updateAutoLockBtn(btn) {{
-        var b = btn || document.getElementById('btn-th-autolock');
-        if (!b) return;
-        if (autoLockATM) {{
-            b.innerHTML = '&#128274; Lock ATM: ON';
-            b.style.background = 'rgba(16,185,129,0.18)';
-            b.style.color = '#10b981';
-            b.style.borderColor = '#10b981';
-        }} else {{
-            b.innerHTML = '&#128275; Lock ATM: OFF';
-            b.style.background = 'rgba(255,255,255,0.05)';
-            b.style.color = '#888888';
-            b.style.borderColor = '#444444';
-        }}
-    }}
-
-    function refreshThetaDecay(btn) {{
-        var b = btn || document.getElementById('btn-th-recalc');
-        if (b) {{
-            b.innerHTML = '&#8635; Recalculating...';
-            b.style.opacity = '0.75';
-            b.disabled = true;
-        }}
-        fetchAndRenderThetaCharts(currentThetaModel, function() {{
-            if (b) {{
-                b.innerHTML = '&#10003; Updated';
-                b.style.opacity = '1';
-                setTimeout(function() {{
-                    b.innerHTML = '&#8635; Recalculate Model';
-                    b.disabled = false;
-                }}, 1000);
-            }}
-            recalcThetaSimClient();
-            if (autoLockATM) {{
-                setTimeout(lockTableToATM, 60);
-            }}
-        }});
-    }}
-
-    function setThetaTableFocus(focus) {{
-        currentThetaFocus = focus;
-        try {{ sessionStorage.setItem('th_focus', focus); }} catch(e) {{}}
-        ['all', 'seller', 'buyer'].forEach(function(f) {{
-            var el = document.getElementById('btn-focus-' + f);
-            if (el) el.classList.toggle('active', f === focus);
-        }});
-        applyThetaFilters();
-    }}
-
-    var currentThetaUnit = sessionStorage.getItem('th_unit') || 'INR';
-
-    function setThetaUnit(unit) {{
-        currentThetaUnit = unit;
-        try {{ sessionStorage.setItem('th_unit', unit); }} catch(e) {{}}
-        var btnInr = document.getElementById('btn-unit-inr');
-        var btnPts = document.getElementById('btn-unit-pts');
-        if (btnInr && btnPts) {{
-            if (unit === 'INR') {{
-                btnInr.style.background = '#0284c7';
-                btnInr.style.color = '#ffffff';
-                btnPts.style.background = 'transparent';
-                btnPts.style.color = '#94a3b8';
-            }} else {{
-                btnPts.style.background = '#0284c7';
-                btnPts.style.color = '#ffffff';
-                btnInr.style.background = 'transparent';
-                btnInr.style.color = '#94a3b8';
-            }}
-        }}
-        updateExecutiveDecayCards(activeSimStrike);
-    }}
-
-    function updateExecutiveDecayCards(strike) {{
-        var container = document.getElementById('theta-table-container');
-        if (!container) return;
-        var row = null;
-        if (strike) {{
-            row = container.querySelector('tr[data-strike="' + strike + '"]');
-        }}
-        if (!row) {{
-            row = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]') || container.querySelector('tbody tr');
-        }}
-        if (!row) return;
-
-        var sVal = parseFloat(row.getAttribute('data-strike')) || 23400;
-        var cLtp = parseFloat(row.getAttribute('data-ce-ltp')) || 0;
-        var pLtp = parseFloat(row.getAttribute('data-pe-ltp')) || 0;
-        var stLtp = parseFloat(row.getAttribute('data-strad-ltp')) || (cLtp + pLtp);
-
-        var cThLot = parseFloat(row.getAttribute('data-ce-theta')) || 0;
-        var pThLot = parseFloat(row.getAttribute('data-pe-theta')) || 0;
-        var stThLot = parseFloat(row.getAttribute('data-strad-theta')) || (cThLot + pThLot);
-
-        var extPts = parseFloat(row.getAttribute('data-ext-pts')) || 0;
-        var extInr = parseFloat(row.getAttribute('data-ext-inr')) || 0;
-        var gamma = parseFloat(row.getAttribute('data-strad-gam')) || 0.003;
-        var delta = parseFloat(row.getAttribute('data-delta')) || 0;
-        var yieldVal = parseFloat(row.getAttribute('data-yield')) || 0;
-        var lot = 65;
-
-        // Update strike labels on cards
-        var lblCeS = document.getElementById('card-ce-strike');
-        if (lblCeS) lblCeS.textContent = sVal.toLocaleString('en-IN');
-        var lblPeS = document.getElementById('card-pe-strike');
-        if (lblPeS) lblPeS.textContent = sVal.toLocaleString('en-IN');
-        var lblStS = document.getElementById('card-strad-strike');
-        if (lblStS) lblStS.textContent = sVal.toLocaleString('en-IN');
-
-        // LTPs
-        var elCeP = document.getElementById('card-ce-price');
-        if (elCeP) elCeP.textContent = 'LTP: ₹' + cLtp.toFixed(1);
-        var elPeP = document.getElementById('card-pe-price');
-        if (elPeP) elPeP.textContent = 'LTP: ₹' + pLtp.toFixed(1);
-        var elStP = document.getElementById('card-strad-price');
-        if (elStP) elStP.textContent = 'LTP: ₹' + stLtp.toFixed(1);
-
-        // Values according to currentThetaUnit
-        var isINR = (currentThetaUnit === 'INR');
-
-        // CALL Card
-        var elCeDay = document.getElementById('card-ce-day');
-        if (elCeDay) elCeDay.textContent = isINR ? '-₹' + Math.round(Math.abs(cThLot)).toLocaleString('en-IN') : '-' + Math.abs(cThLot / lot).toFixed(1) + ' pts';
-        var elCeDaySub = document.getElementById('card-ce-day-sub');
-        if (elCeDaySub) elCeDaySub.textContent = isINR ? '-' + Math.abs(cThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(cThLot)).toLocaleString('en-IN') + '/d';
-
-        var elCeHr = document.getElementById('card-ce-hour');
-        if (elCeHr) elCeHr.textContent = isINR ? '-₹' + Math.round(Math.abs(cThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(cThLot / (lot * 6.25)).toFixed(2) + ' pts';
-        var elCeHrSub = document.getElementById('card-ce-hour-sub');
-        if (elCeHrSub) elCeHrSub.textContent = isINR ? '-' + Math.abs(cThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(cThLot / 6.25)).toLocaleString('en-IN') + '/h';
-
-        var elCeMin = document.getElementById('card-ce-min');
-        if (elCeMin) elCeMin.textContent = isINR ? '-₹' + Math.abs(cThLot / 375.0).toFixed(2) : '-' + Math.abs(cThLot / (lot * 375.0)).toFixed(3) + ' pts';
-        var elCeMinSub = document.getElementById('card-ce-min-sub');
-        if (elCeMinSub) elCeMinSub.textContent = isINR ? '-' + Math.abs(cThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(cThLot / 375.0).toFixed(2) + '/m';
-
-        var elCeExp = document.getElementById('card-ce-exp');
-        if (elCeExp) elCeExp.textContent = isINR ? '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') : (extPts / 2.0).toFixed(1) + ' pts';
-        var elCeExpSub = document.getElementById('card-ce-exp-sub');
-        if (elCeExpSub) elCeExpSub.textContent = isINR ? (extPts / 2.0).toFixed(1) + ' pts ext' : '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') + ' ext';
-
-        // PUT Card
-        var elPeDay = document.getElementById('card-pe-day');
-        if (elPeDay) elPeDay.textContent = isINR ? '-₹' + Math.round(Math.abs(pThLot)).toLocaleString('en-IN') : '-' + Math.abs(pThLot / lot).toFixed(1) + ' pts';
-        var elPeDaySub = document.getElementById('card-pe-day-sub');
-        if (elPeDaySub) elPeDaySub.textContent = isINR ? '-' + Math.abs(pThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(pThLot)).toLocaleString('en-IN') + '/d';
-
-        var elPeHr = document.getElementById('card-pe-hour');
-        if (elPeHr) elPeHr.textContent = isINR ? '-₹' + Math.round(Math.abs(pThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(pThLot / (lot * 6.25)).toFixed(2) + ' pts';
-        var elPeHrSub = document.getElementById('card-pe-hour-sub');
-        if (elPeHrSub) elPeHrSub.textContent = isINR ? '-' + Math.abs(pThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(pThLot / 6.25)).toLocaleString('en-IN') + '/h';
-
-        var elPeMin = document.getElementById('card-pe-min');
-        if (elPeMin) elPeMin.textContent = isINR ? '-₹' + Math.abs(pThLot / 375.0).toFixed(2) : '-' + Math.abs(pThLot / (lot * 375.0)).toFixed(3) + ' pts';
-        var elPeMinSub = document.getElementById('card-pe-min-sub');
-        if (elPeMinSub) elPeMinSub.textContent = isINR ? '-' + Math.abs(pThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(pThLot / 375.0).toFixed(2) + '/m';
-
-        var elPeExp = document.getElementById('card-pe-exp');
-        if (elPeExp) elPeExp.textContent = isINR ? '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') : (extPts / 2.0).toFixed(1) + ' pts';
-        var elPeExpSub = document.getElementById('card-pe-exp-sub');
-        if (elPeExpSub) elPeExpSub.textContent = isINR ? (extPts / 2.0).toFixed(1) + ' pts ext' : '₹' + Math.round(extInr / 2.0).toLocaleString('en-IN') + ' ext';
-
-        // STRADDLE Card
-        var elStDay = document.getElementById('card-strad-day');
-        if (elStDay) elStDay.textContent = isINR ? '-₹' + Math.round(Math.abs(stThLot)).toLocaleString('en-IN') : '-' + Math.abs(stThLot / lot).toFixed(1) + ' pts';
-        var elStDaySub = document.getElementById('card-strad-day-sub');
-        if (elStDaySub) elStDaySub.textContent = isINR ? '-' + Math.abs(stThLot / lot).toFixed(1) + ' pts/d' : '-₹' + Math.round(Math.abs(stThLot)).toLocaleString('en-IN') + '/d';
-
-        var elStHr = document.getElementById('card-strad-hour');
-        if (elStHr) elStHr.textContent = isINR ? '-₹' + Math.round(Math.abs(stThLot / 6.25)).toLocaleString('en-IN') : '-' + Math.abs(stThLot / (lot * 6.25)).toFixed(2) + ' pts';
-        var elStHrSub = document.getElementById('card-strad-hour-sub');
-        if (elStHrSub) elStHrSub.textContent = isINR ? '-' + Math.abs(stThLot / (lot * 6.25)).toFixed(2) + ' pts/h' : '-₹' + Math.round(Math.abs(stThLot / 6.25)).toLocaleString('en-IN') + '/h';
-
-        var elStMin = document.getElementById('card-strad-min');
-        if (elStMin) elStMin.textContent = isINR ? '-₹' + Math.abs(stThLot / 375.0).toFixed(2) : '-' + Math.abs(stThLot / (lot * 375.0)).toFixed(3) + ' pts';
-        var elStMinSub = document.getElementById('card-strad-min-sub');
-        if (elStMinSub) elStMinSub.textContent = isINR ? '-' + Math.abs(stThLot / (lot * 375.0)).toFixed(3) + ' pts/m' : '-₹' + Math.abs(stThLot / 375.0).toFixed(2) + '/m';
-
-        var elStExp = document.getElementById('card-strad-exp');
-        if (elStExp) elStExp.textContent = isINR ? '₹' + Math.round(extInr).toLocaleString('en-IN') : extPts.toFixed(1) + ' pts';
-        var elStExpSub = document.getElementById('card-strad-exp-sub');
-        if (elStExpSub) elStExpSub.textContent = isINR ? extPts.toFixed(1) + ' pts ext' : '₹' + Math.round(extInr).toLocaleString('en-IN') + ' ext';
-
-        // Renormalized Alpha Metric
-        var em = 250.0;
-        var emEl = document.getElementById('attr-em-pts');
-        if (emEl) {{
-            var m = emEl.textContent.match(/[0-9,.]+/);
-            if (m) em = parseFloat(m[0].replace(/,/g, '')) || em;
-        }}
-        var gammaHazard = 0.5 * gamma * (em * em) * lot;
-        var renormAlpha = Math.abs(stThLot) / Math.max(gammaHazard, 1.0);
-        var elAlpha = document.getElementById('card-strad-alpha');
-        if (elAlpha) {{
-            var aCol = renormAlpha >= 1.0 ? '#10b981' : (renormAlpha >= 0.7 ? '#ffd54f' : '#ef5350');
-            var aLabel = renormAlpha >= 1.0 ? 'Alpha Edge' : (renormAlpha >= 0.7 ? 'Buffer Zone' : 'Gamma Drag');
-            elAlpha.textContent = renormAlpha.toFixed(2) + ' (' + aLabel + ')';
-            elAlpha.style.color = aCol;
-        }}
-    }}
-
-    function selectSimStrike(strike) {{
-        activeSimStrike = strike;
-        var sel = document.getElementById('sel-th-strike');
-        if (sel && sel.value !== String(strike)) {{
-            sel.value = String(strike);
-        }}
-        var container = document.getElementById('theta-table-container');
-        if (container) {{
-            var allRows = container.querySelectorAll('tbody tr');
-            allRows.forEach(function(r) {{
-                var s = parseFloat(r.getAttribute('data-strike'));
-                if (s === strike) {{
-                    r.style.boxShadow = 'inset 0 0 0 2px #0284c7';
-                }} else {{
-                    r.style.boxShadow = '';
-                }}
-            }});
-        }}
-        updateExecutiveDecayCards(strike);
-        recalcThetaSimClient();
-    }}
-
-    function onThetaSimSliderChange() {{
-        var minEl = document.getElementById('slider-sim-min');
-        var daysEl = document.getElementById('slider-sim-days');
-        var spotEl = document.getElementById('slider-sim-spot');
-        var ivEl = document.getElementById('slider-sim-iv');
-
-        simMin = minEl ? parseFloat(minEl.value) : 0;
-        simDays = daysEl ? parseFloat(daysEl.value) : 0;
-        simSpotShock = spotEl ? parseFloat(spotEl.value) : 0;
-        simIVShock = ivEl ? parseFloat(ivEl.value) : 0;
-
-        var lblMin = document.getElementById('lbl-sim-min');
-        if (lblMin) lblMin.textContent = '+' + simMin + ' min';
-
-        var lblDays = document.getElementById('lbl-sim-days');
-        if (lblDays) lblDays.textContent = '+' + simDays.toFixed(1) + ' days';
-
-        var spotBase = 23450;
-        var spotElDisplay = document.getElementById('spot-display');
-        if (spotElDisplay) {{
-            var m = spotElDisplay.textContent.match(/[0-9,.]+/);
-            if (m) spotBase = parseFloat(m[0].replace(/,/g, '')) || spotBase;
-        }}
-
-        var em = 250.0;
-        var emEl = document.getElementById('attr-em-pts');
-        if (emEl) {{
-            var mEm = emEl.textContent.match(/[0-9,.]+/);
-            if (mEm) em = parseFloat(mEm[0].replace(/,/g, '')) || em;
-        }}
-        var zScore = (simSpotShock / Math.max(em, 1.0)).toFixed(1);
-
-        var lblSpot = document.getElementById('lbl-sim-spot');
-        if (lblSpot) lblSpot.textContent = (simSpotShock >= 0 ? '+' : '') + simSpotShock + ' pts (' + (zScore >= 0 ? '+' : '') + zScore + 'σ)';
-
-        var lblIv = document.getElementById('lbl-sim-iv');
-        if (lblIv) lblIv.textContent = (simIVShock >= 0 ? '+' : '') + simIVShock.toFixed(1) + '%';
-
-        recalcThetaSimClient();
-    }}
-
-    function setSimSpotPreset(pts) {{
-        var spotEl = document.getElementById('slider-sim-spot');
-        if (spotEl) spotEl.value = pts;
-        onThetaSimSliderChange();
-    }}
-
-    function setSimTimePreset(mins) {{
-        var minEl = document.getElementById('slider-sim-min');
-        if (minEl) minEl.value = mins;
-        onThetaSimSliderChange();
-    }}
-
-    function setSimDaysPreset(days) {{
-        var daysEl = document.getElementById('slider-sim-days');
-        if (daysEl) daysEl.value = days;
-        onThetaSimSliderChange();
-    }}
-
-    function setSimIVPreset(iv) {{
-        var ivEl = document.getElementById('slider-sim-iv');
-        if (ivEl) ivEl.value = iv;
-        onThetaSimSliderChange();
-    }}
-
-    function resetSimSpot() {{
-        var spotEl = document.getElementById('slider-sim-spot');
-        if (spotEl) spotEl.value = 0;
-        onThetaSimSliderChange();
-    }}
-
-    function resetSimIV() {{
-        var ivEl = document.getElementById('slider-sim-iv');
-        if (ivEl) ivEl.value = 0;
-        onThetaSimSliderChange();
-    }}
-
-    function resetSimShocks() {{
-        var minEl = document.getElementById('slider-sim-min');
-        var daysEl = document.getElementById('slider-sim-days');
-        var spotEl = document.getElementById('slider-sim-spot');
-        var ivEl = document.getElementById('slider-sim-iv');
-        if (minEl) minEl.value = 0;
-        if (daysEl) daysEl.value = 0;
-        if (spotEl) spotEl.value = 0;
-        if (ivEl) ivEl.value = 0;
-        onThetaSimSliderChange();
-    }}
-
-    function recalcThetaSimClient() {{
-        var container = document.getElementById('theta-table-container');
-        if (!container) return;
-
-        var targetRow = null;
-        if (activeSimStrike) {{
-            targetRow = container.querySelector('tr[data-strike="' + activeSimStrike + '"]');
-        }}
-        if (!targetRow) {{
-            targetRow = document.getElementById('th-row-atm') || container.querySelector('tr[data-is-atm="true"]') || container.querySelector('tbody tr');
-        }}
-        if (!targetRow) return;
-
-        var stradLtp = parseFloat(targetRow.getAttribute('data-strad-ltp')) || 260.0;
-        var extPts = parseFloat(targetRow.getAttribute('data-ext-pts')) || (stradLtp * 0.9);
-        var thDayLot = parseFloat(targetRow.getAttribute('data-strad-theta')) || -3750.0;
-        var gamma = parseFloat(targetRow.getAttribute('data-strad-gam')) || 0.0032;
-        var delta = parseFloat(targetRow.getAttribute('data-delta')) || 0.0;
-        var vega = parseFloat(targetRow.getAttribute('data-vega')) || 30.0;
-        var cushion = parseFloat(targetRow.getAttribute('data-cushion')) || 120.0;
-        var lot = 65;
-
-        var dtTotalDays = (simMin / 375.0) + simDays;
-        var dS = simSpotShock;
-        var dSig = simIVShock;
-
-        // 2nd Order Greek Taylor Attribution:
-        // dP = (Theta/lot) * dt + Delta * dS + 0.5 * Gamma * (dS^2) + Vega * dSig
-        var dP_theta = (thDayLot / lot) * dtTotalDays; // theta is negative (burns premium)
-        var dP_delta = delta * dS;
-        var dP_gamma = 0.5 * gamma * (dS * dS);
-        var dP_vega = vega * dSig;
-
-        var dP_total = dP_theta + dP_delta + dP_gamma + dP_vega;
-        var newLtp = Math.max(0.05, stradLtp + dP_total);
-        var pnlSellerShare = stradLtp - newLtp;
-        var pnlSellerLot = pnlSellerShare * lot;
-        var pnlSellerPct = (pnlSellerShare / stradLtp) * 100.0;
-
-        var pnlBuyerLot = -pnlSellerLot;
-        var pnlBuyerPct = -pnlSellerPct;
-
-        // Projected Straddle LTP
-        var elPrice = document.getElementById('sim-res-price');
-        if (elPrice) elPrice.textContent = '₹' + newLtp.toFixed(1);
-        var elPriceSub = document.getElementById('sim-res-price-sub');
-        if (elPriceSub) elPriceSub.textContent = 'Base: ₹' + stradLtp.toFixed(1) + ' (Δ: ' + (dP_total >= 0 ? '+' : '') + dP_total.toFixed(1) + ')';
-
-        // Seller P&L
-        var elPnlS = document.getElementById('sim-res-seller-pnl');
-        if (elPnlS) {{
-            var signS = pnlSellerLot >= 0 ? '+' : '';
-            var colS = pnlSellerLot >= 0 ? '#10b981' : '#ef5350';
-            elPnlS.innerHTML = '<span style="color:' + colS + ';">' + signS + '₹' + Math.round(pnlSellerLot).toLocaleString('en-IN') + ' (' + signS + pnlSellerPct.toFixed(1) + '%)</span>';
-        }}
-
-        // Buyer P&L
-        var elPnlB = document.getElementById('sim-res-buyer-pnl');
-        if (elPnlB) {{
-            var signB = pnlBuyerLot >= 0 ? '+' : '';
-            var colB = pnlBuyerLot >= 0 ? '#10b981' : '#ef5350';
-            elPnlB.innerHTML = '<span style="color:' + colB + ';">' + signB + '₹' + Math.round(pnlBuyerLot).toLocaleString('en-IN') + ' (' + signB + pnlBuyerPct.toFixed(1) + '%)</span>';
-        }}
-
-        // Greek Attribution Cards
-        var elTh = document.getElementById('attr-th-val');
-        if (elTh) {{
-            var thGain = Math.abs(dP_theta * lot);
-            elTh.textContent = '+₹' + Math.round(thGain).toLocaleString('en-IN');
-        }}
-
-        var elDel = document.getElementById('attr-del-val');
-        if (elDel) {{
-            var delImpact = -dP_delta * lot; // from seller perspective
-            var sDel = delImpact >= 0 ? '+' : '-';
-            elDel.textContent = sDel + '₹' + Math.round(Math.abs(delImpact)).toLocaleString('en-IN');
-            elDel.style.color = delImpact >= 0 ? '#38bdf8' : '#ef5350';
-        }}
-
-        var elGam = document.getElementById('attr-gam-val');
-        if (elGam) {{
-            var gamCost = dP_gamma * lot;
-            elGam.textContent = '-₹' + Math.round(gamCost).toLocaleString('en-IN');
-        }}
-
-        var elVeg = document.getElementById('attr-veg-val');
-        if (elVeg) {{
-            var vegImpact = -dP_vega * lot;
-            var sVeg = vegImpact >= 0 ? '+' : '-';
-            elVeg.textContent = sVeg + '₹' + Math.round(Math.abs(vegImpact)).toLocaleString('en-IN');
-            elVeg.style.color = vegImpact >= 0 ? '#c084fc' : '#ef5350';
-        }}
-
-        // Attribution Formula Text
-        var elFormula = document.getElementById('formula-text');
-        if (elFormula) {{
-            var thSign = dP_theta <= 0 ? '+' : '-';
-            var thLotVal = Math.round(Math.abs(dP_theta * lot));
-            var delLotVal = Math.round(dP_delta * lot);
-            var gamLotVal = Math.round(dP_gamma * lot);
-            var vegLotVal = Math.round(dP_vega * lot);
-            var totLotVal = Math.round(pnlSellerLot);
-            elFormula.textContent = 'ΔP = Θ(' + thSign + '₹' + thLotVal.toLocaleString('en-IN') + ') + Δ(' + (delLotVal >= 0 ? '+' : '') + '₹' + delLotVal.toLocaleString('en-IN') + ') - ½Γ(₹' + gamLotVal.toLocaleString('en-IN') + ') + V(' + (vegLotVal >= 0 ? '+' : '') + '₹' + vegLotVal.toLocaleString('en-IN') + ') = ' + (totLotVal >= 0 ? '+' : '') + '₹' + totLotVal.toLocaleString('en-IN');
-        }}
-
-        // Position Retention Guide
-        var cardAction = document.getElementById('sim-res-action-card');
-        var titleAction = document.getElementById('sim-res-action-title');
-        var descAction = document.getElementById('sim-res-action-desc');
-
-        if (cardAction && titleAction && descAction) {{
-            var decayCaptured = (pnlSellerShare / Math.max(extPts, 1.0)) * 100.0;
-            if (Math.abs(dS) > cushion * 1.1) {{
-                titleAction.textContent = 'DEFEND / ROLL WINGS';
-                titleAction.style.color = '#ef5350';
-                cardAction.style.borderColor = 'rgba(239,68,68,0.5)';
-                cardAction.style.background = 'rgba(239,68,68,0.14)';
-                descAction.textContent = 'Spot breached cushion (±' + cushion.toFixed(0) + ' pts). Gamma hazard.';
-            }} else if (decayCaptured >= 75.0 || newLtp <= (stradLtp * 0.25)) {{
-                titleAction.textContent = 'TAKE PROFIT (HARVESTED)';
-                titleAction.style.color = '#ffd54f';
-                cardAction.style.borderColor = 'rgba(255,213,79,0.5)';
-                cardAction.style.background = 'rgba(255,213,79,0.14)';
-                descAction.textContent = 'Captured >75% of extrinsic decay. Risk/reward now favors closing.';
-            }} else {{
-                titleAction.textContent = 'STAY IN TRADE';
-                titleAction.style.color = '#10b981';
-                cardAction.style.borderColor = 'rgba(16,185,129,0.5)';
-                cardAction.style.background = 'rgba(16,185,129,0.14)';
-                descAction.textContent = 'Extrinsic burn active. Underlying within safe ±' + cushion.toFixed(0) + ' pts cushion.';
-            }}
-        }}
-
-        // Highlight matching row in Scenarios Table
-        var em = 250.0;
-        var emEl = document.getElementById('attr-em-pts');
-        if (emEl) {{
-            var mEm = emEl.textContent.match(/[0-9,.]+/);
-            if (mEm) em = parseFloat(mEm[0].replace(/,/g, '')) || em;
-        }}
-        var curZ = dS / Math.max(em, 1.0);
-        var scenTable = document.getElementById('scenarios-table');
-        if (scenTable) {{
-            var scenRows = scenTable.querySelectorAll('tbody tr');
-            var closestRow = null;
-            var minZDiff = 999;
-            scenRows.forEach(function(sr) {{
-                var zVal = parseFloat(sr.getAttribute('data-z'));
-                if (!isNaN(zVal)) {{
-                    var diff = Math.abs(zVal - curZ);
-                    if (diff < minZDiff) {{
-                        minZDiff = diff;
-                        closestRow = sr;
-                    }}
-                }}
-                sr.style.background = '';
-            }});
-            if (closestRow && minZDiff <= 0.3) {{
-                closestRow.style.background = 'rgba(2,132,199,0.25)';
-            }}
-        }}
-    }}
-
-    function applyThetaFilters() {{
-        var rangePct = parseFloat(currentThetaRange) || 10;
-        var spotEl = document.getElementById('spot-display');
-        var spot = 23450;
-        if (spotEl) {{
-            var m = spotEl.textContent.match(/[0-9,.]+/);
-            if (m) spot = parseFloat(m[0].replace(/,/g, '')) || spot;
-        }}
-
-        var tbl = document.getElementById('theta-decay-table');
-        if (tbl) {{
-            var allTrs = tbl.querySelectorAll('tr');
-            allTrs.forEach(function(r) {{
-                var cells = r.cells;
-                if (!cells || cells.length < 15) return;
-
-                // Column visibility according to Focus mode:
-                // 0: Strike, 1: Dist, 2: Strad LTP, 3: Expiry Horizon, 4: CE LTP, 5: CE Th, 6: PE LTP, 7: PE Th,
-                // 8: Strad Th, 9: 1-Hr, 10: Gamma, 11: Cushion, 12: Yield, 13: Edge, 14: Advice
-                if (currentThetaFocus === 'seller') {{
-                    cells[4].style.display = 'none';
-                    cells[5].style.display = 'none';
-                    cells[6].style.display = 'none';
-                    cells[7].style.display = 'none';
-                    cells[2].style.display = '';
-                    cells[3].style.display = '';
-                    cells[8].style.display = '';
-                    cells[9].style.display = '';
-                    cells[10].style.display = '';
-                    cells[11].style.display = '';
-                    cells[12].style.display = '';
-                    cells[13].style.display = '';
-                    cells[14].style.display = '';
-                }} else if (currentThetaFocus === 'buyer') {{
-                    cells[3].style.display = 'none';
-                    cells[4].style.display = 'none';
-                    cells[5].style.display = 'none';
-                    cells[6].style.display = 'none';
-                    cells[7].style.display = 'none';
-                    cells[11].style.display = 'none';
-                    cells[12].style.display = 'none';
-                    cells[2].style.display = '';
-                    cells[8].style.display = '';
-                    cells[9].style.display = '';
-                    cells[10].style.display = '';
-                    cells[13].style.display = '';
-                    cells[14].style.display = '';
-                }} else {{
-                    for (var c = 0; c < cells.length; c++) {{
-                        cells[c].style.display = '';
-                    }}
-                }}
-            }});
-
-            var rows = tbl.querySelectorAll('tbody tr');
-            rows.forEach(function(r) {{
-                var sVal = parseFloat(r.getAttribute('data-strike'));
-                if (!isNaN(sVal) && spot > 0) {{
-                    var inBand = (Math.abs(sVal - spot) / spot) <= (rangePct / 100.0) * 1.05;
-                    r.style.display = inBand ? '' : 'none';
-                }}
-                var ceCells = [r.cells[4], r.cells[5]];
-                var peCells = [r.cells[6], r.cells[7]];
-
-                if (currentThetaType === 'CE') {{
-                    if (ceCells[0]) ceCells[0].style.opacity = '1';
-                    if (ceCells[1]) ceCells[1].style.opacity = '1';
-                    if (peCells[0]) peCells[0].style.opacity = '0.35';
-                    if (peCells[1]) peCells[1].style.opacity = '0.35';
-                }} else if (currentThetaType === 'PE') {{
-                    if (ceCells[0]) ceCells[0].style.opacity = '0.35';
-                    if (ceCells[1]) ceCells[1].style.opacity = '0.35';
-                    if (peCells[0]) peCells[0].style.opacity = '1';
-                    if (peCells[1]) peCells[1].style.opacity = '1';
-                }} else {{
-                    if (ceCells[0]) ceCells[0].style.opacity = '1';
-                    if (ceCells[1]) ceCells[1].style.opacity = '1';
-                    if (peCells[0]) peCells[0].style.opacity = '1';
-                    if (peCells[1]) peCells[1].style.opacity = '1';
-                }}
-            }});
-
-            var ths = tbl.querySelectorAll('thead th');
-            if (ths.length >= 9) {{
-                ths[4].style.color = (currentThetaType === 'CE' || currentThetaType === 'STRADDLE') ? '{ACCENT}' : '{MUTED}';
-                ths[5].style.color = (currentThetaType === 'CE' || currentThetaType === 'STRADDLE') ? '{ACCENT}' : '{MUTED}';
-                ths[6].style.color = (currentThetaType === 'PE' || currentThetaType === 'STRADDLE') ? '#ff7043' : '{MUTED}';
-                ths[7].style.color = (currentThetaType === 'PE' || currentThetaType === 'STRADDLE') ? '#ff7043' : '{MUTED}';
-                ths[8].style.color = (currentThetaType === 'STRADDLE') ? '{YELLOW}' : '{MUTED}';
-            }}
-        }}
-
-        var sel = document.getElementById('sel-th-range');
-        if (sel) sel.value = currentThetaRange;
-    }}
-
-    function toggleThetaView(optType) {{
-        currentThetaType = optType;
-        try {{ sessionStorage.setItem('th_type', optType); }} catch(e) {{}}
-        ['ce', 'pe', 'straddle'].forEach(function(t) {{
-            var el = document.getElementById('btn-th-' + t);
-            if (el) el.classList.toggle('active', t.toUpperCase() === optType || (t === 'straddle' && optType === 'STRADDLE'));
-        }});
-        applyThetaFilters();
-        updateThetaChartTraces();
-        fetchAndRenderThetaCharts(currentThetaModel);
-        if (autoLockATM) {{
-            setTimeout(lockTableToATM, 60);
-        }}
-    }}
-
-    function updateThetaChartTraces() {{
-        if (!window.Plotly) return;
-        var row1 = document.getElementById('theta-chart-row1');
-        if (!row1) return;
-        var graphDiv = row1.querySelector('.plotly-graph-div');
-        if (!graphDiv || !graphDiv.data) return;
-
-        try {{
-            var ceOp = (currentThetaType === 'PE') ? 0.2 : 1.0;
-            var peOp = (currentThetaType === 'CE') ? 0.2 : 1.0;
-            var stOp = (currentThetaType === 'STRADDLE' || currentThetaType === 'CE' || currentThetaType === 'PE') ? 1.0 : 0.8;
-            Plotly.restyle(graphDiv, {{ 'opacity': [ceOp, peOp, stOp] }}, [1, 2, 3]);
-        }} catch(e) {{}}
-    }}
-
-    function toggleThetaModel(model) {{
-        currentThetaModel = model;
-        try {{ sessionStorage.setItem('th_model', model); }} catch(e) {{}}
-        ['bsm', 'heston', 'both'].forEach(function(m) {{
-            var el = document.getElementById('btn-th-' + m);
-            if (el) el.classList.toggle('active', m === model);
-        }});
-        fetchAndRenderThetaCharts(model);
-        if (autoLockATM) {{
-            setTimeout(lockTableToATM, 60);
-        }}
-    }}
-
-    function changeThetaRange(val) {{
-        currentThetaRange = val;
-        try {{ sessionStorage.setItem('th_range', val); }} catch(e) {{}}
-        applyThetaFilters();
-        fetchAndRenderThetaCharts(currentThetaModel);
-        if (autoLockATM) {{
-            setTimeout(lockTableToATM, 60);
-        }}
-    }}
-
-    function ensureThetaChartsRendered() {{
-        var row1 = document.getElementById('theta-chart-row1');
-        if (!row1) return;
-        var g = row1.querySelector('.plotly-graph-div');
-        if (!g || !g.querySelector('svg') || g.clientWidth === 0) {{
-            fetchAndRenderThetaCharts(currentThetaModel);
-        }}
-    }}
-
-    function fetchAndRenderThetaCharts(model, callback) {{
-        var url = '/api/theta_decay?opt_type=' + currentThetaType + '&model=' + (model || currentThetaModel) + '&range_pct=' + currentThetaRange + '&t=' + Date.now();
-        fetch(url)
-            .then(function(res) {{ return res.json(); }})
-            .then(function(data) {{
-                if (!data || !data.ok) return;
-                renderDynamicThetaCharts(data);
-                if (typeof callback === 'function') callback(data);
-            }})
-            .catch(function(e) {{
-                console.log('Theta fetch error:', e);
-                if (typeof callback === 'function') callback(null);
-            }});
-    }}
-
-    function renderDynamicThetaCharts(data) {{
-        if (!window.Plotly) return;
-        var spot = data.spot || 23450;
-        var strikes = data.strikes || [];
-        var dteSteps = data.dte_steps || [];
-        var series = data.series || {{}};
-        var bsm = series.bsm || {{}};
-
-        var row1El = document.getElementById('theta-chart-row1');
-        if (row1El) {{
-            var graph1 = row1El.querySelector('.plotly-graph-div');
-            if (!graph1) {{
-                graph1 = document.createElement('div');
-                graph1.className = 'plotly-graph-div';
-                graph1.style.width = '100%';
-                graph1.style.height = '350px';
-                row1El.innerHTML = '';
-                row1El.appendChild(graph1);
-            }}
-
-            var atmIdx = 0;
-            var minDiff = 999999;
-            strikes.forEach(function(s, i) {{
-                var diff = Math.abs(s - spot);
-                if (diff < minDiff) {{ minDiff = diff; atmIdx = i; }}
-            }});
-
-            var traces = [];
-            var atmThetaDte = [];
-            if (bsm.theta && bsm.theta[atmIdx]) {{
-                atmThetaDte = bsm.theta[atmIdx].map(function(v) {{ return Math.abs(v * 65); }});
-            }}
-
-            traces.push({{
-                x: dteSteps,
-                y: atmThetaDte,
-                mode: 'lines+markers',
-                name: 'ATM (' + (strikes[atmIdx] || spot) + ')',
-                line: {{ color: '{ACCENT}', width: 2.5 }},
-                marker: {{ size: 6 }},
-                xaxis: 'x',
-                yaxis: 'y'
-            }});
-
-            var strikeThetaVals = [];
-            if (bsm.theta) {{
-                strikes.forEach(function(s, i) {{
-                    var dte0Val = (bsm.theta[i] && bsm.theta[i][0] !== undefined) ? Math.abs(bsm.theta[i][0] * 65) : 0;
-                    strikeThetaVals.push(dte0Val);
-                }});
-            }}
-
-            traces.push({{
-                x: strikes,
-                y: strikeThetaVals,
-                mode: 'lines+markers',
-                name: (currentThetaType === 'PE' ? 'Put Theta' : currentThetaType === 'STRADDLE' ? 'Straddle Theta' : 'Call Theta') + ' (₹)',
-                line: {{ color: currentThetaType === 'PE' ? '{RED}' : '{ACCENT}', width: 2 }},
-                marker: {{ size: 5 }},
-                xaxis: 'x2',
-                yaxis: 'y2'
-            }});
-
-            var layout1 = {{
-                height: 350,
-                autosize: true,
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                font: {{ color: '{WHITE}', family: 'Inter, sans-serif', size: 10 }},
-                grid: {{ rows: 1, columns: 2, pattern: 'independent' }},
-                xaxis: {{ title: 'Days to Expiry (DTE)', autorange: 'reversed', gridcolor: 'rgba(255,255,255,0.05)' }},
-                yaxis: {{ title: 'Decay (₹/lot/day)', gridcolor: 'rgba(255,255,255,0.05)' }},
-                xaxis2: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
-                yaxis2: {{ title: 'Decay (₹/lot/day)', gridcolor: 'rgba(255,255,255,0.05)' }},
-                legend: {{ bgcolor: 'rgba(18,18,42,0.85)', font: {{ size: 9 }}, orientation: 'h', y: 1.05, x: 1, xanchor: 'right' }},
-                margin: {{ l: 40, r: 20, t: 40, b: 30 }},
-                hovermode: 'x unified'
-            }};
-
-            Plotly.react(graph1, traces, layout1, {{ responsive: true }});
-        }}
-
-        var row2El = document.getElementById('theta-chart-row2');
-        if (row2El) {{
-            var graph2 = row2El.querySelector('.plotly-graph-div');
-            if (!graph2) {{
-                graph2 = document.createElement('div');
-                graph2.className = 'plotly-graph-div';
-                graph2.style.width = '100%';
-                graph2.style.height = '350px';
-                row2El.innerHTML = '';
-                row2El.appendChild(graph2);
-            }}
-
-            var effVals = [];
-            if (bsm.theta && bsm.gamma) {{
-                strikes.forEach(function(s, i) {{
-                    var th = (bsm.theta[i] && bsm.theta[i][0]) ? Math.abs(bsm.theta[i][0]) : 0;
-                    var ga = (bsm.gamma[i] && bsm.gamma[i][0]) ? Math.abs(bsm.gamma[i][0]) : 1e-6;
-                    var cushion = Math.sqrt(Math.max(2.0 * th / Math.max(ga, 1e-7), 0.0));
-                    effVals.push(Math.round(cushion));
-                }});
-            }}
-
-            var traceEff = {{
-                x: strikes,
-                y: effVals,
-                mode: 'lines+markers',
-                name: 'Daily Cushion (±pts)',
-                line: {{ color: '{GREEN}', width: 2.5 }},
-                fill: 'tozeroy',
-                fillcolor: 'rgba(16,185,129,0.1)',
-                xaxis: 'x',
-                yaxis: 'y'
-            }};
-
-            var zMatrix = [];
-            if (bsm.theta) {{
-                strikes.forEach(function(s, i) {{
-                    var rowZ = [];
-                    dteSteps.forEach(function(d, j) {{
-                        var val = (bsm.theta[i] && bsm.theta[i][j]) ? Math.abs(bsm.theta[i][j] * 65) : 0;
-                        rowZ.push(Math.round(val));
-                    }});
-                    zMatrix.push(rowZ);
-                }});
-            }}
-
-            var traceHeat = {{
-                z: zMatrix,
-                x: dteSteps.map(function(d) {{ return d + 'd'; }}),
-                y: strikes,
-                type: 'heatmap',
-                colorscale: 'Viridis',
-                colorbar: {{ title: {{ text: '₹/day', font: {{ size: 10 }} }}, len: 0.8, x: 1.02 }},
-                xaxis: 'x2',
-                yaxis: 'y2'
-            }};
-
-            var layout2 = {{
-                height: 350,
-                autosize: true,
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                font: {{ color: '{WHITE}', family: 'Inter, sans-serif', size: 10 }},
-                grid: {{ rows: 1, columns: 2, pattern: 'independent' }},
-                xaxis: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
-                yaxis: {{ title: 'Breakeven Cushion (± pts)', gridcolor: 'rgba(255,255,255,0.05)' }},
-                xaxis2: {{ title: 'DTE Horizon', gridcolor: 'rgba(255,255,255,0.05)' }},
-                yaxis2: {{ title: 'Strike Price', gridcolor: 'rgba(255,255,255,0.05)' }},
-                legend: {{ bgcolor: 'rgba(18,18,42,0.85)', font: {{ size: 9 }}, orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center' }},
-                margin: {{ l: 40, r: 20, t: 40, b: 30 }},
-                hovermode: 'closest'
-            }};
-
-            Plotly.react(graph2, [traceEff, traceHeat], layout2, {{ responsive: true }});
-        }}
-    }}
-
-    window.isScrubbing = false;
-
-    function trackStrategy(payloadStr) {{
-        fetch('/api/track_strategy', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: payloadStr
-        }}).then(res => {{
-            if(res.ok) {{
-                console.log("Tracking started");
-                if (!window.isScrubbing) refreshContent(); // instantly update UI
-            }} else alert("Error starting tracking.");
-        }}).catch(e => console.error("Error calling API:", e));
-    }}
-    
-    function deleteStrategy(id) {{
-        fetch('/api/close_strategy', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{id: id}})
-        }}).then(res => {{
-            if(res.ok) {{
-                console.log("Strategy deleted");
-                if (!window.isScrubbing) refreshContent(); // instantly update UI
-            }}
-        }});
-    }}
-
-    function fetchHistoricalPNL() {{
-        const timeVal = document.getElementById('histScrubTime').value;
-        if(!timeVal) return;
-        window.isScrubbing = true;
-        
-        fetch(`/api/strategy_pnl_at?time=${{timeVal}}`) 
-        .then(r => r.text())
-        .then(html => {{
-            document.getElementById('pnlTrackerContainer').innerHTML = html;
-            document.getElementById('pnlTrackerContainer').style.boxShadow = "inset 0 0 10px rgba(255,165,0,0.3)"; 
-            document.getElementById('pnlTrackerContainer').style.padding = "10px";
-            document.getElementById('pnlTrackerContainer').style.borderRadius = "8px";
-        }});
-    }}
-
-    function resetToLivePNL() {{
-        window.isScrubbing = false;
-        document.getElementById('histScrubTime').value = '';
-        document.getElementById('pnlTrackerContainer').style.boxShadow = "none";
-        document.getElementById('pnlTrackerContainer').style.padding = "0";
-        refreshContent();
-    }}
-
-    // Real-Time WebSocket integration with DataHub
-    var ws;
-    function connectDataHub() {{
-        var host = window.location.hostname;
-        var port = window.location.port;
-        var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-        if (host === 'localhost' || host === '127.0.0.1') {{
-            port = '8082';
-        }}
-        var wsUrl = protocol + host + (port ? ':' + port : '') + '/stream';
-        ws = new WebSocket(wsUrl);
-        
-        ws.onopen = function() {{
-            console.log("Connected to DataHub Real-Time Stream");
-            document.getElementById('live-pulse').style.background = '{GREEN}';
-            document.getElementById('time-display').innerHTML = 'CONNECTED | REAL-TIME';
-        }};
-        
-        ws.onmessage = function(event) {{
-            var msg = JSON.parse(event.data);
-            if (msg.type === 'tick') {{
-                // Update Spot Price instantly
-                var spotEl = document.getElementById('spot-display');
-                spotEl.innerHTML = 'SPOT: ' + Number(msg.spot).toLocaleString(undefined, {{minimumFractionDigits: 2}});
-                spotEl.style.transition = 'color 0.2s';
-                spotEl.style.color = '{WHITE}';
-                setTimeout(function() {{ spotEl.style.color = '{ACCENT}'; }}, 200);
-                // ── Live timestamp from tick ──────────────────────────────────
-                var tickTime = msg.time || new Date().toLocaleTimeString('en-IN', {{hour12: false}});
-                var timeEl = document.getElementById('time-display');
-                if (timeEl) timeEl.innerHTML = '&#128339; ' + tickTime + ' &nbsp;|&nbsp; &#9679; LIVE TICK';
-            }} else if (msg.type === 'chain' || msg.type === 'init') {{
-                // Refresh full dashboard content when option chain updates (or on init)
-                if (!window.isScrubbing) refreshContent();
-            }}
-        }};
-        
-        ws.onclose = function() {{
-            console.log("Disconnected from DataHub. Retrying in 5s...");
-            document.getElementById('live-pulse').style.background = '{RED}';
-            document.getElementById('time-display').innerHTML = 'OFFLINE | RECONNECTING...';
-            setTimeout(connectDataHub, 5000);
-        }};
-    }}
-
-    // Start WebSocket connection
-    connectDataHub();
-
-    // ──────────────── GEX & DEALER POLLING (15s) ────────────────
-    function pollGexAndDealer() {{
-        Promise.all([
-            fetch('/api/gex').then(function(r) {{ return r.ok ? r.json() : null; }}),
-            fetch('/api/dealer').then(function(r) {{ return r.ok ? r.json() : null; }})
-        ]).then(function(results) {{
-            var gexData = results[0];
-            var dealerData = results[1];
-            if (!gexData || !dealerData) return;
-            
-            var gexVal = gexData.net_gex || 0;
-            var vannaVal = dealerData.net_vanna || 0;
-            var charmVal = dealerData.net_charm || 0;
-            
-            // --- Render Raw Metrics ---
-            var gColor = gexVal > 0 ? '{GREEN}' : '{RED}';
-            document.getElementById('gex-content').innerHTML = `
-                <div style="display:flex; flex-wrap:wrap; gap:10px;">
-                    <div class="metric-box">
-                        <div style="color:{MUTED};font-size:11px;">NET GEX</div>
-                        <div style="font-size:24px;font-weight:700;color:${{gColor}}">${{(gexVal/1e7).toFixed(2)}} Cr</div>
-                    </div>
-                    <div class="metric-box">
-                        <div style="color:{MUTED};font-size:11px;">ZERO GAMMA STRIKE (APPROX)</div>
-                        <div style="font-size:20px;font-weight:700;">${{gexData.zero_gamma_level ? gexData.zero_gamma_level.toFixed(2) : '--'}}</div>
-                    </div>
-                </div>
-            `;
-            
-            var vColor = vannaVal > 0 ? '{GREEN}' : '{RED}';
-            var cColor = charmVal > 0 ? '{GREEN}' : '{RED}';
-            document.getElementById('dealer-content').innerHTML = `
-                <div style="display:flex; flex-wrap:wrap; gap:10px;">
-                    <div class="metric-box">
-                        <div style="color:{MUTED};font-size:11px;">NET VANNA EXPOSURE</div>
-                        <div style="font-size:24px;font-weight:700;color:${{vColor}}">${{(vannaVal/1e7).toFixed(2)}} Cr</div>
-                    </div>
-                    <div class="metric-box">
-                        <div style="color:{MUTED};font-size:11px;">NET CHARM EXPOSURE</div>
-                        <div style="font-size:24px;font-weight:700;color:${{cColor}}">${{(charmVal/1e7).toFixed(2)}} Cr</div>
-                    </div>
-                </div>
-            `;
-            
-            // --- Institutional Signal Synthesis ---
-            var sigTitle = "";
-            var sigDesc = "";
-            var borderColor = "";
-            
-            if (gexVal > 0) {{
-                sigTitle = "MEAN REVERSION / PINNING EXPECTED";
-                borderColor = "{GREEN}";
-                sigDesc = "Dealers are currently <strong style='color:{GREEN};'>Long Gamma</strong>. They are structurally positioned to hedge by <em>selling rips</em> and <em>buying dips</em> against the prevailing trend. <br><br><strong>EXPECTATION:</strong> Volatility compression, choppy price action, and a strong gravitational pull towards the Zero Gamma Level (" + (gexData.zero_gamma_level ? gexData.zero_gamma_level.toFixed(0) : "N/A") + "). Iron Condors and Short Straddles are favored.";
-            }} else if (gexVal < 0) {{
-                sigTitle = "VOLATILITY EXPANSION / TREND ACCELERATION";
-                borderColor = "{RED}";
-                sigDesc = "Dealers are currently <strong style='color:{RED};'>Short Gamma</strong>. They are structurally positioned to hedge by <em>buying rips</em> and <em>selling dips</em> alongside the prevailing trend. <br><br><strong>EXPECTATION:</strong> Violent price swings, volatility expansion, and trending environments. The market will slip freely away from the Zero Gamma Level. Directional setups and Long Straddles are favored.";
-            }} else {{
-                sigTitle = "NEUTRAL GAMMA REGIME";
-                borderColor = "{YELLOW}";
-                sigDesc = "Dealer Gamma exposure is flat. Market makers are not exerting significant hedging pressure on the index. Look to Vanna and Charm flows for directional bias.";
-            }}
-            
-            if (vannaVal > 0 && charmVal > 0) {{
-                sigDesc += "<br><br><span style='color:{GREEN};font-weight:700;'>BULLISH TAILWIND (Vanna & Charm):</span> Both Vanna and Charm are significantly positive. As time decays (Charm) and IV drops (Vanna), market makers must buy delta to remain delta-neutral, creating an invisible bid under the market. This structurally supports upward drift.";
-            }} else if (vannaVal < 0 && charmVal < 0) {{
-                sigDesc += "<br><br><span style='color:{RED};font-weight:700;'>BEARISH HEADWIND (Vanna & Charm):</span> Both Vanna and Charm are significantly negative. As time decays and IV drops, market makers must sell delta to remain delta-neutral, creating a persistent drag on the index.";
-            }}
-            
-            var sigCont = document.getElementById('mm-signal-container');
-            sigCont.style.display = 'block';
-            sigCont.style.borderLeftColor = borderColor;
-            
-            var sigTitleEl = document.getElementById('mm-signal-title');
-            sigTitleEl.innerHTML = sigTitle;
-            sigTitleEl.style.color = borderColor;
-            
-            document.getElementById('mm-signal-desc').innerHTML = sigDesc;
-            
-        }}).catch(function(err) {{ console.log('MM Fetch Error:', err); }});
-    }}
-    setInterval(pollGexAndDealer, 15000);
-    pollGexAndDealer();
-
-    // ── /health heartbeat (30s) — keeps timestamp alive even when WS is quiet ──
-    function pollHealth() {{
-        fetch('/health')
-        .then(function(r) {{ return r.ok ? r.json() : null; }})
-        .then(function(d) {{
-            if (!d) return;
-            var timeEl = document.getElementById('time-display');
-            if (!timeEl) return;
-            var wsLive = ws && ws.readyState === WebSocket.OPEN;
-            if (!wsLive) {{
-                var srvTime = d.server_time || '--:--:--';
-                var status  = d.status || 'Polling';
-                timeEl.innerHTML = '&#128339; ' + srvTime + ' &nbsp;|&nbsp; ' + status;
-            }}
-            if (d.spot && d.spot > 0 && !wsLive) {{
-                var spotEl = document.getElementById('spot-display');
-                if (spotEl) spotEl.innerHTML = 'SPOT: ' + Number(d.spot).toLocaleString(undefined, {{minimumFractionDigits: 2}});
-            }}
-        }})
-        .catch(function() {{}});
-    }}
-    setInterval(pollHealth, 30000);
-    pollHealth();
-    
-    if ('serviceWorker' in navigator) {{
-        navigator.serviceWorker.getRegistrations().then(function(registrations) {{
-            registrations.forEach(function(registration) {{
-                registration.unregister();
-            }});
-        }});
-    }}
-    if ('caches' in window) {{
-        caches.keys().then(function(names) {{
-            names.forEach(function(name) {{
-                caches.delete(name);
-            }});
-        }});
-    }}
-    </script>
-</body></html>'''
-                        with open(html_path, 'w', encoding='utf-8') as f:
+    </header>
+
+    <!-- Tab Navigation -->
+    <nav class="tab-navigation">
+        <button class="tab-btn active" data-tab="regime"><span>REGIME SYSTEM</span></button>
+        <button class="tab-btn" data-tab="iv"><span>IV SURFACE & SMILE</span></button>
+        <button class="tab-btn" data-tab="vol"><span>REALIZED VOL & VRP</span></button>
+        <button class="tab-btn" data-tab="chain"><span>OPTION CHAIN & GREEKS</span></button>
+        <button class="tab-btn" data-tab="theta"><span>THETA DECAY & SIMULATOR</span></button>
+        <button class="tab-btn" data-tab="prob"><span>PROBABILITY CONE</span></button>
+        <button class="tab-btn mm-tab-btn" data-tab="mm">
+            <span style="display:inline-flex; align-items:center; gap:6px;">
+                <span style="color:var(--accent-cyan);">⚡</span>
+                <span style="font-weight:700;">GAMMA EXPLOSION & MM</span>
+                <span class="pulse-badge" style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:var(--accent-cyan); color:#060812; letter-spacing:0.5px;">NEW</span>
+            </span>
+        </button>
+    </nav>
+
+    <!-- Main Workspace Container -->
+    <main class="workspace-container" id="dash-container">
+        <section id="tab-regime" class="tab-content active">{regime_tab_html}</section>
+        <section id="tab-iv" class="tab-content">{iv_tab_html}</section>
+        <section id="tab-vol" class="tab-content">{vol_tab_html}</section>
+        <section id="tab-chain" class="tab-content">{chain_tab_html}</section>
+        <section id="tab-theta" class="tab-content">{theta_tab_html}</section>
+        <section id="tab-prob" class="tab-content">{prob_tab_html}</section>
+        <section id="tab-mm" class="tab-content">{mm_tab_html}</section>
+    </main>
+
+    <!-- Client Scripts -->
+    <script src="/static/js/background_canvas.js"></script>
+    <script src="/static/js/theta_simulator.js"></script>
+    <script src="/static/js/gamma_explosion_terminal.js"></script>
+    <script src="/static/js/dashboard_core.js"></script>
+</body>
+</html>'''
+                    with open(html_path, 'w', encoding='utf-8') as f:
+                        f.write(full_html)
+                    try:
+                        tpl_dest = os.path.join(dashboard_dir, 'templates', 'unified_dashboard.html')
+                        with open(tpl_dest, 'w', encoding='utf-8') as f:
                             f.write(full_html)
+                    except Exception:
+                        pass
+                    if first_run:
                         _dashboard_url = f'{_base_url}/unified_dashboard.html'
                         webbrowser.open(_dashboard_url)
                         first_run = False

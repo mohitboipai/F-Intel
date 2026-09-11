@@ -107,7 +107,9 @@ class DealerPositionEngine:
         dealer_sign = self._infer_dealer_sign(df)
         
         # Calculate exposure per contract side
-        base_multiplier = df['oi'] * self.lot_size * dealer_sign
+        is_shares = bool((df['oi'].max() > 100_000)) if not df.empty else False
+        total_shares = df['oi'] if is_shares else (df['oi'] * self.lot_size)
+        base_multiplier = total_shares * dealer_sign
         
         # Net Delta Exposure (DEX) - Total equivalent underlying shares dealer is holding
         df['dex'] = df['delta'] * base_multiplier

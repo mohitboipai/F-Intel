@@ -143,11 +143,16 @@ class GexEngine:
         # 3. Apply Institutional Positioning Inference
         dealer_sign = self._infer_dealer_sign(df)
         
-        # GEX Scaling: Gamma * Contracts * Spot^2 * 1% * LotSize
-        scaling_factor = (spot_price * spot_price * self.gex_scaling) * self.lot_size
-        
-        df['gex_oi'] = dealer_sign * df['gamma'] * df['oi'] * scaling_factor
-        df['gex_vol'] = dealer_sign * df['gamma'] * df['volume'] * scaling_factor
+        # GEX Scaling: Gamma * TotalShares * Spot^2 * 1%
+        # Note: In NSE / Fyers API, 'oi' and 'volume' are reported in underlying units/shares (e.g. 15M).
+        # If 'oi' is in contracts (< 100,000 max), multiply by lot_size to convert to shares.
+        is_shares = bool((df['oi'].max() > 100_000)) if not df.empty else False
+        total_shares = df['oi'] if is_shares else (df['oi'] * self.lot_size)
+        total_vol_shares = df['volume'] if is_shares else (df['volume'] * self.lot_size)
+
+        rupee_scale = (spot_price * spot_price * self.gex_scaling)
+        df['gex_oi'] = dealer_sign * df['gamma'] * total_shares * rupee_scale
+        df['gex_vol'] = dealer_sign * df['gamma'] * total_vol_shares * rupee_scale
         
         # Time-weighted Gamma (scaled by sqrt(T) for normalization across expiries)
         df['rolling_gex'] = df['gex_oi'] * np.sqrt(T_years)
