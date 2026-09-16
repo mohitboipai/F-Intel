@@ -95,5 +95,20 @@ class TestGexEngine(unittest.TestCase):
         self.assertTrue(not res['raw_df']['gamma'].isna().any(), "Zero DTE should not produce NaN")
         self.assertTrue(res['0dte_gex'] > 0, "0DTE GEX should be captured")
 
+    def test_nifty_lots_and_crores_metrics(self):
+        res = self.engine_std.calculate_gex(self.chain, self.spot)
+        self.assertIn('net_gex_lots_50pt', res)
+        self.assertIn('net_gex_crores_100pt', res)
+        self.assertIn('call_wall', res)
+        self.assertIn('put_wall', res)
+        self.assertIsInstance(res['net_gex_lots_50pt'], float)
+        self.assertIsInstance(res['net_gex_crores_100pt'], float)
+        self.assertEqual(res['call_wall'], 24600)
+        self.assertEqual(res['put_wall'], 24400)
+        # Verify raw dataframe columns exist
+        df = res['raw_df']
+        self.assertIn('gex_lots_50pt', df.columns)
+        self.assertIn('gex_crores_100pt', df.columns)
+
 if __name__ == '__main__':
     unittest.main()

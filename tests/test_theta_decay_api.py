@@ -59,5 +59,51 @@ class TestThetaDecayAPI(unittest.TestCase):
         self.assertGreater(asym["chain_totals"]["ce_total_inr"], 0)
         self.assertGreater(asym["chain_totals"]["pe_total_inr"], 0)
 
+    def test_spot_be_move_pts_and_extrinsic_clamping(self):
+        data = self._fetch({"opt_type": "CE", "model": "bsm", "range_pct": 5})
+        self.assertTrue(data.get("ok"))
+        self.assertIn("strikes_analytics", data)
+        analytics = data["strikes_analytics"]
+        self.assertGreater(len(analytics), 0)
+        # Check that spot_be_move_pts is present and non-negative
+        for k_str, k_info in analytics.items():
+            self.assertIn("spot_be_move_pts", k_info)
+            self.assertGreaterEqual(k_info["spot_be_move_pts"], 0.0)
+
+    def test_ltp_greek_decomposition(self):
+        data = self._fetch({"opt_type": "STRADDLE", "model": "bsm", "range_pct": 5})
+        self.assertTrue(data.get("ok"))
+        self.assertIn("strikes_analytics", data)
+        analytics = data["strikes_analytics"]
+        self.assertGreater(len(analytics), 0)
+        for k_str, k_info in analytics.items():
+            self.assertIn("ltp_decomposition", k_info)
+            decomp = k_info["ltp_decomposition"]
+            self.assertIn("intrinsic_pts", decomp)
+            self.assertIn("theta_pts", decomp)
+            self.assertIn("vega_pts", decomp)
+            self.assertIn("gamma_pts", decomp)
+            self.assertGreaterEqual(decomp["intrinsic_pts"], 0.0)
+            self.assertGreaterEqual(decomp["theta_pts"], 0.0)
+            self.assertGreaterEqual(decomp["vega_pts"], 0.0)
+            self.assertGreaterEqual(decomp["gamma_pts"], 0.0)
+
+    def test_ce_pe_ltp_decomposition(self):
+        for otype in ["CE", "PE"]:
+            data = self._fetch({"opt_type": otype, "model": "bsm", "range_pct": 5})
+            self.assertTrue(data.get("ok"))
+            self.assertIn("strikes_analytics", data)
+            analytics = data["strikes_analytics"]
+            self.assertGreater(len(analytics), 0)
+            for k_str, k_info in analytics.items():
+                self.assertIn("ltp_decomposition", k_info)
+                decomp = k_info["ltp_decomposition"]
+                self.assertGreaterEqual(decomp["intrinsic_pts"], 0.0)
+                self.assertGreaterEqual(decomp["theta_pts"], 0.0)
+                self.assertGreaterEqual(decomp["vega_pts"], 0.0)
+                self.assertGreaterEqual(decomp["gamma_pts"], 0.0)
+
 if __name__ == "__main__":
     unittest.main()
+
+

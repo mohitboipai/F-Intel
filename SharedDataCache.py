@@ -15,6 +15,7 @@ Usage:
 """
 
 import time
+import collections
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -60,6 +61,150 @@ class SharedDataCache:
 
         # ── Listeners: list of callables notified on new spot ────────
         self._spot_listeners = []
+
+        # ── OI Snapshot Ring (for per-strike OI velocity) ────────────
+        # Each entry: {'ts': float, 'oi_map': {(strike, type): int}}
+        # 60 snapshots at 30s cadence ≈ 30 min of OI history
+        self._oi_ring: collections.deque = collections.deque(maxlen=60)
+
+        # ── 1-Min Candle Ring (for multi-candle absorption scoring) ──
+        # Each entry: [ts, open, high, low, close, volume]  (Fyers format)
+        # 120 bars = 2 trading hours
+        self._candle_ring: collections.deque = collections.deque(maxlen=120)
+
+    # ─────────────────────────────────────────────────────────────────
+    # OI SNAPSHOT RING
+    # ─────────────────────────────────────────────────────────────────
+
+    def push_oi_snapshot(self, chain_df: pd.DataFrame):
+        """
+        Push a fresh OI snapshot from the live chain DataFrame.
+        Called by DataServer's 30s chain refresh loop.
+        Stores {(strike, type): oi} keyed map with a timestamp.
+        """
+        if chain_df is None or chain_df.empty:
+            return
+        try:
+            oi_map = {}
+            for _, row in chain_df[['strike', 'type', 'oi']].iterrows():
+                key = (float(row['strike']), str(row['type']))
+                oi_map[key] = int(row.get('oi', 0) or 0)
+            self._oi_ring.append({'ts': time.time(), 'oi_map': oi_map})
+        except Exception:
+            pass
+
+    def get_oi_velocity_data(self, window_secs: int = 900, fast_window_secs: int = 300) -> dict:
+        """
+        Compute per-strike OI change rate (15-min velocity) and acceleration (5-min fast velocity).
+        Returns:
+            {
+                'vel_by_strike': {(strike, type): oi_delta_per_min},      # 15m rate
+                'fast_vel_by_strike': {(strike, type): oi_delta_per_min}, # 5m rate
+                'accel_by_strike': {(strike, type): delta_accel_per_min2},# 2nd derivative
+                'pct_vel_by_strike': {(strike, type): pct_delta},         # % change vs baseline
+                'violently_unwinding': [(strike, type), ...],             # delta < -100k/min
+                'accelerating_unwind': [(strike, type), ...],             # V < -40k & A < -5k
+                'exhausting_unwind': [(strike, type), ...],               # V < -40k & A > +5k
+                'fortress_building': [(strike, type), ...],               # V > +50k & A >= 0
+                'window_secs': int,
+                'elapsed_min': float,
+                'is_warmed_up': bool,
+                'snapshot_count': int
+            }
+        """
+        snaps = list(self._oi_ring)
+        if len(snaps) < 2:
+            return {}
+
+        latest = snaps[-1]
+        now = latest['ts']
+
+        target_15m = now - window_secs
+        target_5m = now - fast_window_secs
+
+        # Find snapshot closest to target windows (guaranteed prior to latest)
+        candidates = snaps[:-1]
+        baseline_15m = min(candidates, key=lambda s: abs(s['ts'] - target_15m))
+        baseline_5m = min(candidates, key=lambda s: abs(s['ts'] - target_5m))
+
+        latest = snaps[-1]
+        elapsed_min_15m = max((latest['ts'] - baseline_15m['ts']) / 60.0, 0.01)
+        elapsed_min_5m = max((latest['ts'] - baseline_5m['ts']) / 60.0, 0.01)
+
+        vel_by_strike = {}
+        fast_vel_by_strike = {}
+        accel_by_strike = {}
+        pct_vel_by_strike = {}
+
+        for key, oi_now in latest['oi_map'].items():
+            # 15m velocity
+            oi_base_15m = baseline_15m['oi_map'].get(key, oi_now)
+            delta_15m = oi_now - oi_base_15m
+            v_15m = round(delta_15m / elapsed_min_15m, 0)
+            vel_by_strike[key] = v_15m
+
+            # 5m fast velocity
+            oi_base_5m = baseline_5m['oi_map'].get(key, oi_now)
+            delta_5m = oi_now - oi_base_5m
+            v_5m = round(delta_5m / elapsed_min_5m, 0)
+            fast_vel_by_strike[key] = v_5m
+
+            # Acceleration (2nd derivative): rate of velocity change
+            accel = round((v_5m - v_15m) / max(elapsed_min_15m - elapsed_min_5m, 1.0), 1)
+            accel_by_strike[key] = accel
+
+            # Relative percentage change
+            base_ref = max(oi_base_15m, 1000)
+            pct_vel_by_strike[key] = round((delta_15m / base_ref) * 100.0, 2)
+
+        violently_unwinding = [
+            k for k, v in vel_by_strike.items() if v < -100_000
+        ]
+        accelerating_unwind = [
+            k for k, v in vel_by_strike.items() if v < -40_000 and accel_by_strike.get(k, 0) < -5_000
+        ]
+        exhausting_unwind = [
+            k for k, v in vel_by_strike.items() if v < -40_000 and accel_by_strike.get(k, 0) > 5_000
+        ]
+        fortress_building = [
+            k for k, v in vel_by_strike.items() if (v > 30_000 or fast_vel_by_strike.get(k, 0) > 40_000) and accel_by_strike.get(k, 0) >= 0
+        ]
+
+        is_warmed_up = elapsed_min_15m >= 8.0
+
+        return {
+            'vel_by_strike': vel_by_strike,
+            'fast_vel_by_strike': fast_vel_by_strike,
+            'accel_by_strike': accel_by_strike,
+            'pct_vel_by_strike': pct_vel_by_strike,
+            'violently_unwinding': violently_unwinding,
+            'accelerating_unwind': accelerating_unwind,
+            'exhausting_unwind': exhausting_unwind,
+            'fortress_building': fortress_building,
+            'window_secs': window_secs,
+            'elapsed_min': round(elapsed_min_15m, 2),
+            'is_warmed_up': is_warmed_up,
+            'snapshot_count': len(snaps)
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # 1-MIN CANDLE RING
+    # ─────────────────────────────────────────────────────────────────
+
+    def push_candle(self, candle: list):
+        """
+        Push a 1-min OHLCV candle [ts, open, high, low, close, volume].
+        Called by DataServer's intraday background thread every minute.
+        """
+        if candle and len(candle) >= 6:
+            self._candle_ring.append(candle)
+
+    def get_recent_candles(self, n: int = 60) -> list:
+        """
+        Return the last `n` 1-min candles as a list of lists.
+        Each candle: [ts, open, high, low, close, volume].
+        """
+        return list(self._candle_ring)[-n:]
 
     # ─────────────────────────────────────────────────────────────────
     # SPOT

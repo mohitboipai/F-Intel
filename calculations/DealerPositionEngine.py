@@ -140,6 +140,14 @@ class DealerPositionEngine:
         net_gex_shares = df['gex_shares'].sum()
         net_vanna = df['vanna_ex'].sum()
         net_charm = df['charm_ex'].sum()
+
+        # Express in Nifty Futures Lots
+        lot_div = max(self.lot_size, 1)
+        net_dex_lots = net_dex / lot_div
+        # 50-pt move gamma in lots: gamma * base_multiplier * 50 / lot_size
+        df['gex_lots_50pt'] = (df['gamma'] * base_multiplier * 50.0) / lot_div
+        net_gex_lots_50pt = df['gex_lots_50pt'].sum()
+        hedge_spot_up_50pt_lots = -net_gex_lots_50pt
         
         # Hedging Projections: 
         # To remain Delta Neutral, a dealer must offset their Delta changes by buying/selling the underlying.
@@ -155,18 +163,23 @@ class DealerPositionEngine:
 
         return {
             'net_delta_exposure': float(net_dex),
+            'net_delta_lots': float(net_dex_lots),
             'net_vega_exposure': float(net_vex),
             'net_gamma_shares': float(net_gex_shares),
+            'net_gamma_lots_50pt': float(net_gex_lots_50pt),
             'net_vanna_exposure': float(net_vanna),
             'net_charm_exposure': float(net_charm),
             'projected_hedging': {
                 'buy_shares_if_spot_up_1pct': float(hedge_spot_up_1pct),
+                'buy_lots_if_spot_up_50pt': float(hedge_spot_up_50pt_lots),
                 'buy_shares_if_iv_up_1pct': float(hedge_iv_up_1pct),
                 'buy_shares_if_1_day_passes': float(hedge_1_day_pass)
             },
             'strike_profile': {
                 'dex': df.groupby('strike')['dex'].sum(),
+                'dex_lots': df.groupby('strike')['dex'].sum() / lot_div,
                 'gex': df.groupby('strike')['gex_shares'].sum(),
+                'gex_lots_50pt': df.groupby('strike')['gex_lots_50pt'].sum(),
                 'vanna': df.groupby('strike')['vanna_ex'].sum(),
                 'charm': df.groupby('strike')['charm_ex'].sum()
             },

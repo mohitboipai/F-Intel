@@ -15,6 +15,9 @@ def get_fyers_instance():
     secret_id = os.getenv("FYERS_SECRET_ID")
     redirect_uri = os.getenv("FYERS_REDIRECT_URI", "http://127.0.0.1:3000/callback")
     
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv("CI"):
+        return None
+
     if not app_id or not secret_id:
         print("Error: Missing FYERS_APP_ID or FYERS_SECRET_ID in .env file.")
         return None

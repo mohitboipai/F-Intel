@@ -1,16 +1,16 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    F-INTEL QUANTITATIVE TERMINAL — LAYOUT & COMPONENTS
+   Clean, flat, Zerodha/Sensibull-style. No glow, no glassmorphism.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* ── Top Header Navigation Bar ── */
+/* ── Top Navigation Bar ── */
 .top-nav {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 12px 24px;
-    background: rgba(9, 13, 22, 0.85);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    padding: 0 20px;
+    height: 48px;
+    background: var(--bg-surface);
     border-bottom: 1px solid var(--border-subtle);
     position: sticky;
     top: 0;
@@ -20,128 +20,150 @@
 .brand-section {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
 }
 
 .brand-logo {
-    font-family: var(--font-heading);
-    font-size: 20px;
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    background: linear-gradient(135deg, #ffffff 0%, #00f0ff 100%);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
+    font-family: var(--font-sans);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
+}
+
+.brand-logo svg {
+    color: var(--accent);
 }
 
 .brand-badge {
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
-    background: var(--accent-cyan-dim);
-    color: var(--accent-cyan);
-    border: 1px solid var(--accent-cyan-glow);
-    padding: 2px 6px;
-    border-radius: 4px;
-    letter-spacing: 0.05em;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 1px 5px;
+    border-radius: var(--radius-sm);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* ── Verdict Pill (in header) ── */
+#top-verdict-pill > div {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-card) !important;
+    border-radius: var(--radius-md) !important;
+    padding: 5px 12px !important;
 }
 
 /* ── Market Status Strip ── */
 .market-strip {
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
 }
 
 .spot-pill {
     display: flex;
     align-items: center;
-    gap: 8px;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid var(--border-card);
-    padding: 6px 14px;
-    border-radius: 8px;
-    font-size: 13px;
+    gap: 6px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+    padding: 4px 12px;
+    border-radius: var(--radius-md);
+    font-size: 12px;
     font-weight: 600;
+    color: var(--text-secondary);
 }
 
 .spot-pill .spot-val {
     font-family: var(--font-mono);
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 700;
-    color: var(--accent-cyan);
+    color: var(--text-primary);
 }
 
-.system-badges {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-/* Ambient FX Toggle Switch */
-.fx-toggle-wrap {
+/* ── Theme Toggle (Day/Night) ── */
+.theme-toggle-wrap {
     display: flex;
     align-items: center;
     gap: 6px;
     font-size: 11px;
     color: var(--text-muted);
     font-weight: 600;
-}
-
-.fx-toggle {
-    position: relative;
-    width: 32px;
-    height: 18px;
+    user-select: none;
     cursor: pointer;
 }
 
-.fx-toggle input {
+.theme-toggle {
+    position: relative;
+    width: 34px;
+    height: 18px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.theme-toggle input {
     opacity: 0;
     width: 0;
     height: 0;
+    position: absolute;
 }
 
-.fx-slider {
+.theme-slider {
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
-    background-color: rgba(255, 255, 255, 0.15);
+    background-color: var(--border-card);
     border-radius: 18px;
-    transition: var(--transition-fast);
+    transition: background-color var(--transition-fast);
 }
 
-.fx-slider:before {
+.theme-slider:before {
     position: absolute;
     content: "";
     height: 12px;
     width: 12px;
     left: 3px;
     bottom: 3px;
-    background-color: white;
+    background-color: var(--text-secondary);
     border-radius: 50%;
-    transition: var(--transition-fast);
+    transition: transform var(--transition-fast), background-color var(--transition-fast);
 }
 
-.fx-toggle input:checked + .fx-slider {
-    background-color: var(--accent-cyan);
+.theme-toggle input:checked + .theme-slider {
+    background-color: var(--accent);
 }
 
-.fx-toggle input:checked + .fx-slider:before {
-    transform: translateX(14px);
-    background-color: var(--bg-canvas);
+.theme-toggle input:checked + .theme-slider:before {
+    transform: translateX(16px);
+    background-color: #fff;
 }
 
-/* ── Modern Tabs Navigation ── */
+.theme-toggle-icon {
+    font-size: 14px;
+    line-height: 1;
+}
+
+/* ── System Badges ── */
+.system-badges {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* ── Tab Navigation ── */
 .tab-navigation {
     display: flex;
-    gap: 6px;
-    padding: 10px 24px;
-    background: rgba(7, 10, 16, 0.6);
-    backdrop-filter: blur(12px);
+    align-items: center;
+    gap: 2px;
+    padding: 0 16px;
+    background: var(--bg-surface);
     border-bottom: 1px solid var(--border-subtle);
     overflow-x: auto;
     scrollbar-width: none;
+    height: 40px;
 }
 
 .tab-navigation::-webkit-scrollbar {
@@ -150,45 +172,46 @@
 
 .tab-btn {
     background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid transparent;
-    padding: 8px 16px;
-    font-family: var(--font-heading);
-    font-size: 13px;
+    color: var(--text-muted);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 0 14px;
+    height: 40px;
+    font-family: var(--font-sans);
+    font-size: 12px;
     font-weight: 600;
-    border-radius: 8px;
+    border-radius: 0;
     cursor: pointer;
     white-space: nowrap;
-    transition: all var(--transition-fast);
+    transition: color var(--transition-fast), border-color var(--transition-fast);
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
 }
 
 .tab-btn:hover {
     color: var(--text-primary);
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--bg-card-hover);
 }
 
 .tab-btn.active {
-    color: var(--accent-cyan);
-    background: var(--accent-cyan-dim);
-    border-color: var(--accent-cyan-glow);
-    box-shadow: 0 0 15px rgba(0, 240, 255, 0.15);
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: transparent;
 }
 
-/* ── Main Workspace Container ── */
+/* ── Main Workspace ── */
 .workspace-container {
     max-width: 1720px;
     margin: 0 auto;
-    padding: 20px 24px 60px;
-    position: relative;
-    z-index: 10;
+    padding: 16px 20px 60px;
 }
 
 .tab-content {
     display: none;
-    animation: fadeInTab 200ms ease-out;
+    animation: fadeInTab 150ms ease-out;
 }
 
 .tab-content.active {
@@ -196,50 +219,46 @@
 }
 
 @keyframes fadeInTab {
-    from {
-        opacity: 0;
-        transform: translateY(4px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
+    from { opacity: 0; transform: translateY(3px); }
+    to   { opacity: 1; transform: translateY(0); }
 }
 
-/* ── Metric Grid & Cards ── */
+/* ── Metric Cards Grid ── */
 .metrics-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
 }
 
 .metric-card {
-    padding: 16px;
-    border-radius: 10px;
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
 }
 
 .metric-card .card-label {
-    font-size: 11px;
+    font-size: 10px;
     text-transform: uppercase;
     color: var(--text-muted);
     font-weight: 600;
     letter-spacing: 0.05em;
-    margin-bottom: 6px;
+    margin-bottom: 4px;
 }
 
 .metric-card .card-value {
     font-family: var(--font-mono);
-    font-size: 22px;
+    font-size: 20px;
     font-weight: 700;
     color: var(--text-primary);
-    line-height: 1.1;
+    line-height: 1.2;
 }
 
 .metric-card .card-subtext {
     font-size: 11px;
     color: var(--text-secondary);
-    margin-top: 6px;
+    margin-top: 4px;
 }
 
 /* ── Financial Tables ── */
@@ -249,16 +268,23 @@
     font-size: 12px;
 }
 
+.quant-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+
 .quant-table th {
-    background: rgba(15, 23, 42, 0.9);
+    background: var(--bg-canvas);
     color: var(--text-muted);
     font-weight: 600;
     text-transform: uppercase;
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    padding: 10px 12px;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border-subtle);
     text-align: right;
+    white-space: nowrap;
 }
 
 .quant-table th:first-child,
@@ -267,45 +293,173 @@
 }
 
 .quant-table td {
-    padding: 8px 12px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border-subtle);
     font-family: var(--font-mono);
+    font-size: 12px;
     text-align: right;
+    color: var(--text-primary);
 }
 
 .quant-table tbody tr:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--bg-card-hover);
+}
+
+/* ATM row highlight — subtle, no glow */
+.quant-table tbody tr.atm-row {
+    background: var(--accent-dim);
+    font-weight: 600;
+}
+
+.quant-table tbody tr.atm-row td {
+    color: var(--text-primary);
+}
+
+/* ── Buttons ── */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-card);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+    white-space: nowrap;
+}
+
+.btn:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+    border-color: var(--border-focus);
+}
+
+.btn.active,
+.btn:active {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+
+.btn-primary:hover {
+    background: var(--accent-light);
+    color: #fff;
+    border-color: var(--accent-light);
 }
 
 /* ── Interactive Sliders ── */
 .slider-control-group {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
 }
 
 .slider-input {
     flex: 1;
     -webkit-appearance: none;
     appearance: none;
-    height: 5px;
-    background: rgba(255, 255, 255, 0.15);
-    border-radius: 3px;
+    height: 4px;
+    background: var(--border-card);
+    border-radius: 2px;
     outline: none;
 }
 
 .slider-input::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
-    width: 15px;
-    height: 15px;
+    width: 14px;
+    height: 14px;
     border-radius: 50%;
-    background: var(--accent-cyan);
+    background: var(--accent);
     cursor: pointer;
-    box-shadow: 0 0 10px var(--accent-cyan);
     transition: transform var(--transition-fast);
 }
 
 .slider-input::-webkit-slider-thumb:hover {
-    transform: scale(1.25);
+    transform: scale(1.2);
+}
+
+/* ── Section Headers ── */
+.section-header {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+    margin-bottom: 12px;
+}
+
+/* ── Inline Tags / Badges ── */
+.tag {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.tag-bull  { background: var(--color-bullish-dim); color: var(--color-bullish); border: 1px solid var(--color-bullish); }
+.tag-bear  { background: var(--color-bearish-dim); color: var(--color-bearish); border: 1px solid var(--color-bearish); }
+.tag-warn  { background: var(--color-warning-dim); color: var(--color-warning); border: 1px solid var(--color-warning); }
+.tag-info  { background: var(--accent-dim);        color: var(--accent);        border: 1px solid var(--accent); }
+.tag-muted { background: var(--bg-canvas);         color: var(--text-muted);    border: 1px solid var(--border-subtle); }
+
+/* ── Input fields ── */
+input[type="number"],
+input[type="text"],
+select {
+    background: var(--bg-input);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 5px 10px;
+    outline: none;
+    transition: border-color var(--transition-fast);
+}
+
+input[type="number"]:focus,
+input[type="text"]:focus,
+select:focus {
+    border-color: var(--border-focus);
+}
+
+select option {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: var(--border-card);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-focus); }
+
+/* ── Divider ── */
+.divider {
+    border: none;
+    border-top: 1px solid var(--border-subtle);
+    margin: 12px 0;
 }

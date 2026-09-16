@@ -131,6 +131,17 @@ class RealizedVolEngine:
         # Optional shared signal memory (inject from outside if desired)
         self.memory = None
 
+        # Advanced Econometric & Sizing Engines
+        self.advanced_vol_engine = None
+        self.strangle_sizer = None
+        try:
+            from calculations.AdvancedVolEngine import AdvancedVolEngine
+            from calculations.StranglePositionSizer import StranglePositionSizer
+            self.advanced_vol_engine = AdvancedVolEngine()
+            self.strangle_sizer = StranglePositionSizer()
+        except Exception:
+            pass
+
     # ── Auth ──────────────────────────────────────────────────────────────
     def _authenticate(self):
 
@@ -327,6 +338,31 @@ class RealizedVolEngine:
         # Classify regime
         regime = self._classify_regime(atm_iv, cur_hv, consensus_rv, rv_trend, hv_pctile)
 
+        # Advanced Econometric & Sizing Analysis
+        econometric = {}
+        strangle_sizing = {}
+        if self.advanced_vol_engine:
+            try:
+                econometric = self.advanced_vol_engine.analyze(df_daily, atm_iv)
+            except Exception as e:
+                econometric = {}
+
+        if self.strangle_sizer:
+            try:
+                f_vrp = econometric.get('forward_vrp', {}).get('vrp_5d', vrp_iv_rv)
+                j_ratio = econometric.get('jump_decomposition', {}).get('jump_ratio', 0.10)
+                s_vai = econometric.get('semi_variance', {}).get('vai', 0.0)
+                strangle_sizing = self.strangle_sizer.calculate_sizing(
+                    capital=2_000_000.0,
+                    atm_iv=atm_iv,
+                    forward_vrp=f_vrp,
+                    jump_ratio=j_ratio,
+                    vai=s_vai,
+                    spot=spot
+                )
+            except Exception as e:
+                strangle_sizing = {}
+
         return {
             'spot': spot,
             'atm_iv': atm_iv,
@@ -338,7 +374,9 @@ class RealizedVolEngine:
             },
             'hv': {'20d': cur_hv, 'percentile': hv_pctile, 'mean': hv_mean},
             'vrp': {'iv_hv': vrp_iv_hv, 'iv_rv': vrp_iv_rv},
-            'regime': regime
+            'regime': regime,
+            'econometric': econometric,
+            'strangle_sizing': strangle_sizing
         }
 
     # ══════════════════════════════════════════════════════════════════════

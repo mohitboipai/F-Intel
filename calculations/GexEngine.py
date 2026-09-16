@@ -9,11 +9,13 @@ try:
     import config as _cfg
     _DEFAULT_LOT_SIZE = _cfg.get("nifty_lot_size", 65)
     _DEFAULT_R = _cfg.get("risk_free_rate", 0.051274)
+    _DEFAULT_Q = _cfg.get("dividend_yield", 0.0122)
     _DEFAULT_GEX_SCALING = _cfg.get("gex_move_pct", 0.01)
     _DEFAULT_IV = _cfg.get("iv_fallback_flat", 0.15)
 except Exception:
     _DEFAULT_LOT_SIZE = 65
     _DEFAULT_R = 0.051274
+    _DEFAULT_Q = 0.0122
     _DEFAULT_GEX_SCALING = 0.01
     _DEFAULT_IV = 0.15
 
@@ -26,7 +28,8 @@ class GexEngine:
     
     def __init__(self, 
                  lot_size: int | None = None, 
-                 risk_free_rate: float | None = None, 
+                 risk_free_rate: float | None = None,
+                 dividend_yield: float | None = None,
                  gex_scaling: float | None = None,
                  positioning_model: Literal['standard', 'inverted', 'flow'] = 'standard',
                  default_iv: float | None = None):
@@ -35,6 +38,7 @@ class GexEngine:
         
         :param lot_size: Contract multiplier (defaults to config.nifty_lot_size, e.g. 65).
         :param risk_free_rate: Risk-free rate for BSM calculation (defaults to config.risk_free_rate, e.g. ~0.0513).
+        :param dividend_yield: Continuous dividend yield for Merton (1973) gamma adjustment (defaults to config.dividend_yield).
         :param gex_scaling: Move magnitude for GEX output (0.01 = 1% Spot move).
         :param positioning_model: Inference model for dealer inventory.
             'standard': Assumes dealers are Long Calls (Overwriting flow) and Short Puts (Protective flow).
@@ -46,13 +50,15 @@ class GexEngine:
         """
         self.lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
         self.r = risk_free_rate if risk_free_rate is not None else _DEFAULT_R
+        self.q = dividend_yield if dividend_yield is not None else _DEFAULT_Q
         self.gex_scaling = gex_scaling if gex_scaling is not None else _DEFAULT_GEX_SCALING
         self.positioning_model = positioning_model
         self.default_iv = default_iv if default_iv is not None else _DEFAULT_IV
 
     def compute_gamma_vectorized(self, S: float, K: np.ndarray, T: np.ndarray, iv: np.ndarray) -> np.ndarray:
         """
-        Calculates Black-Scholes Gamma using NumPy vectorization.
+        Calculates Merton (1973) dividend-adjusted Gamma using NumPy vectorization.
+        Gamma = e^{-qT} * n(d1) / (S * iv * sqrt(T))
         Gracefully handles zero DTE or extreme IV edge cases.
         """
         # Enforce mathematical boundaries to prevent NaN or Inf
@@ -60,9 +66,12 @@ class GexEngine:
         iv = np.maximum(iv, 1e-5)
         K = np.maximum(K, 1e-5)
         S = max(S, 1e-5)
-        
-        d1 = (np.log(S / K) + (self.r + 0.5 * iv ** 2) * T) / (iv * np.sqrt(T))
-        gamma = norm.pdf(d1) / (S * iv * np.sqrt(T))
+
+        # Merton (1973): d1 uses (r - q) drift
+        d1 = (np.log(S / K) + (self.r - self.q + 0.5 * iv ** 2) * T) / (iv * np.sqrt(T))
+        # Apply e^{-qT} dividend discount factor — collapses to 1.0 when q=0
+        eq_T = np.exp(-self.q * T)
+        gamma = eq_T * norm.pdf(d1) / (S * iv * np.sqrt(T))
         return gamma
 
     def _infer_dealer_sign(self, df: pd.DataFrame) -> np.ndarray:
@@ -153,15 +162,33 @@ class GexEngine:
         rupee_scale = (spot_price * spot_price * self.gex_scaling)
         df['gex_oi'] = dealer_sign * df['gamma'] * total_shares * rupee_scale
         df['gex_vol'] = dealer_sign * df['gamma'] * total_vol_shares * rupee_scale
+
+        # Market-Standard Units (Nifty Futures Lots per 50-pt move & ₹ Crores per 100-pt move)
+        # Gamma * total_shares gives total delta shares per 1 point move.
+        # For a standard 50-pt move, divide by lot_size to get Lots:
+        df['gex_lots_50pt'] = dealer_sign * (50.0 * df['gamma'] * total_shares / max(self.lot_size, 1))
+        df['gex_crores_100pt'] = dealer_sign * (100.0 * df['gamma'] * total_shares * spot_price / 1e7)
         
         # Time-weighted Gamma (scaled by sqrt(T) for normalization across expiries)
         df['rolling_gex'] = df['gex_oi'] * np.sqrt(T_years)
         
         # 4. Aggregate Analytics
         net_gex = df['gex_oi'].sum()
+        net_gex_lots = df['gex_lots_50pt'].sum()
+        net_gex_crores = df['gex_crores_100pt'].sum()
         profile = df.groupby('strike')['gex_oi'].sum()
+        profile_lots = df.groupby('strike')['gex_lots_50pt'].sum()
+        profile_crores = df.groupby('strike')['gex_crores_100pt'].sum()
         expiry_gex = df.groupby('dte')['gex_oi'].sum()
         
+        # Identify Call Wall and Put Wall
+        ce_df = df[df['type'] == 'CE']
+        pe_df = df[df['type'] == 'PE']
+        call_wall = float(ce_df.groupby('strike')['oi'].sum().idxmax()) if not ce_df.empty else 0.0
+        put_wall = float(pe_df.groupby('strike')['oi'].sum().idxmax()) if not pe_df.empty else 0.0
+        dist_call_wall = abs(spot_price - call_wall) if call_wall > 0 else 0.0
+        dist_put_wall = abs(spot_price - put_wall) if put_wall > 0 else 0.0
+
         # Identify Zero Gamma Level (Interpolated Flip Point)
         sorted_strikes = profile.index.sort_values()
         flip_point = 0.0
@@ -204,6 +231,12 @@ class GexEngine:
         
         return {
             'net_gex': float(net_gex),
+            'net_gex_lots_50pt': float(net_gex_lots),
+            'net_gex_crores_100pt': float(net_gex_crores),
+            'call_wall': call_wall,
+            'put_wall': put_wall,
+            'dist_to_call_wall': float(dist_call_wall),
+            'dist_to_put_wall': float(dist_put_wall),
             'spot_gamma': spot_gamma,
             'forward_gex': float(forward_gex),
             'rolling_gex': float(net_rolling_gex),
@@ -213,6 +246,8 @@ class GexEngine:
             'dealer_long_pct': float(dealer_long_pct),
             'dealer_short_pct': float(dealer_short_pct),
             'profile': profile, # pd.Series
+            'profile_lots': profile_lots, # pd.Series (Lots per 50pt move)
+            'profile_crores': profile_crores, # pd.Series (₹ Cr per 100pt move)
             'expiry_gex': expiry_gex, # pd.Series
             'heatmap': heatmap, # pd.DataFrame
             'gex_vol_total': float(df['gex_vol'].sum()),

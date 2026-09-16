@@ -1,71 +1,111 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    F-INTEL QUANTITATIVE TERMINAL — DESIGN TOKENS & THEME
+   Inspired by Zerodha Kite & Sensibull: flat, readable, professional.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
-:root {
-    /* ── Surface Palettes ── */
-    --bg-canvas: #06080d;
-    --bg-surface: #0b0e17;
-    --bg-card: rgba(14, 20, 32, 0.72);
-    --bg-card-hover: rgba(20, 28, 46, 0.85);
-    --bg-card-elevated: rgba(22, 32, 52, 0.90);
-    --bg-input: rgba(10, 15, 26, 0.8);
-    
-    /* ── Borders & Outlines ── */
-    --border-subtle: rgba(255, 255, 255, 0.07);
-    --border-card: rgba(255, 255, 255, 0.10);
-    --border-focus: rgba(0, 240, 255, 0.50);
-    
-    /* ── Brand & Accent Lights ── */
-    --accent-cyan: #00f0ff;
-    --accent-cyan-dim: rgba(0, 240, 255, 0.15);
-    --accent-cyan-glow: rgba(0, 240, 255, 0.35);
-    --accent-blue: #38bdf8;
-    --accent-purple: #a855f7;
-    
-    /* ── Financial Semantic Colors ── */
-    --color-bullish: #10b981;
-    --color-bullish-dim: rgba(16, 185, 129, 0.15);
-    --color-bullish-glow: rgba(16, 185, 129, 0.35);
-    
-    --color-bearish: #ef4444;
-    --color-bearish-dim: rgba(239, 68, 68, 0.15);
-    --color-bearish-glow: rgba(239, 68, 68, 0.35);
-    
-    --color-warning: #f59e0b;
-    --color-warning-dim: rgba(245, 158, 11, 0.15);
-    
-    --color-neutral: #94a3b8;
-    
-    /* ── Typography & Foregrounds ── */
-    --text-primary: #f8fafc;
-    --text-secondary: #cbd5e1;
-    --text-muted: #64748b;
-    --text-inverse: #030712;
-    
-    --font-heading: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+/* ── DARK THEME (Default / Night Mode) ── */
+:root,
+[data-theme="dark"] {
+    /* Surfaces */
+    --bg-canvas:      #131722;
+    --bg-surface:     #1e222d;
+    --bg-card:        #1e222d;
+    --bg-card-hover:  #252a38;
+    --bg-input:       #131722;
+
+    /* Borders */
+    --border-subtle:  #2a2e39;
+    --border-card:    #363c4e;
+    --border-focus:   #2962ff;
+
+    /* Accent */
+    --accent:         #2962ff;
+    --accent-dim:     rgba(41, 98, 255, 0.12);
+    --accent-light:   #4c7fff;
+
+    /* Financial semantic */
+    --color-bullish:      #26a69a;
+    --color-bullish-dim:  rgba(38, 166, 154, 0.12);
+    --color-bearish:      #ef5350;
+    --color-bearish-dim:  rgba(239, 83, 80, 0.12);
+    --color-warning:      #ff9800;
+    --color-warning-dim:  rgba(255, 152, 0, 0.12);
+    --color-neutral:      #78909c;
+
+    /* Text */
+    --text-primary:   #d1d4dc;
+    --text-secondary: #868993;
+    --text-muted:     #555d6b;
+    --text-inverse:   #131722;
+
+    /* Typography */
     --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
-    
-    /* ── Glassmorphism & Shadows ── */
-    --glass-blur: blur(16px);
-    --shadow-card: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
-    --shadow-glow-cyan: 0 0 20px rgba(0, 240, 255, 0.20);
-    --shadow-glow-bull: 0 0 20px rgba(16, 185, 129, 0.20);
-    --shadow-glow-bear: 0 0 20px rgba(239, 68, 68, 0.20);
-    
-    /* ── Transitions ── */
-    --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
-    --transition-smooth: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+    --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+
+    /* Shadows — flat, no glow */
+    --shadow-card:   0 1px 4px rgba(0, 0, 0, 0.35);
+    --shadow-soft:   0 2px 8px rgba(0, 0, 0, 0.25);
+
+    /* Border radius */
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+
+    /* Transitions */
+    --transition-fast:   120ms ease;
+    --transition-smooth: 200ms ease;
 }
 
-/* Base resets */
+/* ── LIGHT THEME (Day Mode) ── */
+[data-theme="light"] {
+    /* Surfaces */
+    --bg-canvas:      #f0f3fa;
+    --bg-surface:     #ffffff;
+    --bg-card:        #ffffff;
+    --bg-card-hover:  #f5f7fc;
+    --bg-input:       #f0f3fa;
+
+    /* Borders */
+    --border-subtle:  #e0e3eb;
+    --border-card:    #d1d5e0;
+    --border-focus:   #2962ff;
+
+    /* Accent stays same */
+    --accent:         #2962ff;
+    --accent-dim:     rgba(41, 98, 255, 0.08);
+    --accent-light:   #4c7fff;
+
+    /* Financial semantic */
+    --color-bullish:      #00897b;
+    --color-bullish-dim:  rgba(0, 137, 123, 0.08);
+    --color-bearish:      #e53935;
+    --color-bearish-dim:  rgba(229, 57, 53, 0.08);
+    --color-warning:      #f57c00;
+    --color-warning-dim:  rgba(245, 124, 0, 0.08);
+    --color-neutral:      #78909c;
+
+    /* Text */
+    --text-primary:   #131722;
+    --text-secondary: #4a5568;
+    --text-muted:     #8896a5;
+    --text-inverse:   #ffffff;
+
+    /* Shadows */
+    --shadow-card:   0 1px 3px rgba(0, 0, 0, 0.1);
+    --shadow-soft:   0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* ── Base Reset ── */
 *, *::before, *::after {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+}
+
+html {
+    font-size: 14px;
 }
 
 body {
@@ -74,77 +114,73 @@ body {
     font-family: var(--font-sans);
     min-height: 100vh;
     overflow-x: hidden;
-    position: relative;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    transition: background-color var(--transition-smooth), color var(--transition-smooth);
 }
 
-/* Background animated canvas wrapper */
-#quant-bg-canvas {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    z-index: 0;
-    pointer-events: none;
-    opacity: 0.85;
-    transition: opacity var(--transition-smooth);
-}
-
-/* Glassmorphism Card Utility */
-.glass-panel {
+/* ── Flat Card (replaces glassmorphism) ── */
+.glass-panel,
+.card,
+.ge-card,
+.ge-chart-card {
     background: var(--bg-card);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--border-card);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-card);
-    position: relative;
-    z-index: 1;
-    transition: transform var(--transition-smooth), border-color var(--transition-smooth), box-shadow var(--transition-smooth);
+    transition: border-color var(--transition-fast);
 }
 
-.glass-panel:hover {
-    border-color: rgba(255, 255, 255, 0.18);
+.glass-panel:hover,
+.card:hover {
+    border-color: var(--border-focus);
 }
 
-/* Monospace quantitative numbers */
+/* ── Monospace numeric utility ── */
 .num-mono {
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
 }
 
-/* Pulse badge */
+/* ── Status indicator (compact, no glow) ── */
 .status-indicator {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 4px 10px;
-    border-radius: 9999px;
-    backdrop-filter: blur(8px);
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+}
+
+.status-indicator.live {
+    border-color: var(--color-bullish);
+    color: var(--color-bullish);
+    background: var(--color-bullish-dim);
 }
 
 .status-indicator .pulse-dot {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
-    animation: statusPulse 2s infinite ease-in-out;
+    background: currentColor;
+    animation: statusPulse 2.5s infinite ease-in-out;
 }
 
 @keyframes statusPulse {
-    0%, 100% {
-        transform: scale(0.9);
-        opacity: 0.6;
-    }
-    50% {
-        transform: scale(1.3);
-        opacity: 1;
-        box-shadow: 0 0 10px currentColor;
-    }
+    0%, 100% { opacity: 0.5; }
+    50%       { opacity: 1; }
 }
+
+/* ── Bull / Bear color utilities ── */
+.bull  { color: var(--color-bullish) !important; }
+.bear  { color: var(--color-bearish) !important; }
+.warn  { color: var(--color-warning) !important; }
+.muted { color: var(--text-muted)   !important; }
+.accent-text { color: var(--accent) !important; }

@@ -22,7 +22,10 @@ class AdvancedVolatilityScanner:
         if fyers_instance:
             self.fyers = fyers_instance
         else:
-            self.fyers = self._authenticate()
+            try:
+                self.fyers = self._authenticate()
+            except Exception:
+                self.fyers = None
         self.analytics = OptionAnalytics()
         self.symbol = "NSE:NIFTY50-INDEX"
         self.spot_price = 0

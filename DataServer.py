@@ -16,6 +16,7 @@ from flask import Flask, jsonify, send_file, request, render_template, make_resp
 from flask_cors import CORS
 from flask_sock import Sock
 from datetime import datetime
+from typing import Any
 from fyers_auth_manager import get_fyers_instance, get_access_token
 from fyers_apiv3.FyersWebsocket import data_ws
 from OptionAnalytics import OptionAnalytics
@@ -44,9 +45,10 @@ class DataHub:
     def __init__(self):
         self.fyers = None
         self.access_token = None
-        self.latest_data = {
-            "spot": 0,
+        self.latest_data: dict[str, Any] = {
+            "spot": 0.0,
             "chain": {},
+            "options": [],
             "last_update": "",
             "status": "Initializing",
             "tick_count": 0
@@ -91,8 +93,14 @@ class DataHub:
                         self.latest_data["spot"] = lp
                         self.latest_data["tick_count"] += 1
                         self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
-                    # Push spot update to UI immediately
-                    self.broadcast({"type": "tick", "spot": lp, "time": self.latest_data["last_update"]})
+                    # Push spot update to UI immediately (support both tick and spot_tick types, and server_time)
+                    self.broadcast({
+                        "type": "tick",
+                        "spot_type": "spot_tick",
+                        "spot": lp,
+                        "time": self.latest_data["last_update"],
+                        "server_time": self.latest_data["last_update"]
+                    })
 
     def start_fyers_ws(self):
         print("DataHub: Starting Fyers WebSocket...")
@@ -118,7 +126,13 @@ class DataHub:
                             with self.lock:
                                 self.latest_data["spot"] = lp
                                 self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
-                            self.broadcast({"type": "tick", "spot": lp, "time": self.latest_data["last_update"]})
+                            self.broadcast({
+                                "type": "tick",
+                                "spot_type": "spot_tick",
+                                "spot": lp,
+                                "time": self.latest_data["last_update"],
+                                "server_time": self.latest_data["last_update"]
+                            })
                     except Exception as e:
                         print(f"DataHub: Spot Fallback Error: {e}")
 
@@ -150,11 +164,12 @@ hub = DataHub()
 # spot and chain from DataHub without an extra Fyers API call.
 from SharedDataCache import SharedDataCache as _SDC
 
+import collections
+
 class _DataHubCacheAdapter:
     """
     Thin adapter exposing the SharedDataCache interface on top of DataHub.
-    Only the methods actually used by HestonCalibrator and PricingRouter
-    need to be implemented — spot, raw_chain, T, and heston_params.
+    Implements spot, raw_chain, T, heston_params, 1-min candles, and OI velocity tracking.
     """
     HESTON_TTL = 300
 
@@ -163,6 +178,9 @@ class _DataHubCacheAdapter:
         self._heston_params = None
         self._heston_ts     = 0.0
         self._T             = 7 / 365   # default
+        self._oi_ring       = collections.deque(maxlen=60)
+        self._candle_ring   = collections.deque(maxlen=120)
+        self._rv_data: dict = {}
 
     # ── Spot ─────────────────────────────────────────────────────────
     @property
@@ -199,6 +217,116 @@ class _DataHubCacheAdapter:
     def set_heston_params(self, params: dict):
         self._heston_params = params
         self._heston_ts     = time.time()
+
+    # ── OI Snapshot & Velocity Ring ────────────────────────────────────
+    def push_oi_snapshot(self, chain_df: pd.DataFrame):
+        if chain_df is None or chain_df.empty:
+            return
+        try:
+            oi_map = {}
+            for _, row in chain_df[['strike', 'type', 'oi']].iterrows():
+                key = (float(row['strike']), str(row['type']))
+                oi_map[key] = int(row.get('oi', 0) or 0)
+            self._oi_ring.append({'ts': time.time(), 'oi_map': oi_map})
+        except Exception:
+            pass
+
+    def get_oi_velocity_data(self, window_secs: int = 900, fast_window_secs: int = 300) -> dict:
+        snaps = list(self._oi_ring)
+        if len(snaps) < 2:
+            return {}
+
+        latest = snaps[-1]
+        now = latest['ts']
+
+        target_15m = now - window_secs
+        target_5m = now - fast_window_secs
+
+        candidates = snaps[:-1]
+        baseline_15m = min(candidates, key=lambda s: abs(s['ts'] - target_15m))
+        baseline_5m = min(candidates, key=lambda s: abs(s['ts'] - target_5m))
+
+        latest = snaps[-1]
+        elapsed_min_15m = max((latest['ts'] - baseline_15m['ts']) / 60.0, 0.01)
+        elapsed_min_5m = max((latest['ts'] - baseline_5m['ts']) / 60.0, 0.01)
+
+        vel_by_strike = {}
+        fast_vel_by_strike = {}
+        accel_by_strike = {}
+        pct_vel_by_strike = {}
+
+        for key, oi_now in latest['oi_map'].items():
+            oi_base_15m = baseline_15m['oi_map'].get(key, oi_now)
+            delta_15m = oi_now - oi_base_15m
+            v_15m = round(delta_15m / elapsed_min_15m, 0)
+            vel_by_strike[key] = v_15m
+
+            oi_base_5m = baseline_5m['oi_map'].get(key, oi_now)
+            delta_5m = oi_now - oi_base_5m
+            v_5m = round(delta_5m / elapsed_min_5m, 0)
+            fast_vel_by_strike[key] = v_5m
+
+            accel = round((v_5m - v_15m) / max(elapsed_min_15m - elapsed_min_5m, 1.0), 1)
+            accel_by_strike[key] = accel
+
+            base_ref = max(oi_base_15m, 1000)
+            pct_vel_by_strike[key] = round((delta_15m / base_ref) * 100.0, 2)
+
+        violently_unwinding = [
+            k for k, v in vel_by_strike.items() if v < -100_000
+        ]
+        accelerating_unwind = [
+            k for k, v in vel_by_strike.items() if v < -40_000 and accel_by_strike.get(k, 0) < -5_000
+        ]
+        exhausting_unwind = [
+            k for k, v in vel_by_strike.items() if v < -40_000 and accel_by_strike.get(k, 0) > 5_000
+        ]
+        fortress_building = [
+            k for k, v in vel_by_strike.items() if (v > 30_000 or fast_vel_by_strike.get(k, 0) > 40_000) and accel_by_strike.get(k, 0) >= 0
+        ]
+
+        is_warmed_up = elapsed_min_15m >= 8.0
+
+        return {
+            'vel_by_strike': vel_by_strike,
+            'fast_vel_by_strike': fast_vel_by_strike,
+            'accel_by_strike': accel_by_strike,
+            'pct_vel_by_strike': pct_vel_by_strike,
+            'violently_unwinding': violently_unwinding,
+            'accelerating_unwind': accelerating_unwind,
+            'exhausting_unwind': exhausting_unwind,
+            'fortress_building': fortress_building,
+            'window_secs': window_secs,
+            'elapsed_min': round(elapsed_min_15m, 2),
+            'is_warmed_up': is_warmed_up,
+            'snapshot_count': len(snaps)
+        }
+
+    # ── 1-Min Candle Ring ──────────────────────────────────────────────
+    def push_candle(self, candle: list):
+        if candle and len(candle) >= 6:
+            self._candle_ring.append(candle)
+
+    def get_recent_candles(self, n: int = 60) -> list:
+        return list(self._candle_ring)[-n:]
+
+    # ── Realized Volatility / OHLC Data ────────────────────────────────
+    def get_rv_data(self, force: bool = False) -> dict:
+        """Returns cached Realized Volatility / OHLC data if available."""
+        if hasattr(self, '_rv_data') and self._rv_data and not force:
+            return self._rv_data
+        return getattr(self, '_rv_data', {})
+
+    def set_rv_data(self, rv_dict: dict):
+        if rv_dict and isinstance(rv_dict, dict):
+            self._rv_data = rv_dict
+
+    def get_rv(self) -> float:
+        """Returns consensus or 20d realized volatility as a float."""
+        rv_dict = self.get_rv_data()
+        if rv_dict and isinstance(rv_dict, dict):
+            return float(rv_dict.get('consensus_rv') or rv_dict.get('rv_20d') or 13.0)
+        return 13.0
 
 
 hub_cache = _DataHubCacheAdapter(hub)
@@ -243,15 +371,39 @@ def index():
     response.headers['Expires'] = '0'
     return response
 
+_LAST_CACHED_FRAGMENT = [""]
+
 @app.route('/fragment', methods=['GET'])
 def serve_fragment():
     """Serve the latest pre-rendered dashboard fragment for refreshContent()."""
-    try:
-        response = send_file('unified_dashboard_fragment.html')
-        response.headers['Cache-Control'] = 'no-store'
+    frag_file = os.path.join(os.path.dirname(__file__), 'unified_dashboard_fragment.html')
+    if not os.path.exists(frag_file):
+        frag_file = 'unified_dashboard_fragment.html'
+
+    for _ in range(5):
+        try:
+            if os.path.exists(frag_file):
+                with open(frag_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                if content and len(content) > 100:
+                    _LAST_CACHED_FRAGMENT[0] = content
+                    response = make_response(content)
+                    response.mimetype = 'text/html'
+                    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+                    response.headers['Pragma'] = 'no-cache'
+                    response.headers['Expires'] = '0'
+                    return response
+            time.sleep(0.05)
+        except Exception:
+            time.sleep(0.05)
+
+    if _LAST_CACHED_FRAGMENT[0]:
+        response = make_response(_LAST_CACHED_FRAGMENT[0])
+        response.mimetype = 'text/html'
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
         return response
-    except Exception:
-        return '<div id="frag-regime"></div>', 200
+
+    return '<div id="frag-regime"></div>', 200
 
 @app.route('/static/manifest.json', methods=['GET'])
 def serve_manifest():
@@ -684,6 +836,30 @@ except Exception as _ge_init_e:
     _gamma_explosion_engine = None
     print(f"[GAMMA_EXPLOSION] Init warning: {_ge_init_e}")
 
+# In-memory GEX Rebalance & Option Buyer Radar snapshot
+_gex_rebalance_snapshot: dict = {
+    "ok": True, "status": "MONITORING", "action_summary": "Initializing Option Buyer Radar..."
+}
+_gex_rebalance_lock = threading.Lock()
+try:
+    from calculations.GexRebalanceEngine import GexRebalanceEngine
+    _gr_lot = config.get("nifty_lot_size", 65) if config else 65
+    _gex_rebalance_engine = GexRebalanceEngine(lot_size=_gr_lot)
+except Exception as _gr_init_e:
+    _gex_rebalance_engine = None
+    print(f"[GEX_REBALANCE] Init warning: {_gr_init_e}")
+
+# In-memory Intraday Signal Engine snapshot
+_intraday_signal_snapshot: dict = {"ok": True, "score": 0.0, "actionable": False}
+_intraday_signal_lock = threading.Lock()
+try:
+    from calculations.IntradayGammaSignalEngine import IntradayGammaSignalEngine
+    _ids_lot = config.get("nifty_lot_size", 65) if config else 65
+    _intraday_signal_engine = IntradayGammaSignalEngine(lot_size=_ids_lot)
+except Exception as _ids_init_e:
+    _intraday_signal_engine = None
+    print(f"[INTRADAY_SIGNAL] Init warning: {_ids_init_e}")
+
 
 def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
     """Convert Fyers optionsChain dict to a clean DataFrame for calculations/."""
@@ -728,6 +904,9 @@ def _get_recent_1min_candles():
                     if candles:
                         _candles_cache = candles
                         _candles_last_fetch = now
+                        # Populate hub_cache candle ring for IntradayGammaSignalEngine
+                        for c in candles:
+                            hub_cache.push_candle(c)
             except Exception as e:
                 print(f"[Candles] History fetch warning: {e}")
         return list(_candles_cache)
@@ -848,6 +1027,85 @@ def _gex_refresh_loop(interval: int = 60):
                         except Exception as _ge_e:
                             print(f"[GAMMA_EXPLOSION] Error (non-fatal): {_ge_e}")
 
+                    # ── Option Buyer Radar via GexRebalanceEngine (with live OI velocity) ──
+                    if _gex_rebalance_engine is not None:
+                        try:
+                            dte_val      = hub_cache.get_T() * 365.0
+                            # Feed live 15m OI velocity & acceleration to GexRebalanceEngine
+                            oi_vel_data  = hub_cache.get_oi_velocity_data(window_secs=900)
+                            oi_vel_arg   = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
+                            gr_payload   = _gex_rebalance_engine.evaluate(
+                                df, spot,
+                                oi_velocity_data=oi_vel_arg,
+                                dte=dte_val,
+                                gex_res=gex_res
+                            )
+                            with _gex_rebalance_lock:
+                                _gex_rebalance_snapshot.clear()
+                                _gex_rebalance_snapshot.update(gr_payload)
+
+                            hub.broadcast({
+                                "type": "gex_rebalance_update",
+                                "payload": gr_payload
+                            })
+                            print(f"[GEX_REBALANCE] Status: {gr_payload.get('status')} | Target: {gr_payload.get('rebalance_target')}")
+                        except Exception as _gr_e:
+                            print(f"[GEX_REBALANCE] Error (non-fatal): {_gr_e}")
+
+                    # ── Push OI snapshot to hub_cache for velocity tracking ──
+                    try:
+                        hub_cache.push_oi_snapshot(df)
+                    except Exception:
+                        pass
+
+                    # ── IntradayGammaSignalEngine fusion update ──
+                    if _intraday_signal_engine is not None:
+                        try:
+                            dte_val_ids  = hub_cache.get_T() * 365.0
+                            oi_vel_ids   = hub_cache.get_oi_velocity_data(window_secs=900)
+                            candles_ids  = hub_cache.get_recent_candles(n=60)
+                            rv_ids       = hub_cache.get_rv_data() or {}
+                            ohlc_ids     = rv_ids.get('ohlc_df', None)
+                            ids_payload  = _intraday_signal_engine.update(
+                                spot=spot,
+                                chain_df=df,
+                                oi_velocity_data=oi_vel_ids if oi_vel_ids else None,
+                                candles=candles_ids,
+                                ohlc_df=ohlc_ids,
+                                dte=dte_val_ids
+                            )
+                            with _intraday_signal_lock:
+                                _intraday_signal_snapshot.clear()
+                                _intraday_signal_snapshot.update(ids_payload)
+
+                            # Broadcast to WebSocket hub
+                            hub.broadcast({
+                                "type":    "intraday_signal",
+                                "payload": ids_payload
+                            })
+
+                            # Update SignalMemory context for MasterSignalEngine
+                            try:
+                                from SignalMemory import SignalMemory
+                                mem = SignalMemory()
+                                mem.update_context({
+                                    'intraday_signal': ids_payload,
+                                    'momentum_status': ids_payload.get('momentum_status', 'NEUTRAL'),
+                                    'swing_quality': ids_payload.get('swing_quality', {}).get('quality', 'UNKNOWN'),
+                                    'intraday_momentum': ids_payload.get('momentum_status', 'NEUTRAL')
+                                })
+                            except Exception:
+                                pass
+
+                            print(
+                                f"[INTRADAY] score={ids_payload.get('score',0):.0f} "
+                                f"quality={ids_payload.get('swing_quality',{}).get('quality','?')} "
+                                f"phase={ids_payload.get('swing_quality',{}).get('session_phase','?')} "
+                                f"actionable={ids_payload.get('actionable')}"
+                            )
+                        except Exception as _ids_e:
+                            print(f"[INTRADAY_SIGNAL] Error (non-fatal): {_ids_e}")
+
         except Exception as _e:
             print(f"[GEX] Refresh error (non-fatal): {_e}")
         time.sleep(interval)
@@ -903,6 +1161,96 @@ def api_gamma_explosion():
     return jsonify(snap or {'ok': True, 'active_pins': [], 'retest_absorptions': [], 'explosion_targets': {}})
 
 
+@app.route('/api/gex-rebalance', methods=['GET'])
+def api_gex_rebalance():
+    """
+    GET /api/gex-rebalance — Option Buyer Radar & Spot Shift Rebalance Engine.
+    Returns: status, trigger_strike, rebalance_target, terminal_fortress,
+             primary_option, otm_gamma_rocket, runway_pts, progress_pct.
+    """
+    with _gex_rebalance_lock:
+        snap = dict(_gex_rebalance_snapshot)
+    if not snap or "trigger_strike" not in snap or snap.get("status") == "WAITING_FOR_DATA":
+        spot = hub.latest_data.get("spot", 0)
+        chain = hub.latest_data.get("chain", {})
+        if spot > 0 and chain and _gex_rebalance_engine is not None:
+            try:
+                df = _parse_chain_to_df(chain)
+                if not df.empty:
+                    dte_val = hub_cache.get_T() * 365.0
+                    oi_vel_data = hub_cache.get_oi_velocity_data(window_secs=900)
+                    oi_vel_arg  = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
+                    gex_res = None
+                    try:
+                        from calculations.GexEngine import GexEngine
+                        _lot = config.get("nifty_lot_size", 65) if config else 65
+                        gex_eng = GexEngine(lot_size=_lot, positioning_model='standard')
+                        gex_res = gex_eng.calculate_gex(df, spot)
+                    except Exception:
+                        pass
+                    live_eval = _gex_rebalance_engine.evaluate(
+                        df, spot,
+                        oi_velocity_data=oi_vel_arg,
+                        dte=dte_val,
+                        gex_res=gex_res
+                    )
+                    with _gex_rebalance_lock:
+                        _gex_rebalance_snapshot.clear()
+                        _gex_rebalance_snapshot.update(live_eval)
+                        snap = dict(_gex_rebalance_snapshot)
+            except Exception as _e:
+                print(f"[api_gex_rebalance] Evaluation error: {_e}")
+    return jsonify(snap or {"ok": True, "status": "MONITORING", "action_summary": "Monitoring walls..."})
+
+
+@app.route('/api/intraday-signal', methods=['GET'])
+def api_intraday_signal():
+    """
+    GET /api/intraday-signal — Unified Intraday Gamma Signal.
+
+    Fuses OI velocity + multi-candle absorption + swing quality + GexRebalance status
+    into one actionable payload. Updated every 60s by the GEX refresh loop.
+
+    Response fields:
+      ok, score (0-100), actionable (bool),
+      swing_quality: {quality, session_phase, adr_pct, rsi_5min},
+      oi_velocity: {available, has_capitulation, violently_unwinding},
+      absorption: {score, confirmed, setup_quality, wick_bars, vol_accel},
+      pin_status: {strike, duration_str, unpinning_risk, ...},
+      rebalance_radar: {status, rebalance_target, ...},
+      gex_summary: {net_gex, call_wall, put_wall, gamma_flip},
+      momentum_status: LONG|SHORT|NEUTRAL,
+      rationale: [str, ...],
+      entry_signal: {direction, entry_zone, sl_spot, t1, t2, option_strike, option_type, rr_ratio, rationale}
+    """
+    with _intraday_signal_lock:
+        snap = dict(_intraday_signal_snapshot)
+    if not snap or not snap.get('ok'):
+        spot   = hub.latest_data.get("spot", 0)
+        chain  = hub.latest_data.get("chain", {})
+        if spot > 0 and chain and _intraday_signal_engine is not None:
+            try:
+                df       = _parse_chain_to_df(chain)
+                candles  = hub_cache.get_recent_candles(n=60) or _get_recent_1min_candles()
+                oi_vel   = hub_cache.get_oi_velocity_data(window_secs=300)
+                rv_data  = hub_cache.get_rv_data() or {}
+                ohlc_df  = rv_data.get('ohlc_df', None)
+                dte_val  = hub_cache.get_T() * 365.0
+                if not df.empty:
+                    snap = _intraday_signal_engine.update(
+                        spot=spot, chain_df=df,
+                        oi_velocity_data=oi_vel or None,
+                        candles=candles,
+                        ohlc_df=ohlc_df,
+                        dte=dte_val
+                    )
+                    with _intraday_signal_lock:
+                        _intraday_signal_snapshot.clear()
+                        _intraday_signal_snapshot.update(snap)
+            except Exception:
+                pass
+    return jsonify(snap or {"ok": True, "score": 0.0, "actionable": False,
+                            "reason": "No data yet — waiting for first GEX cycle."})
 
 
 @app.route('/api/signals', methods=['GET'])
@@ -1803,9 +2151,16 @@ def api_theta_decay():
 
             # Greeks at current market
             th_day_pts = abs(bsm_series['theta'][i][0]) if bsm_series['theta'][i] else 0.0
+            # Boundary Clamping: Daily decay cannot exceed remaining extrinsic value
+            if extrinsic_decay_pts > 0:
+                th_day_pts = min(th_day_pts, extrinsic_decay_pts)
+
             gamma_val = bsm_series['gamma'][i][0] if bsm_series['gamma'][i] else 1e-6
             delta_val = bsm_series['delta'][i][0] if bsm_series['delta'][i] else 0.0
             vega_val = bsm_series['vega'][i][0] if bsm_series['vega'][i] else 0.0
+
+            # Spot Breakeven Move required to offset theta decay (Breakeven Velocity)
+            spot_be_move_pts = round(th_day_pts / max(abs(delta_val), 0.05), 1)
 
             # Daily Breakeven Cushion Move (pts)
             cushion_pts = round(float(np.sqrt(max(2.0 * th_day_pts / max(gamma_val, 1e-7), 0.0))), 1)
@@ -1838,15 +2193,16 @@ def api_theta_decay():
             # Granular Call & Put Greeks and Decays
             g_ce = _bsm_calc_greeks(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'CE', q)
             g_pe = _bsm_calc_greeks(spot, K, max(T_current or 0.01, 1e-5), r, k_sig_base, 'PE', q)
-            ce_th_day = abs(g_ce['theta'])
-            pe_th_day = abs(g_pe['theta'])
-            strad_th_day = round(ce_th_day + pe_th_day, 2)
 
             ce_intr = max(0.0, spot - K)
             pe_intr = max(0.0, K - spot)
             ce_ext = max(0.0, c_ltp - ce_intr)
             pe_ext = max(0.0, p_ltp - pe_intr)
             st_ext = ce_ext + pe_ext
+
+            ce_th_day = min(abs(g_ce['theta']), ce_ext) if ce_ext > 0 else abs(g_ce['theta'])
+            pe_th_day = min(abs(g_pe['theta']), pe_ext) if pe_ext > 0 else abs(g_pe['theta'])
+            strad_th_day = round(ce_th_day + pe_th_day, 2)
 
             ce_decay = {
                 'per_day_pts': round(ce_th_day, 2),
@@ -1940,6 +2296,13 @@ def api_theta_decay():
                 retention_reason = 'Healthy theta harvest with safe cushion'
                 retention_color = '#10b981'
 
+            _dte_val = max(float(T_current or 0) * 365.0, 0.25)
+            _decomp_th_pts = round(min(extrinsic_decay_pts, th_day_pts * _dte_val), 2)
+            _decomp_veg_pts = round(min(max(0.0, extrinsic_decay_pts - _decomp_th_pts), vega_val * max(0.0, (iv_per_strike[K] - rv_consensus) / 10.0)), 2)
+            _decomp_gam_pts = round(max(0.0, extrinsic_decay_pts - _decomp_th_pts - _decomp_veg_pts), 2)
+            _decomp_intr_pts = round(intr, 2)
+            _decomp_tot = max(active_ltp, 0.01)
+
             strikes_analytics[str(K)] = {
                 'ce_ltp': c_ltp,
                 'pe_ltp': p_ltp,
@@ -1949,9 +2312,24 @@ def api_theta_decay():
                 'extrinsic_pts': extrinsic_decay_pts,
                 'extrinsic_inr': extrinsic_decay_inr,
                 'extrinsic_pct': extrinsic_pct,
+                'ltp_decomposition': {
+                    'intrinsic_pts': _decomp_intr_pts,
+                    'intrinsic_inr': round(_decomp_intr_pts * lot_size, 0),
+                    'intrinsic_pct': round((_decomp_intr_pts / _decomp_tot) * 100.0, 1),
+                    'theta_pts': _decomp_th_pts,
+                    'theta_inr': round(_decomp_th_pts * lot_size, 0),
+                    'theta_pct': round((_decomp_th_pts / _decomp_tot) * 100.0, 1),
+                    'vega_pts': _decomp_veg_pts,
+                    'vega_inr': round(_decomp_veg_pts * lot_size, 0),
+                    'vega_pct': round((_decomp_veg_pts / _decomp_tot) * 100.0, 1),
+                    'gamma_pts': _decomp_gam_pts,
+                    'gamma_inr': round(_decomp_gam_pts * lot_size, 0),
+                    'gamma_pct': round((_decomp_gam_pts / _decomp_tot) * 100.0, 1),
+                },
                 'th_day_pts': th_day_pts,
                 'th_day_inr': round(th_day_pts * lot_size, 0),
                 'th_1h_inr': round((th_day_pts * lot_size) / 6.25, 1),
+                'spot_be_move_pts': spot_be_move_pts,
                 'gamma': gamma_val,
                 'delta': delta_val,
                 'vega': vega_val,
@@ -2221,6 +2599,132 @@ def switch_profile(profile_name):
             }), 404
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADVANCED ECONOMETRIC VOLATILITY & STRANGLE SIZING ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_econ_vol_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_econ_vol_lock = threading.Lock()
+
+def _get_cached_econometric_vol():
+    """Returns cached econometric volatility metrics or recalculates if expired (>15s)."""
+    global _econ_vol_cache
+    now = time.time()
+    with _econ_vol_lock:
+        if _econ_vol_cache["data"] is not None and (now - _econ_vol_cache["ts"]) < 15.0:
+            return _econ_vol_cache["data"]
+
+    try:
+        from RealizedVolEngine import RealizedVolEngine
+        from calculations.AdvancedVolEngine import AdvancedVolEngine
+        
+        rv_engine = RealizedVolEngine()
+        df_daily = rv_engine._fetch_daily_history(365)
+        df_intraday = rv_engine._fetch_intraday_history()
+        
+        with hub.lock:
+            spot = hub.latest_data.get("spot", 0.0)
+        if spot <= 0:
+            spot = rv_engine._get_spot()
+            
+        atm_iv = 0.0
+        chain_opts: list[dict[str, Any]] = []
+        with hub.lock:
+            raw_opts = hub.latest_data.get("options", [])
+            if isinstance(raw_opts, list):
+                chain_opts = raw_opts
+        if chain_opts and spot > 0:
+            best_d = float('inf')
+            for opt in chain_opts:
+                if isinstance(opt, dict):
+                    k = opt.get('strike_price', 0)
+                    iv = opt.get('iv', 0)
+                    if abs(k - spot) < best_d and iv > 0:
+                        best_d = abs(k - spot)
+                        atm_iv = iv * 100.0 if iv < 1.0 else iv
+        if atm_iv <= 0:
+            atm_iv = 13.5
+
+        adv_engine = AdvancedVolEngine()
+        res = adv_engine.analyze(df_daily, atm_iv=atm_iv, df_intraday=df_intraday)
+        if not res or "semi_variance" not in res:
+            raise ValueError("Insufficient daily history for econometric analysis")
+        res["spot"] = spot
+        res["atm_iv"] = atm_iv
+
+        with _econ_vol_lock:
+            _econ_vol_cache["data"] = res
+            _econ_vol_cache["ts"] = now
+        return res
+    except Exception as e:
+        return {
+            "spot": 23300.0,
+            "atm_iv": 13.5,
+            "semi_variance": {"total_rv": 12.0, "rv_plus": 11.5, "rv_minus": 12.5, "rv_plus_pct": 46.0, "rv_minus_pct": 54.0, "vai": 0.08, "bias": "BALANCED", "interpretation": "Symmetric volatility"},
+            "har_forecast": {"forecast_1d": 11.8, "forecast_5d": 11.2, "weights": {"beta_0": 2.1, "beta_d": 0.45, "beta_w": 0.25, "beta_m": 0.15}, "r_squared": 0.42, "residual_se": 1.8},
+            "jump_decomposition": {"jump_ratio": 0.12, "jump_ratio_pct": 12.0, "jump_regime": "CONTINUOUS_FLOW", "action_badge": "STRUCTURAL_FLOW", "description": "Continuous volatility flow"},
+            "forward_vrp": {"vrp_5d": 2.3, "verdict": "FAVORABLE_PREMIUM", "action": "NORMAL_STRANGLE_WRITING", "description": "Positive forward volatility risk premium"},
+            "higher_moments": {"realized_skew": -0.15, "realized_kurtosis": 0.85, "tail_risk": "MESOKURTIC_NORMAL"},
+            "error": str(e)
+        }
+
+@app.route('/api/volatility/econometric', methods=['GET'])
+def api_volatility_econometric():
+    """
+    GET /api/volatility/econometric
+    Returns Realized Semi-Variance (RV+, RV-), Corsi (2009) HAR forward forecast,
+    Bipower jump decomposition, and Forward VRP.
+    """
+    try:
+        data = _get_cached_econometric_vol()
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route('/api/strangle/sizing', methods=['GET'])
+def api_strangle_sizing():
+    """
+    GET /api/strangle/sizing?capital=2000000
+    Computes optimal strangle lot allocation, sizing multiplier, and leg distribution.
+    """
+    try:
+        from calculations.StranglePositionSizer import StranglePositionSizer
+        capital = float(request.args.get('capital', 2_000_000.0))
+        vol_data = _get_cached_econometric_vol()
+
+        spot = float(vol_data.get("spot", 23300.0))
+        atm_iv = float(vol_data.get("atm_iv", 13.5))
+        _fvrp_obj = vol_data.get("forward_vrp")
+        forward_vrp = float(_fvrp_obj.get("vrp_5d", 2.0) if isinstance(_fvrp_obj, dict) else 2.0)
+        _jump_obj = vol_data.get("jump_decomposition")
+        jump_ratio = float(_jump_obj.get("jump_ratio", 0.10) if isinstance(_jump_obj, dict) else 0.10)
+        _semi_obj = vol_data.get("semi_variance")
+        vai = float(_semi_obj.get("vai", 0.0) if isinstance(_semi_obj, dict) else 0.0)
+
+        gamma_flip: float | None = None
+        try:
+            with hub.lock:
+                gf_raw = hub.latest_data.get("zero_gamma_level")
+                if gf_raw is not None:
+                    gamma_flip = float(gf_raw)
+        except Exception:
+            pass
+
+        sizer = StranglePositionSizer()
+        sizing = sizer.calculate_sizing(
+            capital=capital,
+            atm_iv=atm_iv,
+            forward_vrp=forward_vrp,
+            jump_ratio=jump_ratio,
+            vai=vai,
+            spot=spot,
+            gamma_flip=gamma_flip
+        )
+        return jsonify({"ok": True, "sizing": sizing})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

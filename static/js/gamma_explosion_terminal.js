@@ -370,20 +370,20 @@
             const widthPct = Math.min(100, Math.max(4, (Math.abs(s.gex) / maxAbs) * 100)).toFixed(1);
 
             let rowCls = 'ge-ladder-row';
-            if (isPin) rowCls += ' is-pin';
-            if (isNearSpot) rowCls += ' is-spot';
+            if (isPin) rowCls += ' is-pin glow-max-pain';
+            if (isNearSpot) rowCls += ' is-spot glow-atm';
 
             html += `
                 <div class="${rowCls}">
                     <div class="ge-strike-lbl">
                         ${s.strike}
-                        ${isPin ? '<span style="color:var(--accent-amber); font-size:11px; margin-left:4px;">★ PIN</span>' : ''}
-                        ${isNearSpot ? '<span style="color:var(--accent-cyan); font-size:10px; margin-left:4px;">● ATM</span>' : ''}
+                        ${isPin ? '<span class="wall-badge-pain">★ PIN</span>' : ''}
+                        ${isNearSpot ? '<span class="wall-badge-atm">● ATM</span>' : ''}
                     </div>
                     <div class="ge-bar-track">
                         <div class="ge-bar-fill ${isPos ? 'pos' : 'neg'}" style="width: ${widthPct}%;"></div>
                     </div>
-                    <div class="ge-val-mono" style="color: ${isPos ? '#00e676' : '#ff3366'};">
+                    <div class="ge-val-mono ${isPos ? 'dealer-glow-green' : 'dealer-glow-red'}">
                         ${isPos ? '+' : ''}${gexCr} Cr
                     </div>
                 </div>
@@ -394,9 +394,71 @@
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 5. MASTER UPDATE LOOP
+    // 5. DOM CLEANUP & DEALER POSITIONING GLOWS (No Candlesticks / Reels)
+    // ─────────────────────────────────────────────────────────────────────────
+    function cleanupMMDOM() {
+        // Strip live nifty candlesticks, Reel 1, and Reel 2 spotlights
+        document.querySelectorAll('.ge-chart-card, .ge-grid, #ge-interactive-chart, #ge-reel1-spotlight, #ge-reel2-spotlight').forEach(el => {
+            el.remove();
+        });
+    }
+
+    function enhanceDealerInventoryGlows(payload, spot) {
+        const mmTab = document.getElementById('tab-mm');
+        if (!mmTab) return;
+        cleanupMMDOM();
+
+        // Highlight Per-Strike Institutional Inventory Table rows
+        const rows = mmTab.querySelectorAll('table tbody tr');
+        rows.forEach(tr => {
+            const tds = tr.querySelectorAll('td');
+            if (tds.length < 5) return;
+
+            const strikeText = tds[0].textContent.trim();
+            const strikeVal = parseFloat(strikeText);
+
+            if (payload && payload.call_wall && payload.call_wall.strike === strikeVal) {
+                tr.classList.add('glow-call-wall');
+                if (!tds[0].querySelector('.wall-badge-cw1')) {
+                    tds[0].innerHTML += ' <span class="wall-badge-cw1">CW ①</span>';
+                }
+            } else if (payload && payload.put_wall && payload.put_wall.strike === strikeVal) {
+                tr.classList.add('glow-put-wall');
+                if (!tds[0].querySelector('.wall-badge-pw1')) {
+                    tds[0].innerHTML += ' <span class="wall-badge-pw1">PW ①</span>';
+                }
+            } else if (Math.abs(strikeVal - spot) <= 25) {
+                tr.classList.add('glow-atm');
+                if (!tds[0].querySelector('.wall-badge-atm')) {
+                    tds[0].innerHTML += ' <span class="wall-badge-atm">ATM</span>';
+                }
+            }
+
+            // Dealer Gamma column (td 4)
+            const gammaTd = tds[4];
+            if (gammaTd) {
+                const gt = gammaTd.textContent.trim();
+                if (gt.startsWith('+')) gammaTd.classList.add('dealer-glow-green');
+                else if (gt.startsWith('-')) gammaTd.classList.add('dealer-glow-red');
+            }
+
+            // Dealer Delta column (td 5)
+            if (tds.length > 5) {
+                const deltaTd = tds[5];
+                const dt = deltaTd.textContent.trim();
+                if (dt.startsWith('+')) deltaTd.classList.add('dealer-glow-cyan');
+                else if (dt.startsWith('-')) deltaTd.classList.add('dealer-glow-red');
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6. MASTER UPDATE LOOP
     // ─────────────────────────────────────────────────────────────────────────
     async function updateTerminal() {
+        // Enforce cleanup immediately
+        cleanupMMDOM();
+
         const payload = await fetchExplosionData();
         if (!payload || !payload.ok) return;
 
@@ -412,10 +474,11 @@
             // ignore
         }
 
-        renderPlotlyChart(payload);
-        renderReel1Spotlight(payload.active_pins, spot);
-        renderReel2Spotlight(payload.retest_absorptions, payload.explosion_targets, spot);
+        // Render Strike Ladder
         renderStrikeLadder(gexData, payload.active_pins, spot);
+
+        // Apply institutional dealer positioning glows
+        enhanceDealerInventoryGlows(payload, spot);
 
         // Update home quick-launch banner if present
         const bannerPin = document.getElementById('ge-banner-pin');
