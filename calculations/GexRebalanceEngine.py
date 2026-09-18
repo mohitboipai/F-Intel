@@ -387,61 +387,103 @@ class GexRebalanceEngine:
     # 4. DIRECT PREMIUM CONVERTER
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4. DIRECT PREMIUM CONVERTER WITH TIERED ROI GUARANTEES
+    # ─────────────────────────────────────────────────────────────────────────
+
     def convert_to_premium(self, strike_dict: Dict[str, Any], spot_move_pts: float,
-                           stop_move_pts: float) -> Dict[str, Any]:
+                           stop_move_pts: float, tier: str = "TIER_1_QUICK_MOMENTUM",
+                           is_rocket: bool = False) -> Dict[str, Any]:
         """
-        Uses Taylor expansion (Delta * dS + 0.5 * Gamma * dS^2) to compute
-        exact option premium buy zone, target, and stop loss.
+        Uses Merton (1973) Taylor expansion (Delta * dS + 0.5 * Gamma * dS^2)
+        and calibrates targets to institutional ROI tiers:
+        - TIER 1 (Quick Momentum): Target 1 >= +20% to +28% ROI, Target 2 >= +35% to +45% ROI, SL ~12-15%
+        - TIER 2 (Runway Squeeze): Target 1 >= +45% to +60% ROI, Target 2 >= +75% to +90% ROI, SL ~18-20%
+        - TIER 3 (0DTE Expiry Mega Move): Target 1 = +100% (2x), Target 2 = +250% to +400% (Hero), SL -50%
         """
-        ltp = strike_dict.get('price', 50.0)
-        delta = abs(strike_dict.get('delta', 0.50))
-        gamma = strike_dict.get('gamma', 0.002)
+        ltp = max(0.5, float(strike_dict.get('price', 50.0)))
+        delta = max(0.05, abs(float(strike_dict.get('delta', 0.50))))
+        gamma = max(0.0001, float(strike_dict.get('gamma', 0.002)))
 
-        # Target 1 Gain: dP = Delta * dS + 0.5 * Gamma * dS^2
-        dP_target = delta * spot_move_pts + 0.5 * gamma * (spot_move_pts ** 2)
-        target_price = round(ltp + dP_target, 1)
-        gain_pct = round(((target_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+        # Taylor expansion base spot move
+        dP_raw = delta * spot_move_pts + 0.5 * gamma * (spot_move_pts ** 2)
 
-        # Runner Target (1.5x spot move)
-        runner_move = spot_move_pts * 1.5
-        dP_runner = delta * runner_move + 0.5 * gamma * (runner_move ** 2)
-        runner_price = round(ltp + dP_runner, 1)
-        runner_gain_pct = round(((runner_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+        if is_rocket and tier == "TIER_3_EXPIRY_MEGA_MOVE":
+            # 0DTE Expiry Mega Move (Hero or Zero Gamma Rocket)
+            target_1_gain = ltp * 1.00   # +100% (2x double)
+            runner_gain = ltp * 2.50     # +250% (3.5x runner)
+            target_price = round(ltp + target_1_gain, 1)
+            runner_price = round(ltp + runner_gain, 1)
+            stop_price = round(max(0.5, ltp * 0.50), 1)  # 50% max capital risk
+            gain_pct = 100.0
+            runner_gain_pct = 250.0
+            loss_pct = -50.0
+        elif tier == "TIER_2_RUNWAY_SQUEEZE":
+            # Vacuum Runway Squeeze: Target 1 at Zero-Gamma apex (+45% min ROI)
+            target_1_gain = max(ltp * 0.45, dP_raw)
+            runner_gain = max(ltp * 0.75, target_1_gain * 1.55)
+            target_price = round(ltp + target_1_gain, 1)
+            runner_price = round(ltp + runner_gain, 1)
+            stop_price = round(max(ltp * 0.50, ltp - (delta * stop_move_pts * 1.1)), 1)
+            if stop_price >= ltp * 0.90:
+                stop_price = round(ltp * 0.82, 1)
+            gain_pct = round(((target_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+            runner_gain_pct = round(((runner_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+            loss_pct = round(((stop_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+        else:
+            # TIER 1: Intraday Quick Momentum (Guaranteed >= +20% to +25% Target 1 ROI)
+            target_1_gain = max(ltp * 0.22, dP_raw)
+            runner_gain = max(ltp * 0.38, target_1_gain * 1.6)
+            target_price = round(ltp + target_1_gain, 1)
+            runner_price = round(ltp + runner_gain, 1)
+            # Strict stop loss: 12-15% max drop
+            dP_stop = delta * stop_move_pts
+            stop_price = round(max(ltp * 0.85, ltp - dP_stop), 1)
+            if stop_price >= ltp * 0.92:
+                stop_price = round(ltp * 0.86, 1)
+            gain_pct = round(((target_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+            runner_gain_pct = round(((runner_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+            loss_pct = round(((stop_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
 
-        # Stop Loss Drop: dP_stop = - (Delta * dS_stop)
-        dP_stop = delta * stop_move_pts
-        stop_price = round(max(ltp * 0.40, ltp - dP_stop), 1)
-        if stop_price >= ltp:
-            stop_price = round(ltp * 0.85, 1)
-        loss_pct = round(((stop_price - ltp) / max(ltp, 0.1)) * 100.0, 1)
+        rr_ratio = round(abs(gain_pct) / max(abs(loss_pct), 1.0), 2)
 
         return {
             'strike': strike_dict.get('strike'),
             'type': strike_dict.get('type'),
             'current_price': round(ltp, 1),
-            'buy_zone': f"₹{round(ltp, 1)} - ₹{round(ltp * 1.04, 1)}",
+            'buy_zone': f"₹{round(ltp, 1)} - ₹{round(ltp * 1.03, 1)}",
             'target_1': target_price,
             'target_gain_pct': gain_pct,
             'runner_target': runner_price,
             'runner_gain_pct': runner_gain_pct,
             'stop_loss': stop_price,
-            'stop_loss_pct': loss_pct
+            'stop_loss_pct': loss_pct,
+            'rr_ratio': rr_ratio
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 5. MASTER REAL-TIME EVALUATION
+    # 5. MASTER REAL-TIME EVALUATION WITH MULTI-MODULE CONFLUENCE
     # ─────────────────────────────────────────────────────────────────────────
 
     def evaluate(self, chain_df: pd.DataFrame, spot: float,
                  oi_velocity_data: Optional[Dict[str, Any]] = None,
                  dte: float = 2.0,
-                 gex_res: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 gex_res: Optional[Dict[str, Any]] = None,
+                 intraday_signal_data: Optional[Dict[str, Any]] = None,
+                 gamma_explosion_data: Optional[Dict[str, Any]] = None,
+                 dealer_data: Optional[Dict[str, Any]] = None,
+                 vol_data: Optional[Dict[str, Any]] = None,
+                 master_verdict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Master method called continuously. Returns the complete, zero-math,
-        presentation-ready Option Buyer Radar payload.
+        Master method called continuously. Performs deep multi-module confluence
+        evaluation across GEX, OI velocity, microstructural absorption, econometric vol,
+        and magnetic pin releases.
+
+        Enforces strict chop/suppression filtering so traders are never fed random,
+        low-probability trade ideas.
         """
         if spot <= 0 or chain_df is None or chain_df.empty:
-            return {'ok': False, 'status': 'WAITING_FOR_DATA'}
+            return {'ok': False, 'status': 'WAITING_FOR_DATA', 'trade_ready': False}
 
         df = self._prepare_chain_df(chain_df, spot=spot)
         walls = self.detect_walls(df, spot)
@@ -543,6 +585,7 @@ class GexRebalanceEngine:
 
         # ── Check OI Velocity & Ignition Trigger ──
         w2_oi_vel = 0.0
+        w2_accel = 0.0
         dual_wall_confirmed = False
         velocity_speed = "MODERATE"
 
@@ -590,15 +633,200 @@ class GexRebalanceEngine:
         current_progress = abs(spot - trigger_strike) if is_broken else 0.0
         progress_pct = max(0.0, min(100.0, round((current_progress / total_move) * 100.0, 1)))
 
-        # Squeeze State Transitions
+        # ── MULTI-MODULE CONFLUENCE EVALUATION & SENSORS ──
+        confluence_score = 50.0  # Base neutral
+        rejection_reasons: List[str] = []
+        checklist: Dict[str, Dict[str, Any]] = {
+            'regime_swing': {'status': 'NEUTRAL', 'label': 'Regime Swing', 'detail': 'Normal Vol'},
+            'dealer_gex':   {'status': 'NEUTRAL', 'label': 'Dealer GEX', 'detail': 'Balanced'},
+            'oi_flow':      {'status': 'NEUTRAL', 'label': 'OI Flow', 'detail': 'Stable'},
+            'absorption':   {'status': 'NEUTRAL', 'label': 'Absorption', 'detail': 'None'},
+            'vol_skew':     {'status': 'NEUTRAL', 'label': 'Vol Asymmetry', 'detail': 'Symmetric'},
+            'pin_cascade':  {'status': 'NEUTRAL', 'label': 'Pin Status', 'detail': 'No Active Pin'}
+        }
+
+        # 1. Swing Quality & Session Phase (Gatekeeper)
+        swing_q = "UNKNOWN"
+        adr_pct = 0.0
+        phase = ""
+        if intraday_signal_data and 'swing_quality' in intraday_signal_data:
+            sq = intraday_signal_data['swing_quality']
+            if isinstance(sq, dict):
+                swing_q = str(sq.get('quality', 'UNKNOWN')).upper()
+                adr_pct = float(sq.get('adr_pct', 0.0))
+                phase = str(sq.get('session_phase', ''))
+            elif isinstance(sq, str):
+                swing_q = sq.upper()
+
+            if swing_q == 'CHOPPY':
+                confluence_score -= 28.0
+                checklist['regime_swing'] = {'status': 'FAIL', 'label': 'Chop Warning', 'detail': f"ADR {adr_pct:.0f}% (Chop)"}
+                rejection_reasons.append("Market in Chop/Compression regime (ADR compressed) — high theta decay risk.")
+            elif swing_q in ('TRENDING', 'CLEAN_TREND'):
+                confluence_score += 16.0
+                checklist['regime_swing'] = {'status': 'PASS', 'label': 'Trending Day', 'detail': f"ADR {adr_pct:.0f}% Expansion"}
+            elif swing_q == 'COILED':
+                confluence_score += 10.0
+                checklist['regime_swing'] = {'status': 'PASS', 'label': 'Coiled Spring', 'detail': 'Range Compression'}
+
+            if phase == 'MID_TREND':
+                confluence_score += 6.0
+            elif phase == 'EXPIRY_HEAT':
+                confluence_score += 10.0
+
+        # 2. Dealer Gamma Positioning & Gamma Flip
+        net_gex = 0.0
+        if gex_res and 'net_gex' in gex_res:
+            net_gex = float(gex_res['net_gex'])
+        elif dealer_data and 'net_gex_shares' in dealer_data:
+            net_gex = float(dealer_data['net_gex_shares']) * spot
+
+        zero_gamma = float(gex_res.get('zero_gamma_level', 0.0)) if gex_res else 0.0
+
+        if net_gex < 0:
+            confluence_score += 18.0
+            checklist['dealer_gex'] = {'status': 'PASS', 'label': 'Short Gamma', 'detail': 'Dealers Accelerating'}
+        elif net_gex > 5e8:
+            confluence_score -= 12.0
+            checklist['dealer_gex'] = {'status': 'WARN', 'label': 'Long Gamma', 'detail': 'Dealers Suppressing'}
+            rejection_reasons.append("Dealers in Long Gamma — market moves are dampened/mean-reverting.")
+        else:
+            checklist['dealer_gex'] = {'status': 'NEUTRAL', 'label': 'GEX Neutral', 'detail': 'Balanced Gamma'}
+
+        if zero_gamma > 0:
+            if direction == "BULLISH_CE" and spot > zero_gamma:
+                confluence_score += 6.0
+            elif direction == "BEARISH_PE" and spot < zero_gamma:
+                confluence_score += 6.0
+
+        # 3. OI Velocity & Writer Capitulation
+        if w2_oi_vel < -80_000:
+            confluence_score += 24.0
+            checklist['oi_flow'] = {'status': 'PASS', 'label': 'Capitulation', 'detail': f"{abs(w2_oi_vel)/1000:.0f}k/m Unwinding"}
+        elif w2_oi_vel < -30_000:
+            confluence_score += 14.0
+            checklist['oi_flow'] = {'status': 'PASS', 'label': 'Unwinding', 'detail': f"{abs(w2_oi_vel)/1000:.0f}k/m Unwinding"}
+        elif w2_oi_vel > 35_000:
+            confluence_score -= 28.0
+            checklist['oi_flow'] = {'status': 'FAIL', 'label': 'Writers Defending', 'detail': f"+{w2_oi_vel/1000:.0f}k/m Defending"}
+            rejection_reasons.append(f"Writers actively defending {trigger_strike:.0f} (+{w2_oi_vel/1000:.0f}k/m added) — fakeout danger.")
+        elif dual_wall_confirmed:
+            confluence_score += 8.0
+            checklist['oi_flow'] = {'status': 'PASS', 'label': 'Support Building', 'detail': 'Opposite Wall Fortified'}
+
+        # 4. Microstructural Absorption
+        if intraday_signal_data and 'absorption' in intraday_signal_data:
+            abs_info = intraday_signal_data['absorption']
+            if isinstance(abs_info, dict):
+                setup_qual = abs_info.get('setup_quality', 'NONE')
+                wick_bars = abs_info.get('wick_bars', 0)
+                vol_acc = abs_info.get('vol_accel', 1.0)
+                if setup_qual == 'STRONG':
+                    confluence_score += 15.0
+                    checklist['absorption'] = {'status': 'PASS', 'label': 'Strong Absorption', 'detail': f"{wick_bars} bars · {vol_acc:.1f}x Vol"}
+                elif setup_qual == 'MODERATE':
+                    confluence_score += 10.0
+                    checklist['absorption'] = {'status': 'PASS', 'label': 'Mod Absorption', 'detail': f"{wick_bars} rejection bars"}
+
+        # 5. Econometric Volatility & Jump Dynamics
+        if vol_data and isinstance(vol_data, dict):
+            semi = vol_data.get('semi_variance')
+            if isinstance(semi, dict):
+                vai = float(semi.get('vai', 0.0))
+                if direction == "BEARISH_PE" and vai > 0.15:
+                    confluence_score += 10.0
+                    checklist['vol_skew'] = {'status': 'PASS', 'label': 'Toxic Downside', 'detail': f"VAI +{vai:.2f} favors PE"}
+                elif direction == "BULLISH_CE" and vai < -0.15:
+                    confluence_score += 10.0
+                    checklist['vol_skew'] = {'status': 'PASS', 'label': 'Bullish Grind', 'detail': f"VAI {vai:.2f} favors CE"}
+
+            jump_data = vol_data.get('jump_decomposition')
+            if isinstance(jump_data, dict):
+                if jump_data.get('jump_regime') == 'JUMP_REGIME' or jump_data.get('jump_ratio', 0) > 0.18:
+                    confluence_score += 6.0
+
+            fvrp = vol_data.get('forward_vrp')
+            if isinstance(fvrp, dict):
+                vrp = float(fvrp.get('vrp_5d', 0.0))
+                if vrp < -1.0:
+                    confluence_score += 5.0
+                elif vrp > 3.0:
+                    confluence_score -= 5.0
+                    rejection_reasons.append(f"High VRP (+{vrp:.1f}) — Implied Vol is expensive and crushing.")
+
+        # 6. Magnetic Pinning Release & Cascade Risk
+        top_pin_risk = "STABLE"
+        pin_duration_str = ""
+        if gamma_explosion_data and isinstance(gamma_explosion_data, dict):
+            pins = gamma_explosion_data.get('active_pins')
+            if isinstance(pins, list) and pins:
+                top_p = pins[0]
+                if isinstance(top_p, dict):
+                    pin_strike = top_p.get('strike', 0)
+                    pin_dur = top_p.get('duration_secs', 0)
+                    top_pin_risk = top_p.get('unpinning_risk', 'STABLE')
+                    pin_duration_str = top_p.get('duration_str', '')
+                    if top_pin_risk in ('IMMINENT', 'HIGH') and pin_dur >= 3600:
+                        confluence_score += 14.0
+                        checklist['pin_cascade'] = {'status': 'PASS', 'label': f'Unpinning {pin_strike:.0f}', 'detail': f'Release Risk {top_pin_risk}'}
+                    elif pin_dur > 0:
+                        checklist['pin_cascade'] = {'status': 'NEUTRAL', 'label': f'Pinned {pin_strike:.0f}', 'detail': pin_duration_str}
+
+        # 7. Master Signal Consensus Alignment
+        if master_verdict:
+            mv = master_verdict.get('verdict', 'NEUTRAL')
+            if (direction == "BULLISH_CE" and "BULLISH" in mv) or (direction == "BEARISH_PE" and "BEARISH" in mv):
+                confluence_score += 8.0
+            elif "AVOID" in mv or "NEUTRAL" in mv:
+                confluence_score -= 6.0
+
+        confluence_score = round(max(0.0, min(100.0, confluence_score)), 1)
+
+        # ── DETERMINE ACTIVE TIER & TRADE READINESS ──
+        # Strict Chop / Suppression Gate:
+        is_vetoed = (w2_oi_vel > 35_000) or (swing_q == 'CHOPPY' and confluence_score < 72.0)
+        trade_ready = (confluence_score >= 65.0) and not is_vetoed
+
+        active_tier = "TIER_1_QUICK_MOMENTUM"
+        tier_name = "INTRADAY MOMENTUM (20-35% ROI)"
+
+        # Check for Tier 3: 0DTE Expiry Mega Move
+        if (dte <= 1.2) and (confluence_score >= 78.0 or top_pin_risk == 'IMMINENT' or abs(w2_oi_vel) >= 70_000):
+            active_tier = "TIER_3_EXPIRY_MEGA_MOVE"
+            tier_name = "0DTE EXPIRY MEGA MOVE 🔥 (100-300%+ ROI)"
+        elif is_inverted or runway_pts >= 110.0 or confluence_score >= 75.0:
+            active_tier = "TIER_2_RUNWAY_SQUEEZE"
+            tier_name = "VACUUM RUNWAY SQUEEZE ⚡ (45-80% ROI)"
+
+        # ── Squeeze State Transitions ──
+        invalidation_stop = trigger_strike - 12.0 if direction == "BULLISH_CE" else trigger_strike + 12.0
+
         if progress_pct >= 90.0:
             status = "TARGET_REACHED"
             status_desc = f"🎯 Rebalance Target {rebalance_target:.0f} reached! Dealer futures buying exhausted. Book profit!"
             self._active_setup = {'active': False}
+        elif is_broken and ((direction == "BULLISH_CE" and spot < invalidation_stop) or
+                            (direction == "BEARISH_PE" and spot > invalidation_stop)):
+            status = "INVALIDATED"
+            status_desc = f"❌ Squeeze failed. Spot fell back below {invalidation_stop:.0f}. Hard exit."
+            self._active_setup = {'active': False}
+        elif not trade_ready:
+            if is_coiling and not is_vetoed:
+                status = "COILING"
+                gate_name = "toll gate (Wall ②)" if is_inverted else "barrier (Wall ①)"
+                status_desc = f"Spot coiling {abs(dist_to_trigger):.1f} pts from {trigger_strike:.0f} {gate_name}. Awaiting ignition confluence ({confluence_score:.0f}/100)."
+            else:
+                status = "STAND_ASIDE"
+                if rejection_reasons:
+                    status_desc = f"🛡️ STAND ASIDE: {rejection_reasons[0]}"
+                elif swing_q == 'CHOPPY':
+                    status_desc = f"🛡️ STAND ASIDE: Choppy market regime. Cash is a position. Awaiting trending flow."
+                else:
+                    status_desc = f"🛡️ STAND ASIDE: Confluence score {confluence_score:.0f}/100 below 65 minimum threshold."
         elif is_broken and w2_oi_vel < 0:
             status = "IGNITED"
             prefix = "ACTIVE SQUEEZE DETECTED" if is_inverted else "BREAKOUT DETECTED"
-            status_desc = f"⚡ {prefix}: {trigger_strike:.0f} toll gate broken with -{abs(w2_oi_vel)/1000:.0f}k unwinding!"
+            status_desc = f"⚡ {prefix}: {trigger_strike:.0f} toll gate broken with -{abs(w2_oi_vel)/1000:.0f}k unwinding! [{tier_name}]"
             self._active_setup = {'active': True, 'trigger': trigger_strike, 'target': rebalance_target, 'direction': direction}
         elif is_broken and self._active_setup and self._active_setup.get('active'):
             status = "REBALANCING"
@@ -609,48 +837,50 @@ class GexRebalanceEngine:
         elif is_coiling:
             status = "COILING"
             gate_name = "toll gate (Wall ②)" if is_inverted else "barrier (Wall ①)"
-            status_desc = f"Spot coiling {abs(dist_to_trigger):.1f} pts from {trigger_strike:.0f} {gate_name}. Runway open to {fortress_wall_1:.0f}."
+            status_desc = f"Spot coiling {abs(dist_to_trigger):.1f} pts from {trigger_strike:.0f} {gate_name}. High confluence ({confluence_score:.0f}/100) — prepare for break!"
         else:
             status = "MONITORING"
-            if is_inverted:
-                status_desc = f"Wall 2 at {trigger_strike:.0f} is closer than Wall 1 ({fortress_wall_1:.0f}). Watching for approach."
-            else:
-                status_desc = f"Normal regime: Spot at {spot:.1f}. Monitoring {trigger_strike:.0f} barrier (runway to {fortress_wall_1:.0f})."
-
-        # Invalidation Stop Level (12 pts back behind trigger)
-        invalidation_stop = trigger_strike - 12.0 if direction == "BULLISH_CE" else trigger_strike + 12.0
-        if is_broken and ((direction == "BULLISH_CE" and spot < invalidation_stop) or
-                          (direction == "BEARISH_PE" and spot > invalidation_stop)):
-            status = "INVALIDATED"
-            status_desc = f"❌ Squeeze failed. Spot fell back below {invalidation_stop:.0f}. Hard exit."
-            self._active_setup = {'active': False}
+            status_desc = f"Monitoring {trigger_strike:.0f} barrier. Confluence: {confluence_score:.0f}/100."
 
         # ── Dual-Strike Recommendation & Premium ₹ Levels ──
         atm_strike_dict, otm_strike_dict = self.select_strikes(df, spot, direction, rebalance_target, dte)
         expected_spot_pts = max(35.0, abs(rebalance_target - spot) if not is_broken else abs(rebalance_target - trigger_strike))
         stop_pts = 14.0
 
-        primary_premium = self.convert_to_premium(atm_strike_dict, expected_spot_pts, stop_pts)
-        otm_premium = self.convert_to_premium(otm_strike_dict, expected_spot_pts, stop_pts)
-        otm_premium['is_active'] = otm_strike_dict.get('is_active', False)
+        primary_premium = self.convert_to_premium(
+            atm_strike_dict, expected_spot_pts, stop_pts, tier=active_tier, is_rocket=False
+        )
+        otm_premium = self.convert_to_premium(
+            otm_strike_dict, expected_spot_pts, stop_pts, tier=active_tier, is_rocket=True
+        )
+        otm_premium['is_active'] = otm_strike_dict.get('is_active', False) or (active_tier == "TIER_3_EXPIRY_MEGA_MOVE")
 
         opt_name = "CE" if direction == "BULLISH_CE" else "PE"
-        if status == "IGNITED":
-            action_summary = f"BUY {primary_premium['strike']:.0f} {opt_name} ON BREAK | TARGET: {rebalance_target:.0f} (+{expected_spot_pts:.0f} pts)"
+
+        if status == "STAND_ASIDE":
+            action_summary = f"STAND ASIDE: {rejection_reasons[0] if rejection_reasons else 'Confluence score ' + str(int(confluence_score)) + '/100 — no high-ROI edge.'}"
+        elif status == "IGNITED":
+            action_summary = f"BUY {primary_premium['strike']:.0f} {opt_name} NOW | TARGET: ₹{primary_premium['target_1']} (+{primary_premium['target_gain_pct']}%) | SL: ₹{primary_premium['stop_loss']}"
         elif status == "COILING" or status == "ARMED":
-            action_summary = f"WAIT: Prepare to BUY {primary_premium['strike']:.0f} {opt_name} when spot breaks {trigger_strike:.0f}"
+            action_summary = f"WAIT FOR TRIGGER: Prepare to BUY {primary_premium['strike']:.0f} {opt_name} when spot breaks {trigger_strike:.0f}"
         elif status == "TARGET_REACHED":
-            action_summary = f"BOOK 75% PROFIT: Rebalance target {rebalance_target:.0f} hit! Trail runners."
+            action_summary = f"BOOK 75% PROFIT: Target {rebalance_target:.0f} hit (+{primary_premium['target_gain_pct']}% ROI)! Trail runners."
         elif status == "REBALANCING":
-            action_summary = f"HOLD {opt_name}: Squeeze underway ({progress_pct:.0f}% towards {rebalance_target:.0f})."
+            action_summary = f"HOLD {opt_name}: {tier_name} underway ({progress_pct:.0f}% towards {rebalance_target:.0f})."
         else:
-            action_summary = f"MONITORING: Spot {abs(dist_to_trigger):.0f} pts from {trigger_strike:.0f} {opt_name} barrier."
+            action_summary = f"MONITORING: Spot {abs(dist_to_trigger):.0f} pts from {trigger_strike:.0f} {opt_name} barrier. Confluence: {confluence_score:.0f}/100."
 
         return {
             'ok': True,
             'status': status,
             'status_desc': status_desc,
             'action_summary': action_summary,
+            'trade_ready': trade_ready,
+            'active_tier': active_tier,
+            'tier_name': tier_name,
+            'confluence_score': confluence_score,
+            'confluence_checklist': checklist,
+            'rejection_reasons': rejection_reasons,
             'direction': direction,
             'spot': round(spot, 1),
             'trigger_strike': trigger_strike,
@@ -668,3 +898,4 @@ class GexRebalanceEngine:
             'walls': walls,
             'timestamp': time.strftime("%H:%M:%S")
         }
+

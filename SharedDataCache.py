@@ -62,10 +62,10 @@ class SharedDataCache:
         # ── Listeners: list of callables notified on new spot ────────
         self._spot_listeners = []
 
-        # ── OI Snapshot Ring (for per-strike OI velocity) ────────────
-        # Each entry: {'ts': float, 'oi_map': {(strike, type): int}}
-        # 60 snapshots at 30s cadence ≈ 30 min of OI history
-        self._oi_ring: collections.deque = collections.deque(maxlen=60)
+        # ── OI Snapshot Ring (for per-strike OI velocity & historical rewind) ─
+        # Each entry: {'ts': float, 'time_str': str, 'spot': float, 'oi_map': {(strike, type): int}}
+        # 1500 snapshots with ~10s throttling ≈ 4-6+ hours of rolling OI history (full trading session)
+        self._oi_ring: collections.deque = collections.deque(maxlen=1500)
 
         # ── 1-Min Candle Ring (for multi-candle absorption scoring) ──
         # Each entry: [ts, open, high, low, close, volume]  (Fyers format)
@@ -76,20 +76,35 @@ class SharedDataCache:
     # OI SNAPSHOT RING
     # ─────────────────────────────────────────────────────────────────
 
-    def push_oi_snapshot(self, chain_df: pd.DataFrame):
+    def push_oi_snapshot(self, chain_df: pd.DataFrame, spot: float = 0.0):
         """
         Push a fresh OI snapshot from the live chain DataFrame.
-        Called by DataServer's 30s chain refresh loop.
-        Stores {(strike, type): oi} keyed map with a timestamp.
+        Called by DataServer's chain refresh loop.
+        Stores {(strike, type): oi} keyed map with timestamp, time_str, and spot.
         """
         if chain_df is None or chain_df.empty:
             return
         try:
+            now_ts = time.time()
+            spot_val = float(spot or self._spot or 0.0)
+
+            # Throttling: If last snapshot was recorded < 8s ago and spot hasn't moved noticeably, avoid duplicate
+            if self._oi_ring:
+                last_snap = self._oi_ring[-1]
+                if (now_ts - last_snap['ts'] < 8.0) and abs(spot_val - last_snap.get('spot', 0.0)) < 3.0:
+                    return
+
             oi_map = {}
             for _, row in chain_df[['strike', 'type', 'oi']].iterrows():
                 key = (float(row['strike']), str(row['type']))
                 oi_map[key] = int(row.get('oi', 0) or 0)
-            self._oi_ring.append({'ts': time.time(), 'oi_map': oi_map})
+            time_str = datetime.now().strftime('%H:%M:%S')
+            self._oi_ring.append({
+                'ts': now_ts,
+                'time_str': time_str,
+                'spot': spot_val,
+                'oi_map': oi_map
+            })
         except Exception:
             pass
 

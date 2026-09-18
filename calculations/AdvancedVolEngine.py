@@ -26,7 +26,7 @@ class RealizedSemiVariance:
     """
 
     @staticmethod
-    def calculate(returns: np.ndarray, annualize: bool = True, periods_per_year: int = 252) -> Dict[str, float]:
+    def calculate(returns: np.ndarray, annualize: bool = True, periods_per_year: int = 252) -> Dict[str, Any]:
         """
         Calculate RV+, RV-, and Volatility Asymmetry Index (VAI).
         :param returns: Array of periodic log returns
@@ -125,8 +125,13 @@ class CorsiHARModel:
         if len(df) < 20:
             return False
 
-        y = df["y"].values
-        X = np.column_stack([np.ones(len(df)), df["rv_d"].values, df["rv_w"].values, df["rv_m"].values])
+        y = np.asarray(df["y"].values, dtype=float)
+        X = np.column_stack([
+            np.ones(len(df)),
+            np.asarray(df["rv_d"].values, dtype=float),
+            np.asarray(df["rv_w"].values, dtype=float),
+            np.asarray(df["rv_m"].values, dtype=float)
+        ])
 
         try:
             # OLS via pseudo-inverse
@@ -270,7 +275,7 @@ class HigherMoments:
     """
 
     @staticmethod
-    def calculate(returns: np.ndarray) -> Dict[str, float]:
+    def calculate(returns: np.ndarray) -> Dict[str, Any]:
         clean_rets = returns[~np.isnan(returns)]
         N = len(clean_rets)
         if N < 8:

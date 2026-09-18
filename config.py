@@ -103,6 +103,10 @@ _DEFAULTS: dict[str, Any] = {
     "rv_weight_c2c"           : 0.20,
     "rv_weight_park"          : 0.20,
     "rv_weight_gk"            : 0.20,
+
+    # ── Trade Execution Broadcasting ──────────────────────────────────────────
+    "enable_trade_broadcast"  : True,     # Broadcast setups to minion nodes
+    "minion_endpoints"        : ["http://127.0.0.1:5000/execute_trade"],
 }
 
 # ── Section mapping for structured JSON storage ───────────────────────────────
@@ -123,6 +127,7 @@ _SECTION_MAP: dict[str, str] = {
     "vov_turbulent": "vol_signals",
     "rv_weight_yz": "vol_signals", "rv_weight_c2c": "vol_signals",
     "rv_weight_park": "vol_signals", "rv_weight_gk": "vol_signals",
+    "enable_trade_broadcast": "execution", "minion_endpoints": "execution",
 }
 
 # ── Active config state (in-memory; may differ from disk after load_profile) ──

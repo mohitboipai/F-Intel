@@ -2,7 +2,8 @@ import subprocess
 import re
 import sys
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, 'reconfigure'):
+    getattr(sys.stdout, 'reconfigure')(encoding='utf-8')
 old_tpl = subprocess.check_output(['git', 'show', 'd626fb2:templates/unified_dashboard.html'], encoding='utf-8', errors='ignore')
 
 m = re.search(r'(<section id="tab-theta"[^>]*>.*?</section>)', old_tpl, re.DOTALL)

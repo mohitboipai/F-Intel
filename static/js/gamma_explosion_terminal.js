@@ -497,7 +497,7 @@
         init: function () {
             updateTerminal();
             if (!_pollTimer) {
-                _pollTimer = setInterval(updateTerminal, 5000);
+                _pollTimer = setInterval(updateTerminal, 1500);
             }
         },
         refresh: updateTerminal,

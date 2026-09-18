@@ -747,14 +747,14 @@ class IntradayGammaSignalEngine:
                 t1_spot    = round(closest_level + 50.0, 1)
                 t2_spot    = round(closest_level + tgt_off, 1)
                 opt_type   = "CE"
-                opt_strike = int(round((closest_level + 50.0) / 50.0) * 50)
+                opt_strike = round((closest_level + 50.0) / 50.0) * 50
             else:
                 entry_zone = [round(closest_level - 20.0, 1), round(closest_level - 5.0, 1)]
                 sl_spot    = round(closest_level + sl_off, 1)
                 t1_spot    = round(closest_level - 50.0, 1)
                 t2_spot    = round(closest_level - tgt_off, 1)
                 opt_type   = "PE"
-                opt_strike = int(round((closest_level - 50.0) / 50.0) * 50)
+                opt_strike = round((closest_level - 50.0) / 50.0) * 50
             opt_price = 0.0
 
         risk_pts   = round(abs(entry_zone[0] - sl_spot), 1)

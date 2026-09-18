@@ -502,6 +502,7 @@ class VolatilityAnalyzer:
         for crow_dict in df_chain.to_dict('records'):
             chain_map[(round(float(crow_dict['strike'])), str(crow_dict['type']))] = crow_dict
 
+        _lot = _get_cfg("nifty_lot_size", 65)
         _r_gex = _get_cfg("risk_free_rate", 0.051274)
         _q_gex = _get_cfg("dividend_yield", 0.0122)
         _T_gex = max(T, 1 / 365)
@@ -538,12 +539,16 @@ class VolatilityAnalyzer:
             sig_ce = max(ce_iv_val / 100.0, 0.02) if ce_iv_val > 0 else sigma
             d1_ce = (np.log(spot / strike) + (_r_gex - _q_gex + 0.5 * sig_ce**2) * _T_gex) / (sig_ce * _sqT)
             gamma_ce = np.exp(-_q_gex * _T_gex) * np.exp(-0.5 * d1_ce**2) / (np.sqrt(2 * np.pi) * spot * sig_ce * _sqT) if (spot > 0 and strike > 0) else 0.0
-            ce_gex_lots = -1.0 * ce_oi * gamma_ce * 50.0
+            ce_contracts = (ce_oi / _lot) if ce_oi > 100_000 else float(ce_oi)
+            ce_gex_lots = +1.0 * ce_contracts * gamma_ce * 50.0
+            ce_gex_cr = (+1.0 * ce_contracts * _lot * gamma_ce * spot * spot * 0.01) / 1e7
 
             sig_pe = max(pe_iv_val / 100.0, 0.02) if pe_iv_val > 0 else sigma
             d1_pe = (np.log(spot / strike) + (_r_gex - _q_gex + 0.5 * sig_pe**2) * _T_gex) / (sig_pe * _sqT)
             gamma_pe = np.exp(-_q_gex * _T_gex) * np.exp(-0.5 * d1_pe**2) / (np.sqrt(2 * np.pi) * spot * sig_pe * _sqT) if (spot > 0 and strike > 0) else 0.0
-            pe_gex_lots = +1.0 * pe_oi * gamma_pe * 50.0
+            pe_contracts = (pe_oi / _lot) if pe_oi > 100_000 else float(pe_oi)
+            pe_gex_lots = -1.0 * pe_contracts * gamma_pe * 50.0
+            pe_gex_cr = (-1.0 * pe_contracts * _lot * gamma_pe * spot * spot * 0.01) / 1e7
 
             dist_ce = strike - spot
             try:
@@ -584,6 +589,7 @@ class VolatilityAnalyzer:
                 pe_signal = "ITM"
 
             net_gex_lots = ce_gex_lots + pe_gex_lots
+            net_gex_cr = ce_gex_cr + pe_gex_cr
             is_atm = abs(strike - spot) < 60
 
             chain_rows.append({
@@ -595,6 +601,8 @@ class VolatilityAnalyzer:
                 'ce_iv': ce_iv_val, 'pe_iv': pe_iv_val,
                 'ce_gex_lots': ce_gex_lots, 'pe_gex_lots': pe_gex_lots,
                 'net_gex_lots': net_gex_lots,
+                'ce_gex_cr': ce_gex_cr, 'pe_gex_cr': pe_gex_cr,
+                'net_gex_cr': net_gex_cr,
                 'is_atm': is_atm,
                 'ce_prob_otm': ce_prob_otm, 'ce_theta': ce_theta, 'ce_signal': ce_signal,
                 'pe_prob_otm': pe_prob_otm, 'pe_theta': pe_theta, 'pe_signal': pe_signal
@@ -2500,15 +2508,15 @@ class VolatilityAnalyzer:
         print(f"  Local server: {_base_url}/")
 
         first_run = True
-        DARK_BG = '#0f0f19'
-        CARD_BG = '#1a1a2e'
-        ACCENT = '#4fc3f7'
-        RED = '#ff4444'
-        GREEN = '#66bb6a'
+        DARK_BG = '#131722'
+        CARD_BG = '#1e222d'
+        ACCENT = '#00e5ff'
+        RED = '#ff3366'
+        GREEN = '#00e676'
         YELLOW = '#ffd54f'
-        WHITE = '#e0e0e0'
-        MUTED = '#888'
-        colors = ['#4fc3f7', '#ff7043', '#66bb6a', '#ab47bc', '#ffa726', '#ef5350']
+        WHITE = '#ffffff'
+        MUTED = '#868993'
+        colors = ['#00e5ff', '#ff7043', '#00e676', '#b388ff', '#ffd54f', '#ff3366']
 
         # ── ONE-TIME DATA (cached across refreshes) ──
         vol_data = {}
@@ -3165,8 +3173,8 @@ class VolatilityAnalyzer:
                     _live_iv = (vol_intel or {}).get('iv', 0)
                     _live_hv  = (vol_intel or {}).get('current_hv', 0)
                     
-                    # ATM IV for prob density (prefer vol intel)
-                    _pd_iv = _live_iv
+                    # ATM IV for prob density (prefer vol intel, fallback to HV or 12.0)
+                    _pd_iv = _live_iv if _live_iv > 0 else (_live_hv if _live_hv > 0 else 12.0)
                     # Heston calibration + MC density
                     T_near = self.analytics.get_time_to_expiry(near_exp)
                     heston_params = _calibrate_heston(spot, df_chain.copy() if not df_chain.empty else df_chain, T_near)
@@ -3235,105 +3243,218 @@ class VolatilityAnalyzer:
                     #  BUILD HTML
                     # ══════════════════════════════════════════
 
-                    # ── TAB 1: IV SURFACE (reuse existing plotly logic) ──
-                    iv_tab_html = ""
-                    if points:
-                        fig = make_subplots(rows=1, cols=2,
-                            specs=[[{"type": "xy"}, {"type": "scene"}]],
-                            subplot_titles=[
-                                f"IV SMILE  |  {pred['direction']} ({pred['confidence']:.0%})",
-                                f"3D SURFACE  |  Term: {pred['term_spread']:+.1f}%"
-                            ], horizontal_spacing=0.05)
+                    # ── TAB 1: IV SURFACE (Interactive Real-Time & Rewind Terminal) ──
+                    _IV_TERMINAL_SHELL = '''
+<div id="iv-surface-card" class="iv-terminal-card">
+    <!-- Top Header -->
+    <div class="iv-header">
+        <div class="iv-title-wrap">
+            <span class="iv-title">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <path d="M8 12a4 4 0 0 1 8 0"></path>
+                </svg>
+                REAL-TIME IV SURFACE &amp; EXHAUSTION TERMINAL
+            </span>
+            <span id="iv-rewind-status-badge" class="iv-status-badge">LIVE STREAMING</span>
+        </div>
+        <div class="iv-header-right">
+            <div class="iv-spot-pill">
+                DAY OPEN: <span id="iv-open-val" style="color:#fff;">--</span>
+            </div>
+            <div class="iv-spot-pill">
+                SPOT: <span id="iv-spot-val" style="color:#fff;">--</span>
+            </div>
+            <span id="iv-snap-time" style="font-family:var(--font-mono); font-size:11px; color:var(--text-muted);">--:--:--</span>
+        </div>
+    </div>
 
-                        exp_data = {}
-                        for p in points:
-                            exp = p['expiry']
-                            if exp not in exp_data: exp_data[exp] = []
-                            exp_data[exp].append(p)
+    <!-- Mathematical Movement & Exhaustion Panel -->
+    <div class="iv-exhaustion-panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="font-family:var(--font-mono); font-size:12px; font-weight:700; color:#00e5ff; letter-spacing:1px;">
+                    QUANTITATIVE VOLATILITY BUDGET &amp; CONSUMPTION GAUGES
+                </div>
+                <span style="font-family:var(--font-mono); font-size:10px; color:#868993; background:rgba(255,255,255,0.06); padding:2px 8px; border-radius:3px;">1-DAY &amp; WEEKLY (1σ)</span>
+            </div>
+            <span id="iv-regime-tag" class="iv-regime-tag consolidation">CALCULATING</span>
+        </div>
 
-                        for i, exp in enumerate(expiries):
-                            data = exp_data.get(exp, [])
-                            if not data: continue
-                            s_map = {}
-                            for x in data:
-                                k = x['strike']
-                                if k not in s_map: s_map[k] = {'ivs': [], 'types': []}
-                                s_map[k]['ivs'].append(x['iv'])
-                                s_map[k]['types'].append(x['type'])
-                            x_val = sorted(s_map.keys())
-                            y_val = [np.mean(s_map[k]['ivs']) for k in x_val]
-                            color = colors[i % len(colors)]
-                            atm = pred.get('near_atm', 0) if i == 0 else pred.get('far_atm', 0)
-                            fig.add_trace(go.Scatter(x=x_val, y=y_val, mode='lines+markers',
-                                name=f"{exp} (ATM:{atm:.1f}%)",
-                                line=dict(color=color, width=2.5),
-                                marker=dict(size=6, color=color)), row=1, col=1)
+        <div class="iv-exhaustion-grid">
+            <!-- 1-Day Expected Move -->
+            <div class="iv-metric-tile">
+                <div class="iv-metric-label">EXPECTED 1-DAY MOVE (1σ)</div>
+                <div id="iv-exp-move-pts" class="iv-metric-value">±-- pts</div>
+                <div id="iv-exp-move-pct" class="iv-metric-sub">±--%</div>
+            </div>
+            <!-- Intraday Range -->
+            <div class="iv-metric-tile">
+                <div class="iv-metric-label">INTRADAY RANGE (H - L)</div>
+                <div id="iv-range-pts" class="iv-metric-value">-- pts</div>
+                <div id="iv-range-sub" class="iv-metric-sub">H: -- | L: --</div>
+            </div>
+            <!-- 1-Day 1σ Boundaries -->
+            <div class="iv-metric-tile">
+                <div class="iv-metric-label">1-DAY 1σ BOUNDARIES</div>
+                <div style="display:flex; gap:12px; margin-top:2px;">
+                    <div>
+                        <span style="font-size:10px; color:#868993;">UPPER:</span>
+                        <div id="iv-boundary-upper" style="font-family:var(--font-mono); font-size:13px; font-weight:700; color:#ffa726;">--</div>
+                    </div>
+                    <div>
+                        <span style="font-size:10px; color:#868993;">LOWER:</span>
+                        <div id="iv-boundary-lower" style="font-family:var(--font-mono); font-size:13px; font-weight:700; color:#ffa726;">--</div>
+                    </div>
+                </div>
+                <div class="iv-metric-sub" style="margin-top:4px;">Daily standard deviation band</div>
+            </div>
+            <!-- Weekly Expected Move -->
+            <div class="iv-metric-tile" style="border-left: 2px solid rgba(124, 77, 255, 0.4);">
+                <div class="iv-metric-label" style="color:#b388ff;">WEEKLY EXPECTED MOVE (1σ)</div>
+                <div id="iv-weekly-exp-pts" class="iv-metric-value" style="color:#e0e0ff;">±-- pts</div>
+                <div id="iv-weekly-exp-pct" class="iv-metric-sub">±--% (5-Day Horizon)</div>
+            </div>
+            <!-- Weekly Realized & 5D Range -->
+            <div class="iv-metric-tile" style="border-left: 2px solid rgba(124, 77, 255, 0.4);">
+                <div class="iv-metric-label" style="color:#b388ff;">WEEKLY REALIZED MOVE &amp; RANGE</div>
+                <div id="iv-weekly-realized-pts" class="iv-metric-value">-- pts</div>
+                <div id="iv-weekly-range-sub" class="iv-metric-sub">5D Range: -- pts (H: -- | L: --)</div>
+            </div>
+            <!-- Weekly 1σ Boundaries -->
+            <div class="iv-metric-tile" style="border-left: 2px solid rgba(124, 77, 255, 0.4);">
+                <div class="iv-metric-label" style="color:#b388ff;">WEEKLY 1σ BOUNDARIES</div>
+                <div style="display:flex; gap:12px; margin-top:2px;">
+                    <div>
+                        <span style="font-size:10px; color:#868993;">UPPER:</span>
+                        <div id="iv-weekly-boundary-upper" style="font-family:var(--font-mono); font-size:13px; font-weight:700; color:#b388ff;">--</div>
+                    </div>
+                    <div>
+                        <span style="font-size:10px; color:#868993;">LOWER:</span>
+                        <div id="iv-weekly-boundary-lower" style="font-family:var(--font-mono); font-size:13px; font-weight:700; color:#b388ff;">--</div>
+                    </div>
+                </div>
+                <div class="iv-metric-sub" style="margin-top:4px;">Expiry / Weekly volatility band</div>
+            </div>
+        </div>
 
-                        fig.add_vline(x=spot, line_dash="dash", line_color=YELLOW, line_width=2,
-                            annotation_text=f"Spot:{spot:.0f}", annotation_font_color=YELLOW,
-                            annotation_position="top right", row=1, col=1)
-                        if float(pred.get('expected_move', 0)) > 0: # type: ignore
-                            fig.add_vrect(x0=spot - float(pred.get('expected_move', 0)), x1=spot + float(pred.get('expected_move', 0)), # type: ignore
-                                fillcolor="rgba(255,213,79,0.08)", line_width=0, row=1, col=1)
+        <!-- 1-Day Gauge Bar -->
+        <div class="iv-gauge-wrap" style="margin-bottom:12px;">
+            <div class="iv-gauge-labels">
+                <span style="display:flex; align-items:center; gap:6px;">
+                    <span style="color:#00e5ff; font-weight:700;">1-DAY BUDGET:</span>
+                    <span>Spot Net Move: <b id="iv-consumption-pct-label" style="color:#00e5ff;">0%</b></span>
+                    <span style="color:var(--text-muted);">|</span>
+                    <span>Intraday Range Traversed: <b id="iv-range-consumption-label" style="color:#94a3b8;">0%</b></span>
+                </span>
+                <span style="color:#ffd54f;">100% (1σ Barrier)</span>
+            </div>
+            <div class="iv-gauge-track">
+                <div id="iv-gauge-bar-range" class="iv-gauge-bar-range" title="Intraday High-Low Range Traversed"></div>
+                <div id="iv-gauge-bar-fill" class="iv-gauge-bar" title="Current Spot Net Displacement"></div>
+                <div class="iv-gauge-marker-1sigma" title="1-Sigma Statistical Barrier (80% scale)"></div>
+            </div>
+        </div>
 
-                        # 3D surface
-                        otm = [p for p in points if
-                            (p['type'] == 'PE' and p['strike'] <= spot) or
-                            (p['type'] == 'CE' and p['strike'] >= spot)]
-                        if not otm: otm = points
-                        xs = np.array([p['strike'] for p in otm])
-                        ys = np.array([p['days'] for p in otm])
-                        zs = np.array([p['iv'] for p in otm])
-                        types = [p['type'] for p in otm]
-                        strike_grid = np.linspace(xs.min(), xs.max(), 50)
-                        days_grid = np.linspace(ys.min(), ys.max(), 25)
-                        sm, dm = np.meshgrid(strike_grid, days_grid)
-                        try:
-                            iv_mesh = griddata((xs, ys), zs, (sm, dm), method='cubic')
-                            iv_nn = griddata((xs, ys), zs, (sm, dm), method='nearest')
-                            iv_mesh = np.where(np.isnan(iv_mesh), iv_nn, iv_mesh)
-                        except:
-                            iv_mesh = griddata((xs, ys), zs, (sm, dm), method='nearest')
-                        fig.add_trace(go.Surface(x=strike_grid, y=days_grid, z=iv_mesh,
-                            colorscale='RdYlBu_r', opacity=0.75, showscale=True,
-                            colorbar=dict(title='IV%', len=0.7, x=1.01)), row=1, col=2)
-                        mc = [RED if t == 'PE' else ACCENT for t in types]
-                        fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode='markers',
-                            marker=dict(size=3, color=mc, opacity=0.85), name='Points'), row=1, col=2)
+        <!-- Weekly Gauge Bar -->
+        <div class="iv-gauge-wrap">
+            <div class="iv-gauge-labels">
+                <span style="display:flex; align-items:center; gap:6px;">
+                    <span style="color:#b388ff; font-weight:700;">WEEKLY BUDGET:</span>
+                    <span>Weekly Realized Move: <b id="iv-weekly-consumption-label" style="color:#b388ff;">0%</b></span>
+                    <span style="color:var(--text-muted);">|</span>
+                    <span>5-Day Range Traversed: <b id="iv-weekly-range-consumption-label" style="color:#94a3b8;">0%</b></span>
+                </span>
+                <span style="color:#ffd54f;">100% (Weekly 1σ Barrier)</span>
+            </div>
+            <div class="iv-gauge-track">
+                <div id="iv-weekly-bar-range" class="iv-gauge-bar-range" title="Weekly High-Low Range Traversed"></div>
+                <div id="iv-weekly-bar-fill" class="iv-gauge-bar" title="Weekly Realized Net Displacement"></div>
+                <div class="iv-gauge-marker-1sigma" title="Weekly 1-Sigma Statistical Barrier (80% scale)"></div>
+            </div>
+            <div class="iv-gauge-legend">
+                <div class="iv-gauge-legend-items">
+                    <span><span class="legend-box solid" style="background:#00e5ff;"></span> Solid Fill: Current Spot Net Move</span>
+                    <span><span class="legend-box" style="background:rgba(0, 229, 255, 0.25); border:1px solid #00e5ff;"></span> Shaded Area: Total Range Traversed</span>
+                </div>
+                <span>Markers: Gold line indicates 1.0σ full volatility budget</span>
+            </div>
+        </div>
+    </div>
 
-                        fig.update_layout(height=480, width=1380, paper_bgcolor='rgba(0,0,0,0)',
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            font=dict(color=WHITE, family='Inter, sans-serif', size=11),
-                            legend=dict(bgcolor='rgba(30,30,50,0.8)', font=dict(size=10), x=0.01, y=0.99),
-                            margin=dict(l=50, r=20, t=50, b=30), hovermode='closest',
-                            scene=dict(
-                                xaxis=dict(title='Strike', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
-                                yaxis=dict(title='Days', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
-                                zaxis=dict(title='IV%', backgroundcolor='rgba(0,0,0,0)', gridcolor='#333'),
-                                camera=dict(eye=dict(x=1.5, y=-1.8, z=0.8)), bgcolor='rgba(0,0,0,0)'))
-                        fig.update_xaxes(gridcolor='rgba(100,100,100,0.15)', title='Strike', row=1, col=1)
-                        fig.update_yaxes(gridcolor='rgba(100,100,100,0.15)', title='IV (%)', row=1, col=1)
-                        iv_plotly = fig.to_html(include_plotlyjs=False, full_html=False)
+    <!-- Rewind Scrubber & Preset Controls -->
+    <div class="iv-rewind-toolbar">
+        <div style="font-family:var(--font-mono); font-size:11px; font-weight:700; color:#868993;">
+            REWIND MEMORY:
+        </div>
+        <div class="iv-rewind-slider-wrap">
+            <input type="range" id="iv-rewind-slider" class="iv-slider" min="0" max="1" value="1" disabled>
+            <span id="iv-rewind-time-label" style="font-family:var(--font-mono); font-size:12px; font-weight:700; color:#00e5ff; min-width:65px;">LIVE</span>
+        </div>
 
-                        # Prediction panel
-                        dir_color = GREEN if 'BULL' in str(pred.get('direction', '')) else RED if 'BEAR' in str(pred.get('direction', '')) else YELLOW
-                        _ts = pred.get('term_spread', 0)
-                        ts_val = float(_ts[0]) if isinstance(_ts, list) else float(_ts) # type: ignore
-                        ts_color = RED if ts_val < -1 else GREEN if ts_val > 1 else WHITE
-                        iv_tab_html = f'''
-                        {iv_plotly}
-                        <div class="card" style="margin-top:10px;">
-                            <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:14px;">SPOT MOVEMENT PREDICTOR</div>
-                            <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                                <div class="metric-box"><div class="metric-label">DIRECTION</div><div style="font-size:22px;font-weight:700;color:{dir_color};">{pred['direction']}</div><div class="metric-sub">Confidence: {pred['confidence']:.0%}</div></div>
-                                <div class="metric-box"><div class="metric-label">EXPECTED 1-DAY MOVE</div><div style="font-size:22px;font-weight:700;color:{WHITE};">±{pred['expected_move']:.0f} pts</div><div class="metric-sub">±{pred['expected_move_pct']:.2f}%</div></div>
-                                <div class="metric-box"><div class="metric-label">SKEW RATIO</div><div style="font-size:22px;font-weight:700;color:{WHITE};">{pred['skew_ratio']:.3f}</div><div class="metric-sub">{pred['skew_signal']}</div></div>
-                                <div class="metric-box"><div class="metric-label">TERM SPREAD</div><div style="font-size:22px;font-weight:700;color:{ts_color};">{pred['term_spread']:+.2f}%</div><div class="metric-sub">{pred['term_signal']}</div></div>
-                                <div class="metric-box"><div class="metric-label">ATM IV</div><div style="font-size:22px;font-weight:700;color:{WHITE};">{pred['atm_iv']:.2f}%</div><div class="metric-sub">Put:{pred['put_iv_avg']:.1f}% Call:{pred['call_iv_avg']:.1f}%</div></div>
-                            </div>
-                        </div>'''
-                    else:
-                        iv_tab_html = '<div class="card"><p style="color:#888;">Waiting for IV surface data...</p></div>'
+        <div class="iv-btn-group">
+            <button class="iv-tool-btn iv-preset-btn active" data-preset="live">LIVE</button>
+            <button class="iv-tool-btn iv-preset-btn" data-preset="5m">-5m</button>
+            <button class="iv-tool-btn iv-preset-btn" data-preset="15m">-15m</button>
+            <button class="iv-tool-btn iv-preset-btn" data-preset="30m">-30m</button>
+            <button class="iv-tool-btn iv-preset-btn" data-preset="60m">-1h</button>
+            <button class="iv-tool-btn iv-preset-btn" data-preset="open">DAY OPEN</button>
+        </div>
+
+        <div class="iv-btn-group" title="Select baseline for Smile &amp; ΔIV comparison">
+            <span style="font-size:10px; color:#868993; padding:4px 6px; align-self:center;">BASELINE:</span>
+            <button class="iv-tool-btn iv-baseline-btn active" data-baseline="open">DAY OPEN</button>
+            <button class="iv-tool-btn iv-baseline-btn" data-baseline="prev">PRIOR SNAP</button>
+        </div>
+
+        <button id="btn-iv-return-live" class="iv-btn-live">
+            ↺ RETURN TO LIVE
+        </button>
+    </div>
+
+    <!-- Total IV Shifts Strip -->
+    <div class="iv-shifts-strip">
+        <div class="iv-shift-pill">
+            <div class="iv-shift-title">ATM IV &amp; Δ SHIFT</div>
+            <div id="iv-shift-atm-val" class="iv-shift-val">--%</div>
+        </div>
+        <div class="iv-shift-pill">
+            <div class="iv-shift-title">SKEW RATIO (PUT/CALL)</div>
+            <div id="iv-shift-skew-val" class="iv-shift-val">--</div>
+        </div>
+        <div class="iv-shift-pill">
+            <div class="iv-shift-title">TERM SPREAD</div>
+            <div id="iv-shift-ts-val" class="iv-shift-val">--%</div>
+        </div>
+        <div class="iv-shift-pill">
+            <div class="iv-shift-title">WING IV (PUT vs CALL)</div>
+            <div id="iv-shift-wings-val" class="iv-shift-val">--</div>
+        </div>
+    </div>
+
+    <!-- Charts Grid: 2D Smile + 3D Surface -->
+    <div class="iv-charts-grid">
+        <!-- 2D Smile Chart -->
+        <div class="iv-chart-box">
+            <div class="iv-chart-header">
+                <span class="iv-chart-title">2D VOLATILITY SMILE &amp; Δ IV PER STRIKE</span>
+                <span style="font-size:10px; font-family:var(--font-mono); color:var(--text-muted);">Active vs Baseline Overlay</span>
+            </div>
+            <div id="iv-smile-plot" class="iv-plot-canvas"></div>
+        </div>
+
+        <!-- 3D Surface Chart -->
+        <div class="iv-chart-box">
+            <div class="iv-chart-header">
+                <span class="iv-chart-title">3D VOLATILITY SURFACE MESH</span>
+                <span style="font-size:10px; font-family:var(--font-mono); color:var(--text-muted);">Strike × DTE × IV (%)</span>
+            </div>
+            <div id="iv-surface-3d-plot" class="iv-plot-canvas"></div>
+        </div>
+    </div>
+</div>
+'''
+                    iv_tab_html = _IV_TERMINAL_SHELL
 
                     # ── TAB 2: VOL INTELLIGENCE (with IV Trend chart) ──
                     vol_tab_html = '<div class="card"><p style="color:#888;">Loading vol intelligence...</p></div>'
@@ -3417,97 +3538,33 @@ class VolatilityAnalyzer:
                         _mt_color = RED if _mt_rg == 'ABOVE_MEAN' else GREEN
 
                         vol_tab_html = f'''
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-                            <div class="card">
-                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:14px;">HV STATISTICS (1-Year)</div>
-                                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
-                                    <div class="metric-box"><div class="metric-label">20d HV (C2C)</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{v['current_hv']:.2f}%</div><div class="metric-sub">Parkinson: {v['parkinson']:.2f}%</div></div>
-                                    <div class="metric-box"><div class="metric-label">1-Yr Mean</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{v['mean_hv']:.2f}%</div><div class="metric-sub">{v['min_hv']:.1f}% — {v['max_hv']:.1f}%</div></div>
-                                    <div class="metric-box"><div class="metric-label">HV Percentile</div><div style="font-size:20px;font-weight:700;color:{YELLOW};">{v['hv_percentile']:.0f}%</div></div>
+                        <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px;">
+                                <div style="color:{ACCENT}; font-size:12px; font-weight:800; letter-spacing:1px; text-transform:uppercase;">
+                                    📈 1-YEAR HISTORICAL VOLATILITY & ESTIMATOR CONE
                                 </div>
-                                <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:12px;">
-                                    <div class="metric-box"><div class="metric-label">ATM IV</div><div style="font-size:18px;font-weight:700;color:{WHITE};">{v['iv']:.2f}%</div></div>
-                                    <div class="metric-box"><div class="metric-label">VRP</div><div style="font-size:18px;font-weight:700;color:{GREEN if v['vrp']>2 else RED if v['vrp']<-2 else WHITE};">{v['vrp']:+.2f}%</div></div>
-                                    <div class="metric-box"><div class="metric-label">VRP Rank</div><div style="font-size:18px;font-weight:700;color:{_vrp_pct_color};">{_vrp_pct:.0f}%ile</div><div class="metric-sub">vs 1yr window</div></div>
-                                    <div class="metric-box"><div class="metric-label">Half-Life</div><div style="font-size:18px;font-weight:700;color:{WHITE};">{v['half_life']:.0f}d</div></div>
-                                </div>
-                                <div style="margin-top:14px;">
-                                    <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:8px;">REALIZED VOL CONE — ALL ESTIMATORS</div>
-                                    <table class="data-table" style="font-size:11px;">
-                                        <thead><tr><th style="text-align:left;">Estimator</th><th>5d</th><th>10d</th><th>20d</th><th>60d</th></tr></thead>
-                                        <tbody>
-                                            <tr><td style="text-align:left;color:{WHITE};">Close-to-Close</td><td>{_hv.get('c2c_5',0):.2f}%</td><td>{_hv.get('c2c_10',0):.2f}%</td><td>{_hv.get('c2c_20',0):.2f}%</td><td>{_hv.get('c2c_60',0):.2f}%</td></tr>
-                                            <tr><td style="text-align:left;color:{WHITE};">Parkinson (H/L)</td><td>{_hv.get('pk_5',0):.2f}%</td><td>{_hv.get('pk_10',0):.2f}%</td><td>{_hv.get('pk_20',0):.2f}%</td><td>{_hv.get('pk_60',0):.2f}%</td></tr>
-                                            <tr><td style="text-align:left;color:{WHITE};">Garman-Klass</td><td>-</td><td>-</td><td>{_hv.get('gk_20',0):.2f}%</td><td>{_hv.get('gk_60',0):.2f}%</td></tr>
-                                            <tr><td style="text-align:left;color:{WHITE};">Yang-Zhang</td><td>-</td><td>-</td><td>{_hv.get('yz_20',0):.2f}%</td><td>{_hv.get('yz_60',0):.2f}%</td></tr>
-                                            <tr style="background:rgba(79,195,247,0.08);"><td style="text-align:left;font-weight:700;color:{ACCENT};">ATM IV</td><td colspan="4" style="text-align:center;font-weight:700;color:{ACCENT};">{v['iv']:.2f}% (VRP: {v['vrp']:+.2f}% | {_vrp_pct:.0f}th pct)</td></tr>
-                                        </tbody>
-                                    </table>
+                                <div style="font-size:11px; color:{MUTED};">
+                                    Historical Percentile: <strong style="color:{YELLOW}; font-family:var(--font-mono);">{v['hv_percentile']:.0f}%</strong> · Half-Life: <strong style="color:{WHITE}; font-family:var(--font-mono);">{v['half_life']:.0f}d</strong>
                                 </div>
                             </div>
-                            <div class="card">
-                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:12px;">MULTI-TIMEFRAME REGIME MATRIX</div>
-                                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px;">
-                                    <div class="metric-box" style="border-top:3px solid {GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">
-                                        <div class="metric-label">INTRADAY</div>
-                                        <div style="font-size:16px;font-weight:800;color:{GREEN if momentum_data['status']=='LONG' else RED if momentum_data['status']=='SHORT' else YELLOW};">{momentum_data['status']}</div>
-                                        <div class="metric-sub">VWAP/EMA momentum</div>
-                                    </div>
-                                    <div class="metric-box" style="border-top:3px solid {_st_color};">
-                                        <div class="metric-label">SHORT-TERM (5d vs 20d)</div>
-                                        <div style="font-size:16px;font-weight:800;color:{_st_color};">{_st_rg}</div>
-                                        <div class="metric-sub">5d: {_hv.get('c2c_5',0):.2f}% vs 20d: {_hv.get('c2c_20',0):.2f}%</div>
-                                    </div>
-                                    <div class="metric-box" style="border-top:3px solid {_mt_color};">
-                                        <div class="metric-label">MEDIUM-TERM (vs mean)</div>
-                                        <div style="font-size:16px;font-weight:800;color:{_mt_color};">{_mt_rg}</div>
-                                        <div class="metric-sub">20d: {_hv.get('c2c_20',0):.2f}% | Mean: {v['mean_hv']:.2f}%</div>
-                                    </div>
-                                </div>
-                                <div style="margin-bottom:10px;">
-                                    <div class="metric-box" style="text-align:left;padding:10px 14px;">
-                                        <div class="metric-label">CURRENT REGIME</div>
-                                        <div style="font-size:18px;font-weight:800;color:{regime_color};margin:4px 0;">{v['regime']}</div>
-                                        <div style="font-size:11px;color:#aaa;">{v['regime_desc']}</div>
-                                        <div style="font-size:10px;color:{MUTED};margin-top:4px;">BBw: {v['bw_percentile']:.0f}th pct | HV Slope: {v['hv_slope']:+.2f}% | Changed: {v.get('regime_changed_at','—')}</div>
-                                    </div>
-                                </div>
-                                <div style="color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:6px;">REGIME TRANSITION LOG</div>
-                                <div style="max-height:140px;overflow-y:auto;background:#0a0a18;border-radius:6px;padding:4px;">
-                                    <table style="width:100%;border-collapse:collapse;font-size:11px;">
-                                        {v.get('trans_rows', '<tr><td colspan="2" style="padding:4px 8px;color:#555;">Building...</td></tr>')}
-                                    </table>
-                                </div>
-                                <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                                    <div class="metric-box"><div class="metric-label">Z-Score (IV)</div><div style="font-size:16px;font-weight:700;color:{WHITE};">{v['z_score']:.2f}×</div></div>
-                                    <div class="metric-box"><div class="metric-label">Samples</div><div style="font-size:16px;font-weight:700;color:{MUTED};">{len(regime_history)}</div></div>
-                                </div>
+                            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:14px;">
+                                <div class="metric-box"><div class="metric-label">20D HV (C2C)</div><div style="font-size:20px; font-weight:700; color:{WHITE}; font-family:var(--font-mono);">{v['current_hv']:.2f}%</div><div class="metric-sub">Parkinson: {v['parkinson']:.2f}%</div></div>
+                                <div class="metric-box"><div class="metric-label">1-YR MEAN HV</div><div style="font-size:20px; font-weight:700; color:{WHITE}; font-family:var(--font-mono);">{v['mean_hv']:.2f}%</div><div class="metric-sub">{v['min_hv']:.1f}% &mdash; {v['max_hv']:.1f}% Range</div></div>
+                                <div class="metric-box"><div class="metric-label">LIVE ATM IV</div><div style="font-size:20px; font-weight:700; color:{ACCENT}; font-family:var(--font-mono);">{v['iv']:.2f}%</div><div class="metric-sub">Z-Score: {v['z_score']:.2f}&times;</div></div>
+                                <div class="metric-box"><div class="metric-label">ANNUAL VRP</div><div style="font-size:20px; font-weight:700; color:{GREEN if v['vrp']>2 else RED if v['vrp']<-2 else WHITE}; font-family:var(--font-mono);">{v['vrp']:+.2f}%</div><div class="metric-sub">{_vrp_pct:.0f}th %ile Rank</div></div>
                             </div>
-                        </div>
-
-                        <div class="card" style="margin-top:12px;border:1px solid {_intra_color}44;">
-                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                                <div style="color:{ACCENT};font-size:13px;font-weight:700;letter-spacing:2px;">⚡ INTRADAY REGIME SIGNAL</div>
-                                <div style="display:flex;gap:8px;align-items:center;">
-                                    <span style="background:{_dte_color}22;color:{_dte_color};font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;border:1px solid {_dte_color}55;">{_dte_note}</span>
-                                    <span style="background:#2a2a4a;color:{MUTED};font-size:11px;padding:3px 10px;border-radius:12px;">{_session}</span>
-                                </div>
-                            </div>
-                            <div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap;">
-                                <div style="flex:0 0 auto;background:{_intra_color}18;border:1px solid {_intra_color}55;border-radius:8px;padding:14px 20px;text-align:center;min-width:180px;">
-                                    <div class="metric-label">INTRADAY BIAS</div>
-                                    <div style="font-size:20px;font-weight:900;color:{_intra_color};margin:6px 0;">{_intra_signal}</div>
-                                </div>
-                                <div style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;">
-                                    <div class="metric-box"><div class="metric-label">IV Velocity (5d)</div><div style="font-size:18px;font-weight:700;color:{RED if _iv_velocity > 0.5 else GREEN if _iv_velocity < -0.5 else WHITE};">{_iv_velocity:+.2f}%</div><div class="metric-sub">IV drift trend</div></div>
-                                    <div class="metric-box"><div class="metric-label">IV Z-Score</div><div style="font-size:18px;font-weight:700;color:{RED if _iv_zscore > 2 else GREEN if _iv_zscore < 0 else WHITE};">{_iv_zscore:.2f}×</div><div class="metric-sub">vs 1yr mean</div></div>
-                                    <div class="metric-box"><div class="metric-label">VRP Edge</div><div style="font-size:18px;font-weight:700;color:{GREEN if _vrp_now > 2 else RED if _vrp_now < -2 else WHITE};">{_vrp_now:+.1f}%</div><div class="metric-sub">IV – HV</div></div>
-                                    <div class="metric-box"><div class="metric-label">VRP Rank</div><div style="font-size:18px;font-weight:700;color:{_vrp_pct_color};">{_vrp_pct:.0f}th pct</div><div class="metric-sub">1-year window</div></div>
-                                </div>
-                            </div>
-                            <div style="margin-top:10px;padding:8px 12px;background:#0d0d1e;border-radius:6px;color:{MUTED};font-size:11px;">
-                                {_intra_reason}
-                                {f' &nbsp;|&nbsp; <span style="color:{YELLOW};">{_session_note}</span>' if _session_note else ''}
+                            <div>
+                                <div style="color:{ACCENT}; font-size:11px; font-weight:700; letter-spacing:1px; margin-bottom:8px;">REALIZED VOLATILITY CONE &mdash; ALL ESTIMATORS</div>
+                                <table class="data-table" style="font-size:11px; width:100%;">
+                                    <thead><tr><th style="text-align:left;">Estimator</th><th>5D Horizon</th><th>10D Horizon</th><th>20D Base</th><th>60D Macro</th></tr></thead>
+                                    <tbody>
+                                        <tr><td style="text-align:left; color:{WHITE}; font-weight:600;">Close-to-Close (C2C)</td><td style="font-family:var(--font-mono);">{_hv.get('c2c_5',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('c2c_10',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('c2c_20',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('c2c_60',0):.2f}%</td></tr>
+                                        <tr><td style="text-align:left; color:{WHITE}; font-weight:600;">Parkinson (High / Low)</td><td style="font-family:var(--font-mono);">{_hv.get('pk_5',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('pk_10',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('pk_20',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('pk_60',0):.2f}%</td></tr>
+                                        <tr><td style="text-align:left; color:{WHITE}; font-weight:600;">Garman-Klass</td><td style="font-family:var(--font-mono);">&mdash;</td><td style="font-family:var(--font-mono);">&mdash;</td><td style="font-family:var(--font-mono);">{_hv.get('gk_20',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('gk_60',0):.2f}%</td></tr>
+                                        <tr><td style="text-align:left; color:{WHITE}; font-weight:600;">Yang-Zhang (Drift-Independent)</td><td style="font-family:var(--font-mono);">&mdash;</td><td style="font-family:var(--font-mono);">&mdash;</td><td style="font-family:var(--font-mono);">{_hv.get('yz_20',0):.2f}%</td><td style="font-family:var(--font-mono);">{_hv.get('yz_60',0):.2f}%</td></tr>
+                                        <tr style="background:rgba(0,229,255,0.08);"><td style="text-align:left; font-weight:800; color:{ACCENT};">Live ATM Implied Volatility (IV)</td><td colspan="4" style="text-align:center; font-weight:800; color:{ACCENT}; font-family:var(--font-mono);">{v['iv']:.2f}% (Annual VRP: {v['vrp']:+.2f}% | {_vrp_pct:.0f}th Percentile Rank)</td></tr>
+                                    </tbody>
+                                </table>
                             </div>
                         </div>'''
 
@@ -3537,86 +3594,63 @@ class VolatilityAnalyzer:
                         _flip_dist_txt = 'N/A'
                         _flip_dist_c = MUTED
                         _hedge_action = 'Balanced Dealer Inventory'
+                        _hedge_act_txt = 'N/A'
                         _dist_call = abs(spot - float(call_wall_1)) if call_wall_1 else 0
                         _dist_put = abs(spot - float(put_wall_1)) if put_wall_1 else 0
 
                         if not df_chain.empty:
                             try:
                                 _lot = _get_cfg("nifty_lot_size", 65)
-                                _r_gex = _get_cfg("risk_free_rate", 0.051274)
-                                _q_gex = _get_cfg("dividend_yield", 0.0122)
                                 _T_gex = self.analytics.get_time_to_expiry(near_exp) or (1 / 365)
-                                _df_gex = df_chain.copy()
+                                
+                                from calculations.GexEngine import GexEngine
+                                gex_eng = GexEngine(lot_size=_lot, positioning_model='standard')
+                                _df_chain_input = df_chain.copy()
+                                if 'dte' not in _df_chain_input.columns:
+                                    _df_chain_input['dte'] = max(_T_gex * 365.0, 0.5)
+                                gex_res = gex_eng.calculate_gex(_df_chain_input, spot)
 
-                                def _get_gamma(r):
-                                    g = r.get('gamma', 0)
-                                    if g == 0 or pd.isna(g):
-                                        calc_iv = self._ensure_iv(r['iv'], r['price'], r['strike'], _T_gex, r['type'])
-                                        sigma = max(calc_iv / 100.0, 0.02)
-                                        K_val = r['strike']
-                                        if K_val <= 0 or spot <= 0: return 0.0
-                                        sqT = np.sqrt(max(_T_gex, 1e-6))
-                                        d1 = (np.log(spot / K_val) + (_r_gex - _q_gex + 0.5 * sigma**2) * _T_gex) / (sigma * sqT)
-                                        g = np.exp(-_q_gex * _T_gex) * np.exp(-0.5 * d1**2) / (np.sqrt(2 * np.pi) * spot * sigma * sqT)
-                                    return float(g)
+                                _net_gex = float(gex_res.get('net_gex', 0.0))
+                                _net_gex_crores = _net_gex / 1e7
+                                _flip_strike = round(float(gex_res.get('zero_gamma_level', 0.0)))
 
-                                _df_gex['gamma_calc'] = _df_gex.apply(_get_gamma, axis=1)
-                                _df_gex['gex_lots'] = _df_gex.apply(
-                                    lambda r: r['oi'] * r['gamma_calc'] * 50.0 * (1.0 if r['type'] == 'PE' else -1.0), axis=1)
-                                _df_gex['gex_crores'] = _df_gex['gex_lots'] * _lot * spot * 2.0 / 1e7
+                                # Sync walls with GexEngine
+                                _cw_res = gex_res.get('call_wall', 0.0)
+                                _pw_res = gex_res.get('put_wall', 0.0)
+                                if _cw_res: call_wall_1 = _cw_res
+                                if _pw_res: put_wall_1 = _pw_res
+                                _dist_call = abs(spot - float(call_wall_1)) if call_wall_1 else 0
+                                _dist_put = abs(spot - float(put_wall_1)) if put_wall_1 else 0
 
-                                _gex_band_lo, _gex_band_hi = spot - 550, spot + 550
-                                _gex_subset = _df_gex[_df_gex['strike'].between(_gex_band_lo, _gex_band_hi)]
-                                _gex_by_strike = _gex_subset.groupby('strike').agg(
-                                    gex_lots=('gex_lots', 'sum'),
-                                    gex_crores=('gex_crores', 'sum')
-                                ).reset_index().sort_values('strike', ascending=True)
-
-                                if _gex_by_strike.empty:
-                                    _gex_by_strike = _df_gex.groupby('strike').agg(
-                                        gex_lots=('gex_lots', 'sum'),
-                                        gex_crores=('gex_crores', 'sum')
-                                    ).reset_index().sort_values('strike', ascending=True)
-
-                                _net_gex_lots = float(_df_gex['gex_lots'].sum())
-                                _net_gex_crores = float(_df_gex['gex_crores'].sum())
-
-                                _max_call_strike = _df_gex[_df_gex['type']=='CE'].groupby('strike')['oi'].sum().idxmax() if not _df_gex[_df_gex['type']=='CE'].empty else call_wall_1
-                                _max_put_strike = _df_gex[_df_gex['type']=='PE'].groupby('strike')['oi'].sum().idxmax() if not _df_gex[_df_gex['type']=='PE'].empty else put_wall_1
-                                _dist_call = abs(spot - float(_max_call_strike)) if _max_call_strike else 0
-                                _dist_put = abs(spot - float(_max_put_strike)) if _max_put_strike else 0
-
-                                _sorted_full_gex = _df_gex.groupby('strike')['gex_lots'].sum().sort_index()
-                                _cum_gex = _sorted_full_gex.cumsum()
-                                _flip_strike = 0
-                                _gex_idx_vals = [float(k) for k in _sorted_full_gex.index]
-                                for _idx in range(1, len(_cum_gex)):
-                                    if _cum_gex.iloc[_idx-1] * _cum_gex.iloc[_idx] < 0:
-                                        _flip_strike = int(_gex_idx_vals[_idx])
-                                        break
-                                if not _flip_strike and not _sorted_full_gex.empty:
-                                    _flip_strike = int(min(_gex_idx_vals, key=lambda s: abs(float(_sorted_full_gex.get(s, 0)))))
-
-                                _is_long_gamma = (_net_gex_lots >= 0)
+                                _is_long_gamma = (_net_gex >= 0)
                                 _pin_txt = "PINNING ↔ (Mean-Reverting)" if _is_long_gamma else "ACCELERATING ↕ (Breakout Risk)"
                                 _regime_badge_col = GREEN if _is_long_gamma else RED
-                                _hedge_action = f"SELL {abs(_net_gex_lots):,.0f} Lots into rally (Dampening)" if _net_gex_lots > 0 else f"BUY {abs(_net_gex_lots):,.0f} Lots into rally (Amplifying)"
+                                _hedge_action = f"Dealers Long GEX (+₹{abs(_net_gex_crores):.1f} Cr) — Dampens Volatility" if _net_gex >= 0 else f"Dealers Short GEX (-₹{abs(_net_gex_crores):.1f} Cr) — Accelerates Breakouts"
 
-                                _gex_colors = [GREEN if g >= 0 else RED for g in _gex_by_strike['gex_lots']]
-                                _strikes_list = [float(s) for s in _gex_by_strike['strike'].tolist()]
+                                # Strike distribution within ±550 band in ₹ Crores
+                                prof_dict = gex_res.get('profile', {})
+                                _gex_band_lo, _gex_band_hi = spot - 550, spot + 550
+
+                                strike_keys = sorted([s for s in prof_dict.keys() if _gex_band_lo <= s <= _gex_band_hi])
+                                if not strike_keys:
+                                    strike_keys = sorted(list(prof_dict.keys()))
+
+                                _strikes_list = [float(s) for s in strike_keys]
+                                _gex_cr_list = [float(prof_dict[s]) / 1e7 for s in strike_keys]
+                                _gex_colors = [GREEN if g >= 0 else RED for g in _gex_cr_list]
+
                                 _s_min = min(_strikes_list) if _strikes_list else spot - 500
                                 _s_max = max(_strikes_list) if _strikes_list else spot + 500
 
                                 fig_gex = go.Figure(go.Bar(
-                                    x=_gex_by_strike['gex_lots'],
-                                    y=_gex_by_strike['strike'],
+                                    x=_gex_cr_list,
+                                    y=_strikes_list,
                                     orientation='h',
                                     marker=dict(color=_gex_colors, line=dict(width=1, color='rgba(255,255,255,0.15)')),
-                                    text=[f"{'+' if g>=0 else ''}{g:,.0f} Lots" for g in _gex_by_strike['gex_lots']],
+                                    text=[f"{'+' if g>=0 else ''}{g:.1f} Cr" for g in _gex_cr_list],
                                     textposition='outside',
                                     textfont=dict(color=WHITE, size=10),
-                                    hovertemplate='<b>Strike: %{y}</b><br>Net Gamma: %{x:,.0f} Lots<br>Notional: %{customdata:.1f} Cr<extra></extra>',
-                                    customdata=_gex_by_strike['gex_crores'],
+                                    hovertemplate='<b>Strike: %{y}</b><br>Net GEX: %{x:+.2f} Cr<extra></extra>',
                                 ))
 
                                 # 1. Pinning Corridor Shaded Area (Put Wall 1 to Call Wall 1)
@@ -3671,47 +3705,42 @@ class VolatilityAnalyzer:
                                         annotation_font=dict(color='#81c784', size=9, family='Inter, sans-serif'),
                                         annotation_bgcolor='rgba(13,17,38,0.9)'
                                     )
-
-                                # 4. Zero-Gamma Flip Line
-                                _flip_dist_txt = f'{abs(spot - _flip_strike):.0f} pts {"above" if spot > _flip_strike else "below"}' if _flip_strike else 'N/A'
-                                _flip_dist_c = GREEN if _flip_strike and spot > _flip_strike else RED if _flip_strike else MUTED
                                 if _flip_strike and (_s_min <= _flip_strike <= _s_max):
                                     fig_gex.add_hline(
-                                        y=float(_flip_strike), line_dash='dash', line_color='#ffd54f', line_width=1.5,
-                                        annotation_text=f"⚡ ZERO-GAMMA FLIP: {_flip_strike} ({_flip_dist_txt})",
-                                        annotation_position="top right" if spot < _flip_strike else "bottom right",
-                                        annotation_font=dict(color='#ffd54f', size=10, family='Inter, sans-serif'),
+                                        y=float(_flip_strike), line_dash='dashdot', line_color='#ffea00', line_width=1.5,
+                                        annotation_text=f"⚡ ZERO-GAMMA FLIP: {_flip_strike}",
+                                        annotation_position="top left",
+                                        annotation_font=dict(color='#ffea00', size=10, family='Inter, sans-serif'),
                                         annotation_bgcolor='rgba(13,17,38,0.9)'
                                     )
-
-                                # 5. Live Spot Price Line (Tagged for dynamic client slide)
                                 fig_gex.add_hline(
-                                    y=float(spot), line_color='#00e5ff', line_width=2.5,
-                                    name='spot_line',
-                                    annotation_text=f"◄ SPOT {spot:.0f}",
-                                    annotation_name='spot_annotation',
-                                    annotation_position="top left",
+                                    y=float(spot), line_dash='dash', line_color='#00e5ff', line_width=2.2,
+                                    annotation_text=f"● LIVE SPOT: {spot:.1f}",
+                                    annotation_position="top right",
                                     annotation_font=dict(color='#00e5ff', size=11, family='Inter, sans-serif'),
                                     annotation_bgcolor='rgba(13,17,38,0.9)'
                                 )
-
                                 fig_gex.update_layout(
                                     height=520,
                                     paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                                     font=dict(color=WHITE, family='Inter, sans-serif', size=11),
                                     margin=dict(l=65, r=85, t=50, b=40),
                                     title=dict(
-                                        text=f'Institutional Gamma Exposure (GEX) & Spot Movement Trajectory | Net: {"+" if _net_gex_lots>=0 else ""}{_net_gex_lots:,.0f} Lots ({_net_gex_crores:+.1f} Cr)',
+                                        text=f'GEX DISTRIBUTION & Spot Movement Trajectory | Net GEX: {"+" if _net_gex_crores>=0 else ""}{_net_gex_crores:+.1f} Cr',
                                         font=dict(color=ACCENT, size=13), x=0.01),
-                                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)', title='Hedging Flow (Lots per 50-pt move)', showline=True, linecolor='rgba(255,255,255,0.1)', zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=1.5),
-                                    yaxis=dict(tickmode='array', tickvals=_strikes_list, ticktext=[str(int(s)) for s in _strikes_list], gridcolor='rgba(255,255,255,0.05)', title='Strike Price', showline=True, linecolor='rgba(255,255,255,0.1)'),
+                                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)', title='Net GEX (₹ Crores)', showline=True, linecolor='rgba(255,255,255,0.1)', zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=1.5),
+                                    yaxis=dict(
+                                        range=[_s_min - 25, _s_max + 25],
+                                        autorange=False,
+                                        tickmode='array', tickvals=_strikes_list, ticktext=[str(int(s)) for s in _strikes_list],
+                                        gridcolor='rgba(255,255,255,0.05)', title='Strike Price', showline=True, linecolor='rgba(255,255,255,0.1)'),
                                     bargap=0.18,
-                                )
+                                 )
                                 gex_html = fig_gex.to_html(include_plotlyjs=False, full_html=False, div_id='gex-distribution-chart', default_height='520px', default_width='100%')
 
                                 # Movement trajectory synthesis
-                                _cw2_txt = f" → Call Wall ② ({call_wall_2})" if call_wall_2 else ""
-                                _pw2_txt = f" → Put Wall ② ({put_wall_2})" if put_wall_2 else ""
+                                _cw2_txt = f" → CW ② ({call_wall_2})" if call_wall_2 else ""
+                                _pw2_txt = f" → PW ② ({put_wall_2})" if put_wall_2 else ""
                                 _traj_summary = (
                                     f"Dealer hedging dampens volatility within <strong>{put_wall_1} – {call_wall_1}</strong> pinning corridor. "
                                     f"Upside breakout &gt; {call_wall_1+25:.0f} triggers dealer short squeeze{_cw2_txt}. "
@@ -3722,39 +3751,92 @@ class VolatilityAnalyzer:
                                     f"Downside cascade target: <strong>{put_wall_1}</strong> (then {put_wall_2 or 'lower'})."
                                 )
 
+                                # Strike zone contextual analysis
+                                _cw_gex_hint = f"Dealers short calls (sell rallies) · Squeeze trigger > {call_wall_1+25:.0f}"
+                                _atm_gex_hint = f"Max gamma concentration · Magnet attraction toward Max Pain ({max_pain_val})"
+                                _pw_gex_hint = f"Dealers long puts (buy dips) · Waterfall breakdown < {put_wall_1-25:.0f}"
+                                _flip_hint = f"Inflection threshold: Spot {'ABOVE' if spot > (_flip_strike or 0) else 'BELOW'} flip ({_flip_strike}) · {'Stabilizing' if _is_long_gamma else 'Breakout Acceleration'}"
+
                                 gex_analysis_html = f'''
-                                <div style="margin-top:12px;padding:12px 14px;background:rgba(15,15,25,0.7);border-radius:8px;border:1px solid rgba(0,229,255,0.18);">
-                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
-                                        <div style="color:{ACCENT};font-size:11px;font-weight:900;letter-spacing:1px;display:flex;align-items:center;gap:6px;">
-                                            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:{ACCENT};"></span>
-                                            SPOT MOVEMENT TRAJECTORY &amp; INSTITUTIONAL BOUNDARIES
+                                <div style="margin-top:12px;padding:14px 16px;background:rgba(15,15,25,0.75);border-radius:8px;border:1px solid rgba(0,229,255,0.2);">
+                                    <!-- Header Strip -->
+                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                                        <div style="color:{ACCENT};font-size:12px;font-weight:900;letter-spacing:1px;display:flex;align-items:center;gap:6px;">
+                                            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{ACCENT};box-shadow:0 0 8px {ACCENT};"></span>
+                                            SPOT MOVEMENT TRAJECTORY &amp; REAL-TIME INTRADAY PROJECTION
                                         </div>
-                                        <span style="font-size:10px;font-weight:700;color:{_regime_badge_col};background:{_regime_badge_col}18;padding:3px 10px;border-radius:4px;border:1px solid {_regime_badge_col}44;">{_pin_txt}</span>
+                                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                            <span id="spot-move-regime-badge" style="font-size:10px;font-weight:800;color:{_regime_badge_col};background:{_regime_badge_col}18;padding:3px 10px;border-radius:4px;border:1px solid {_regime_badge_col}44;">{_pin_txt}</span>
+                                            <span id="live-net-gex-badge" style="font-size:10px;font-weight:800;color:{GREEN if _net_gex_crores>=0 else RED};background:rgba(255,255,255,0.06);padding:3px 10px;border-radius:4px;border:1px solid {GREEN if _net_gex_crores>=0 else RED};">Net GEX: {f"{_net_gex_crores:+.1f} Cr"}</span>
+                                        </div>
                                     </div>
-                                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:8px;margin-bottom:10px;">
+
+                                    <!-- 4 Landmark Boundary Metric Boxes -->
+                                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:8px;margin-bottom:12px;">
                                         <div class="metric-box" style="padding:8px 10px;border-left:2px solid #00e676;">
                                             <div class="metric-label" style="color:#00e676;font-size:10px;font-weight:700;">🟢 PUT WALL ① (Demand Floor)</div>
-                                            <div style="font-size:15px;font-weight:800;color:{WHITE};">{put_wall_1}</div>
-                                            <div class="metric-sub" style="color:#00e676;font-size:10px;">-{_dist_put:.0f} pts · Cascade &lt; {put_wall_1-25:.0f}{_pw2_txt}</div>
+                                            <div id="spot-move-put-wall" style="font-size:16px;font-weight:800;color:{WHITE};">{put_wall_1}</div>
+                                            <div id="spot-move-put-dist" class="metric-sub" style="color:#00e676;font-size:10px;">-{_dist_put:.0f} pts · Cascade &lt; {put_wall_1-25:.0f}{_pw2_txt}</div>
                                         </div>
                                         <div class="metric-box" style="padding:8px 10px;border-left:2px solid #ff3366;">
                                             <div class="metric-label" style="color:#ff3366;font-size:10px;font-weight:700;">🔴 CALL WALL ① (Supply Ceiling)</div>
-                                            <div style="font-size:15px;font-weight:800;color:{WHITE};">{call_wall_1}</div>
-                                            <div class="metric-sub" style="color:#ff3366;font-size:10px;">+{_dist_call:.0f} pts · Squeeze &gt; {call_wall_1+25:.0f}{_cw2_txt}</div>
+                                            <div id="spot-move-call-wall" style="font-size:16px;font-weight:800;color:{WHITE};">{call_wall_1}</div>
+                                            <div id="spot-move-call-dist" class="metric-sub" style="color:#ff3366;font-size:10px;">+{_dist_call:.0f} pts · Squeeze &gt; {call_wall_1+25:.0f}{_cw2_txt}</div>
                                         </div>
                                         <div class="metric-box" style="padding:8px 10px;border-left:2px solid #ffd54f;">
                                             <div class="metric-label" style="color:#ffd54f;font-size:10px;font-weight:700;">⚡ ZERO-GAMMA FLIP LEVEL</div>
-                                            <div style="font-size:15px;font-weight:800;color:{WHITE};">{_flip_strike or 'N/A'}</div>
-                                            <div class="metric-sub" style="color:{_flip_dist_c};font-size:10px;">{_flip_dist_txt} ({'Long Gamma Pinning' if _is_long_gamma else 'Short Gamma Breakout'})</div>
+                                            <div id="spot-move-flip-strike" style="font-size:16px;font-weight:800;color:{WHITE};">{_flip_strike or 'N/A'}</div>
+                                            <div id="spot-move-flip-dist" class="metric-sub" style="color:{_flip_dist_c};font-size:10px;">{_flip_dist_txt} ({'Long Gamma Pinning' if _is_long_gamma else 'Short Gamma Breakout'})</div>
                                         </div>
                                         <div class="metric-box" style="padding:8px 10px;border-left:2px solid #00e5ff;">
                                             <div class="metric-label" style="color:#00e5ff;font-size:10px;font-weight:700;">🎯 1-SIGMA EXPECTED MOVE</div>
-                                            <div style="font-size:15px;font-weight:800;color:{WHITE};">±{_em_val:.0f} pts</div>
-                                            <div class="metric-sub" style="color:#94a3b8;font-size:10px;">Range: {spot - _em_val:.0f} – {spot + _em_val:.0f} | Pain: {max_pain_val}</div>
+                                            <div id="spot-move-expected-move" style="font-size:16px;font-weight:800;color:{WHITE};">±{_em_val:.0f} pts</div>
+                                            <div id="spot-move-expected-range" class="metric-sub" style="color:#94a3b8;font-size:10px;">Range: {spot - _em_val:.0f} – {spot + _em_val:.0f} | Pain: {max_pain_val}</div>
                                         </div>
                                     </div>
-                                    <div style="padding:8px 10px;background:rgba(0,229,255,0.06);border-radius:6px;border:1px solid rgba(0,229,255,0.15);font-size:11px;color:#cbd5e1;line-height:1.5;">
-                                        <span style="color:#00e5ff;font-weight:800;margin-right:4px;">PREDICTIVE OUTLOOK:</span> {_traj_summary}
+
+                                    <!-- Real-Time Intraday Projection & Cross-Strike Dynamics Matrix -->
+                                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:10px;margin-bottom:10px;">
+                                        <!-- Panel 1: Real-Time Intraday Projection -->
+                                        <div style="padding:10px 12px;background:rgba(0,0,0,0.35);border-radius:6px;border:1px solid rgba(255,255,255,0.06);">
+                                            <div style="font-size:11px;font-weight:800;color:#00e5ff;margin-bottom:6px;display:flex;justify-content:space-between;">
+                                                <span>⚡ INTRADAY PROJECTION ENGINE</span>
+                                                <span id="proj-bias-badge" style="color:{GREEN if _is_long_gamma else RED};font-size:10px;">{'PIN / MEAN-REVERTING' if _is_long_gamma else 'DIRECTIONAL EXPANSION'}</span>
+                                            </div>
+                                            <div style="font-size:11px;color:#ccc;line-height:1.5;">
+                                                <div>• Projected Corridor: <strong id="proj-corridor" style="color:#ffffff;">{put_wall_1} — {call_wall_1}</strong> ({call_wall_1 - put_wall_1:.0f} pts)</div>
+                                                <div>• Primary Magnet Target: <strong id="proj-target" style="color:#ffd54f;">{max_pain_val} (Max Pain)</strong></div>
+                                                <div>• Dealer Hedging Flow: <span id="proj-flow" style="color:{_regime_badge_col};font-weight:700;">{_hedge_act_txt}</span> per 50pt Nifty advance</div>
+                                                <div>• Squeeze Acceleration Trigger: <span id="proj-trigger" style="color:#ff3366;font-weight:700;">&gt; {call_wall_1+25:.0f}</span> (Upside) / <span style="color:#00e676;font-weight:700;">&lt; {put_wall_1-25:.0f}</span> (Downside)</div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Panel 2: What's Happening Across Strikes & What It Means -->
+                                        <div style="padding:10px 12px;background:rgba(0,0,0,0.35);border-radius:6px;border:1px solid rgba(255,255,255,0.06);">
+                                            <div style="font-size:11px;font-weight:800;color:#ffd54f;margin-bottom:6px;">
+                                                🔍 REAL-TIME STRIKE DYNAMICS &amp; MEANING
+                                            </div>
+                                            <div style="font-size:11px;color:#bbb;line-height:1.45;">
+                                                <div style="margin-bottom:4px;">
+                                                    <span style="color:#ff6688;font-weight:700;">Call Wall ({call_wall_1}):</span> {_cw_gex_hint}
+                                                </div>
+                                                <div style="margin-bottom:4px;">
+                                                    <span style="color:#00e5ff;font-weight:700;">ATM ({round(spot/50)*50}):</span> {_atm_gex_hint}
+                                                </div>
+                                                <div style="margin-bottom:4px;">
+                                                    <span style="color:#00e676;font-weight:700;">Put Wall ({put_wall_1}):</span> {_pw_gex_hint}
+                                                </div>
+                                                <div>
+                                                    <span style="color:#ffd54f;font-weight:700;">Flip Line ({_flip_strike or 'N/A'}):</span> {_flip_hint}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Bottom Outlook Strip -->
+                                    <div style="padding:8px 12px;background:rgba(0,229,255,0.06);border-radius:6px;border:1px solid rgba(0,229,255,0.15);font-size:11px;color:#cbd5e1;line-height:1.5;">
+                                        <span style="color:#00e5ff;font-weight:800;margin-right:4px;">PREDICTIVE OUTLOOK:</span>
+                                        <span id="spot-move-outlook-text">{_traj_summary}</span>
                                     </div>
                                 </div>'''
                             except Exception as e:
@@ -3803,12 +3885,12 @@ class VolatilityAnalyzer:
                             ce_v_col = GREEN if r['ce_vel'] > 0 else RED if r['ce_vel'] < 0 else MUTED
                             pe_v_col = GREEN if r['pe_vel'] > 0 else RED if r['pe_vel'] < 0 else MUTED
 
-                            ce_gex_val = r.get('ce_gex_lots', 0)
-                            pe_gex_val = r.get('pe_gex_lots', 0)
-                            ce_gex_txt = f"{ce_gex_val:+,.0f}" if ce_gex_val != 0 else "·"
-                            pe_gex_txt = f"{pe_gex_val:+,.0f}" if pe_gex_val != 0 else "·"
-                            ce_gex_col = RED if ce_gex_val < 0 else GREEN if ce_gex_val > 0 else MUTED
-                            pe_gex_col = GREEN if pe_gex_val > 0 else RED if pe_gex_val < 0 else MUTED
+                            ce_gex_val = r.get('ce_gex_cr', 0.0)
+                            pe_gex_val = r.get('pe_gex_cr', 0.0)
+                            ce_gex_txt = f"{ce_gex_val:+.1f} Cr" if abs(ce_gex_val) >= 0.05 else "·"
+                            pe_gex_txt = f"{pe_gex_val:+.1f} Cr" if abs(pe_gex_val) >= 0.05 else "·"
+                            ce_gex_col = GREEN if ce_gex_val > 0 else RED if ce_gex_val < 0 else MUTED
+                            pe_gex_col = RED if pe_gex_val < 0 else GREEN if pe_gex_val > 0 else MUTED
 
                             ce_price_txt = f"₹{r['ce_price']:.2f}" if r.get('ce_price', 0) > 0 else "·"
                             pe_price_txt = f"₹{r['pe_price']:.2f}" if r.get('pe_price', 0) > 0 else "·"
@@ -3862,7 +3944,7 @@ class VolatilityAnalyzer:
                                 f'<tr style="{row_style}">'
                                 f'<td class="col-seller" style="text-align:center;padding:7px 6px;background:{ce_cell_bg};">{ce_sig_badge}</td>'
                                 f'<td class="col-seller" style="text-align:right;padding:7px 6px;font-family:monospace;color:#ffab91;background:{ce_cell_bg};font-size:11px;">{ce_th_txt}</td>'
-                                f'<td class="col-gex" style="text-align:right;padding:7px 8px;font-family:monospace;color:{ce_gex_col};background:{ce_cell_bg};font-weight:700;">{ce_gex_txt}</td>'
+                                f'<td class="col-gex" data-call-gex="{r["strike"]}" style="text-align:right;padding:7px 8px;font-family:monospace;color:{ce_gex_col};background:{ce_cell_bg};font-weight:700;">{ce_gex_txt}</td>'
                                 f'<td class="col-gex" style="text-align:right;padding:7px 8px;font-family:monospace;color:{WHITE};{ce_oi_bg};font-weight:600;">{r["ce_oi"]:,}</td>'
                                 f'<td class="col-base" style="text-align:right;padding:7px 8px;font-family:monospace;color:{ce_v_col};background:{ce_cell_bg};font-weight:600;">{ce_v}</td>'
                                 f'<td class="col-base" style="text-align:right;padding:7px 8px;font-family:monospace;color:{WHITE};background:{ce_cell_bg};font-weight:700;">{ce_price_txt}</td>'
@@ -3878,7 +3960,7 @@ class VolatilityAnalyzer:
                                 f'<td class="col-base" style="text-align:left;padding:7px 8px;font-family:monospace;color:{WHITE};background:{pe_cell_bg};font-weight:700;">{pe_price_txt}</td>'
                                 f'<td class="col-base" style="text-align:right;padding:7px 8px;font-family:monospace;color:{pe_v_col};background:{pe_cell_bg};font-weight:600;">{pe_v}</td>'
                                 f'<td class="col-gex" style="text-align:right;padding:7px 8px;font-family:monospace;color:{WHITE};{pe_oi_bg};font-weight:600;">{r["pe_oi"]:,}</td>'
-                                f'<td class="col-gex" style="text-align:right;padding:7px 8px;font-family:monospace;color:{pe_gex_col};background:{pe_cell_bg};font-weight:700;">{pe_gex_txt}</td>'
+                                f'<td class="col-gex" data-put-gex="{r["strike"]}" style="text-align:right;padding:7px 8px;font-family:monospace;color:{pe_gex_col};background:{pe_cell_bg};font-weight:700;">{pe_gex_txt}</td>'
                                 f'<td class="col-seller" style="text-align:right;padding:7px 6px;font-family:monospace;color:#ffab91;background:{pe_cell_bg};font-size:11px;">{pe_th_txt}</td>'
                                 f'<td class="col-seller" style="text-align:center;padding:7px 6px;background:{pe_cell_bg};">{pe_sig_badge}</td>'
                                 f'</tr>'
@@ -3910,6 +3992,11 @@ class VolatilityAnalyzer:
                                 <div class="metric-box"><div class="metric-label">Straddle</div><div style="font-size:20px;font-weight:700;color:{WHITE};">{s['straddle']:.0f}</div></div>
                                 <div class="metric-box"><div class="metric-label">Exp. Move</div><div style="font-size:20px;font-weight:700;color:{WHITE};">±{s['em']:.0f} ({s['em_pct']:.1f}%)</div></div>
                                 <div class="metric-box"><div class="metric-label">Max Pain</div><div style="font-size:20px;font-weight:700;color:{YELLOW};">{max_pain_val}</div></div>
+                                <div class="metric-box" id="chain-net-gex-box" style="border-left:2px solid {'#00e676' if _net_gex_crores>=0 else '#ff3366'};">
+                                    <div class="metric-label">LIVE NET GEX</div>
+                                    <div id="chain-net-gex-val" style="font-size:20px;font-weight:700;color:{'#00e676' if _net_gex_crores>=0 else '#ff3366'};">{'+' if _net_gex_crores>=0 else ''}{_net_gex_crores:+.1f} Cr</div>
+                                    <div class="metric-sub" id="chain-gex-regime-sub">{'Long Gamma Pin' if _net_gex_crores>=0 else 'Short Gamma Trend'}</div>
+                                </div>
                                 <div class="metric-box" style="border-left:2px solid {GREEN};">
                                     <div class="metric-label">Put Wall ①</div>
                                     <div style="font-size:20px;font-weight:700;color:{GREEN};">{put_wall_1}</div>
@@ -3984,23 +4071,25 @@ class VolatilityAnalyzer:
                             </div>
                         </div>
 
-                        <!-- 3. INSTITUTIONAL GEX DISTRIBUTION BAR CHART & VOLATILITY CONTOURS -->
+                        <!-- 3. GEX DISTRIBUTION BAR CHART & VOLATILITY CONTOURS -->
                         <div class="card" style="margin-bottom:14px;padding:16px 20px;border:1px solid rgba(0,229,255,0.25);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.4);">
                             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
                                 <div style="display:flex;align-items:center;gap:8px;">
                                     <div style="width:8px;height:8px;border-radius:50%;background:#00e5ff;box-shadow:0 0 8px #00e5ff;"></div>
                                     <div style="font-size:13px;font-weight:900;letter-spacing:1.5px;color:#00e5ff;">
-                                        INSTITUTIONAL GEX DISTRIBUTION &amp; VOLATILITY CONTOURS
+                                        GEX DISTRIBUTION &amp; VOLATILITY CONTOURS
                                     </div>
                                 </div>
                                 <span style="font-size:11px;color:#94a3b8;font-family:'JetBrains Mono',monospace;">
                                     Full Width Contours · Strike Selection Merged in Master Chain
                                 </span>
                             </div>
-                            <div id="gex-chart-container" style="min-height:520px; height:520px; width:100%; position:relative; overflow:hidden;">
+                            <!-- Real-Time Intraday Projection & Strike Dynamics Panel -->
+                            {gex_analysis_html}
+
+                            <div id="gex-chart-container" style="min-height:540px; height:540px; width:100%; position:relative; overflow:hidden; margin-top:14px;">
                                 {gex_html}
                             </div>
-                            {gex_analysis_html}
                         </div>
 
                         <!-- 5. OPTION BUYER RADAR: GEX SPOT REBALANCE & VACUUM RUNWAY ENGINE -->
@@ -4176,7 +4265,180 @@ class VolatilityAnalyzer:
                                     Updated: --:--:--
                                 </div>
                             </div>
-                        </div>'''
+                        </div>
+
+                        <!-- 3. REAL-TIME OI DYNAMICS & ORDER FLOW RADAR -->
+                        <div class="card" id="oi-velocity-card" style="margin-top:16px;margin-bottom:14px;padding:0;overflow:hidden;border:1px solid rgba(0,229,255,0.25);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.45);background:rgba(13,17,36,0.95);">
+                            <!-- Top Header Toolbar -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 18px;background:rgba(18,22,46,0.98);border-bottom:1px solid rgba(255,255,255,0.08);flex-wrap:wrap;gap:10px;">
+                                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                                    <div style="font-size:14px;font-weight:900;letter-spacing:1.5px;color:#00e5ff;">OI DYNAMICS &amp; ORDER FLOW RADAR</div>
+                                    <span id="oi-rewind-status-badge" style="font-size:10px;background:rgba(0,230,118,0.15);color:#00e676;border:1px solid rgba(0,230,118,0.4);padding:3px 8px;border-radius:4px;font-weight:800;letter-spacing:0.5px;">LIVE STREAMING</span>
+                                    <button type="button" id="btn-return-live" style="display:none;padding:3px 10px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(0,229,255,0.2);color:#00e5ff;border:1px solid #00e5ff;cursor:pointer;">↺ RETURN TO LIVE</button>
+                                </div>
+
+                                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                                    <!-- Metric Mode: Total Cumulative OI vs Absolute Delta Volume vs Rate of Change -->
+                                    <div style="display:flex;align-items:center;gap:4px;background:rgba(255,255,255,0.03);padding:2px 4px;border-radius:6px;border:1px solid rgba(255,255,255,0.08);">
+                                        <button type="button" id="btn-metric-total" class="oi-metric-btn" style="padding:4px 9px;font-size:10px;font-weight:800;border-radius:4px;background:transparent;color:#94a3b8;border:1px solid transparent;cursor:pointer;">TOTAL OI</button>
+                                        <button type="button" id="btn-metric-delta" class="oi-metric-btn active" style="padding:4px 9px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(0,229,255,0.18);color:#00e5ff;border:1px solid #00e5ff;cursor:pointer;">Δ OI VOLUME</button>
+                                        <button type="button" id="btn-metric-rate" class="oi-metric-btn" style="padding:4px 9px;font-size:10px;font-weight:800;border-radius:4px;background:transparent;color:#94a3b8;border:1px solid transparent;cursor:pointer;">RATE / MIN</button>
+                                    </div>
+
+                                    <!-- Strike Field of View Range -->
+                                    <div style="display:flex;align-items:center;gap:4px;background:rgba(255,255,255,0.03);padding:2px 4px;border-radius:6px;border:1px solid rgba(255,255,255,0.08);">
+                                        <span style="font-size:10px;color:#64748b;font-weight:700;margin-left:2px;">RANGE:</span>
+                                        <button type="button" id="btn-range-500" class="oi-range-btn" style="padding:3px 6px;font-size:10px;font-weight:700;border-radius:4px;background:transparent;color:#94a3b8;border:none;cursor:pointer;">±10</button>
+                                        <button type="button" id="btn-range-1000" class="oi-range-btn active" style="padding:3px 7px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(0,229,255,0.15);color:#00e5ff;border:1px solid rgba(0,229,255,0.3);cursor:pointer;">±20 (1k)</button>
+                                        <button type="button" id="btn-range-1500" class="oi-range-btn" style="padding:3px 6px;font-size:10px;font-weight:700;border-radius:4px;background:transparent;color:#94a3b8;border:none;cursor:pointer;">±30</button>
+                                        <button type="button" id="btn-range-all" class="oi-range-btn" style="padding:3px 6px;font-size:10px;font-weight:700;border-radius:4px;background:transparent;color:#94a3b8;border:none;cursor:pointer;">ALL</button>
+                                    </div>
+
+                                    <!-- Timeframe Selector -->
+                                    <div style="display:flex;align-items:center;gap:4px;">
+                                        <button type="button" id="btn-tf-1m" class="oi-tf-btn" style="padding:4px 8px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">1m</button>
+                                        <button type="button" id="btn-tf-3m" class="oi-tf-btn" style="padding:4px 8px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">3m</button>
+                                        <button type="button" id="btn-tf-5m" class="oi-tf-btn active" style="padding:4px 8px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(0,229,255,0.18);color:#00e5ff;border:1px solid #00e5ff;cursor:pointer;">5m</button>
+                                        <button type="button" id="btn-tf-15m" class="oi-tf-btn" style="padding:4px 8px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">15m</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Whole-Day Macro Context Strip -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 18px;background:rgba(12,16,34,0.9);border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;gap:10px;font-size:11px;">
+                                <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+                                    <span style="color:#64748b;font-weight:800;letter-spacing:0.5px;">DAY TOTALS:</span>
+                                    <span style="color:#94a3b8;">Total Calls: <strong id="oi-macro-ce-val" style="color:#00e5ff;font-family:'JetBrains Mono',monospace;">--</strong></span>
+                                    <span style="color:#94a3b8;">Total Puts: <strong id="oi-macro-pe-val" style="color:#00e676;font-family:'JetBrains Mono',monospace;">--</strong></span>
+                                    <span style="color:#94a3b8;">Day PCR: <strong id="oi-macro-pcr-val" style="color:#ffd54f;font-family:'JetBrains Mono',monospace;">--</strong></span>
+                                </div>
+                                <span id="oi-macro-bias-badge" style="font-size:10px;font-weight:800;letter-spacing:0.5px;padding:2px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);color:#cbd5e1;background:rgba(255,255,255,0.03);">WHOLE-DAY MACRO: BALANCED</span>
+                            </div>
+
+                            <!-- Multi-Timeframe Rate Cards Row -->
+                            <div style="padding:10px 18px;background:rgba(10,14,30,0.6);border-bottom:1px solid rgba(255,255,255,0.06);">
+                                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(170px, 1fr));gap:8px;">
+                                    <div id="tf-card-1m" style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;cursor:pointer;transition:all 0.2s;">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#64748b;font-weight:700;">
+                                            <span>1m RATE</span>
+                                            <span id="tf-bias-1m" style="color:#94a3b8;font-weight:800;">--</span>
+                                        </div>
+                                        <div id="tf-val-1m" style="font-size:15px;font-weight:900;color:#94a3b8;margin-top:2px;font-family:'JetBrains Mono',monospace;">--</div>
+                                    </div>
+                                    <div id="tf-card-3m" style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;cursor:pointer;transition:all 0.2s;">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#64748b;font-weight:700;">
+                                            <span>3m RATE</span>
+                                            <span id="tf-bias-3m" style="color:#94a3b8;font-weight:800;">--</span>
+                                        </div>
+                                        <div id="tf-val-3m" style="font-size:15px;font-weight:900;color:#94a3b8;margin-top:2px;font-family:'JetBrains Mono',monospace;">--</div>
+                                    </div>
+                                    <div id="tf-card-5m" style="background:rgba(0,229,255,0.08);border:1px solid #00e5ff;border-radius:6px;padding:6px 10px;cursor:pointer;transition:all 0.2s;">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#64748b;font-weight:700;">
+                                            <span>5m RATE</span>
+                                            <span id="tf-bias-5m" style="color:#00e5ff;font-weight:800;">--</span>
+                                        </div>
+                                        <div id="tf-val-5m" style="font-size:15px;font-weight:900;color:#00e5ff;margin-top:2px;font-family:'JetBrains Mono',monospace;">--</div>
+                                    </div>
+                                    <div id="tf-card-15m" style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;cursor:pointer;transition:all 0.2s;">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#64748b;font-weight:700;">
+                                            <span>15m RATE</span>
+                                            <span id="tf-bias-15m" style="color:#94a3b8;font-weight:800;">--</span>
+                                        </div>
+                                        <div id="tf-val-15m" style="font-size:15px;font-weight:900;color:#94a3b8;margin-top:2px;font-family:'JetBrains Mono',monospace;">--</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- FOCUSED ADVISORY: MAJOR LEVELS & WHERE BIG MONEY MOVED -->
+                            <div style="padding:12px 18px;background:rgba(14,18,40,0.92);border-bottom:1px solid rgba(255,255,255,0.06);">
+                                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:12px;">
+                                    <!-- Panel A: Major Structural Levels (Call Wall, Put Wall, ATM) -->
+                                    <div style="background:rgba(18,24,52,0.85);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 14px;">
+                                        <div style="font-size:11px;font-weight:800;color:#ffd54f;margin-bottom:8px;letter-spacing:0.5px;">🏛️ MAJOR STRUCTURAL LEVELS</div>
+                                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:'JetBrains Mono',monospace;">
+                                            <div style="background:rgba(255,51,102,0.06);border:1px solid rgba(255,51,102,0.25);border-radius:6px;padding:6px 8px;">
+                                                <div style="font-size:10px;color:#94a3b8;">CALL WALL (Ceiling)</div>
+                                                <div id="major-call-wall-strike" style="font-size:14px;font-weight:900;color:#ff3366;margin-top:2px;">--</div>
+                                                <div id="major-call-wall-delta" style="font-size:10px;color:#cbd5e1;margin-top:2px;">--</div>
+                                            </div>
+                                            <div style="background:rgba(0,230,118,0.06);border:1px solid rgba(0,230,118,0.25);border-radius:6px;padding:6px 8px;">
+                                                <div style="font-size:10px;color:#94a3b8;">PUT WALL (Floor)</div>
+                                                <div id="major-put-wall-strike" style="font-size:14px;font-weight:900;color:#00e676;margin-top:2px;">--</div>
+                                                <div id="major-put-wall-delta" style="font-size:10px;color:#cbd5e1;margin-top:2px;">--</div>
+                                            </div>
+                                        </div>
+                                        <div id="major-levels-status-text" style="font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.4;">
+                                            Monitoring major structural wall defenses...
+                                        </div>
+                                    </div>
+
+                                    <!-- Panel B: Outlier Hotspots (Where Major Change Happened) -->
+                                    <div style="background:rgba(18,24,52,0.85);border:1px solid rgba(0,229,255,0.2);border-radius:8px;padding:10px 14px;">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                                            <span style="font-size:11px;font-weight:800;color:#00e5ff;letter-spacing:0.5px;">⚡ WHERE MAJOR CHANGE HAPPENED</span>
+                                            <span id="oi-net-pressure-pill" style="font-size:10px;font-weight:800;color:#ffd54f;background:rgba(255,213,79,0.12);border:1px solid #ffd54f;padding:2px 6px;border-radius:4px;font-family:'JetBrains Mono',monospace;">NET: --</span>
+                                        </div>
+                                        <!-- Call vs Put Flow Breakdown Cards -->
+                                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px;font-size:10px;font-family:'JetBrains Mono',monospace;">
+                                            <div style="background:rgba(255,51,102,0.05);border:1px solid rgba(255,51,102,0.2);border-radius:5px;padding:4px 6px;">
+                                                <div style="color:#ff3366;font-weight:800;margin-bottom:2px;">CALL FLOW</div>
+                                                <div id="oi-call-write-hotspot" style="color:#cbd5e1;">Writing: --</div>
+                                                <div id="oi-call-unwind-hotspot" style="color:#cbd5e1;">Covering: --</div>
+                                            </div>
+                                            <div style="background:rgba(0,230,118,0.05);border:1px solid rgba(0,230,118,0.2);border-radius:5px;padding:4px 6px;">
+                                                <div style="color:#00e676;font-weight:800;margin-bottom:2px;">PUT FLOW</div>
+                                                <div id="oi-put-write-hotspot" style="color:#cbd5e1;">Writing: --</div>
+                                                <div id="oi-put-unwind-hotspot" style="color:#cbd5e1;">Dumping: --</div>
+                                            </div>
+                                        </div>
+                                        <div id="oi-hotspots-container" style="display:flex;flex-direction:column;gap:5px;">
+                                            <div style="font-size:11px;color:#64748b;">Accumulating consecutive ticks to identify volume surge strikes...</div>
+                                        </div>
+                                        <div id="oi-advisory-narrative" style="font-size:11px;color:#cbd5e1;line-height:1.4;margin-top:6px;border-top:1px dashed rgba(255,255,255,0.08);padding-top:6px;">
+                                            Analyzing major positioning shifts...
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Historical Rewind Toolbar -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 18px;background:rgba(15,20,38,0.95);border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;gap:10px;">
+                                <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:280px;">
+                                    <span style="font-size:11px;color:#94a3b8;font-weight:700;white-space:nowrap;">REWIND MEMORY:</span>
+                                    <input type="range" id="oi-rewind-slider" min="0" max="10" value="10" style="flex:1;accent-color:#00e5ff;cursor:pointer;">
+                                    <span id="oi-rewind-time-label" style="font-size:11px;font-family:'JetBrains Mono',monospace;color:#00e5ff;font-weight:800;min-width:65px;text-align:right;">LIVE</span>
+                                </div>
+                                <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+                                    <span style="font-size:10px;color:#64748b;font-weight:700;">PRESETS:</span>
+                                    <button type="button" id="btn-preset-live" class="oi-preset-btn active" style="padding:3px 8px;font-size:10px;font-weight:800;border-radius:4px;background:rgba(0,230,118,0.15);color:#00e676;border:1px solid rgba(0,230,118,0.4);cursor:pointer;">LIVE</button>
+                                    <button type="button" id="btn-preset-1m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-1m</button>
+                                    <button type="button" id="btn-preset-3m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-3m</button>
+                                    <button type="button" id="btn-preset-5m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-5m</button>
+                                    <button type="button" id="btn-preset-10m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-10m</button>
+                                    <button type="button" id="btn-preset-15m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-15m</button>
+                                    <button type="button" id="btn-preset-30m" class="oi-preset-btn" style="padding:3px 7px;font-size:10px;font-weight:700;border-radius:4px;background:rgba(255,255,255,0.04);color:#94a3b8;border:1px solid rgba(255,255,255,0.1);cursor:pointer;">-30m</button>
+                                </div>
+                            </div>
+
+                            <!-- Bidirectional Plotly Chart Canvas -->
+                            <div style="padding:10px 14px;background:rgba(8,11,26,0.85);">
+                                <div id="oi-velocity-chart" style="width:100%;min-height:560px;"></div>
+                            </div>
+
+                            <!-- Bottom Flow Legend Guide Strip -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 18px;background:rgba(15,20,38,0.95);border-top:1px solid rgba(255,255,255,0.06);font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap;gap:8px;">
+                                <div style="display:flex;gap:14px;flex-wrap:wrap;">
+                                    <span style="color:#ff3366;">🔴 CALL WRITING (RESISTANCE)</span>
+                                    <span style="color:#00e5ff;">🔵 CALL SHORT COVERING</span>
+                                    <span style="color:#00e676;">🟢 PUT WRITING (SUPPORT)</span>
+                                    <span style="color:#ff9100;">🟠 PUT CAPITULATION</span>
+                                </div>
+                                <div style="color:#94a3b8;font-size:10px;">
+                                    <span>░░ DOTTED GHOST BARS: CURRENT LIVE FLOW (WHEN REWOUND)</span>
+                                </div>
+                            </div>
+                        </div>
+'''
                     else:
                         chain_tab_html = '<div class="card"><p style="color:#888;">No option chain data available for analysis.</p></div>'
 
@@ -5136,12 +5398,11 @@ class VolatilityAnalyzer:
                             _is_shares = bool((_df_mm['oi'].max() > 100_000)) if not _df_mm.empty else False
                             _total_shares = _df_mm['oi'] if _is_shares else (_df_mm['oi'] * _lot_mm)
 
-                            # ── UNIFIED INSTITUTIONAL DEALER POSITIONING (NSE INDEX STANDARDS) ──
-                            # Standard dealer positioning for Indian index options:
+                            # ── INSTITUTIONAL DEALER GEX POSITIONING & HEDGING FLOWS ──
+                            # Standard dealer positioning:
                             # Dealers are liquidity providers. 
                             # CE: Dealer Long Call delta & gamma (+1).
                             # PE: Dealer Short Put (+delta, -gamma) (-1).
-                            # Dealer Gamma in Nifty Futures Lots per 50-pt move:
                             _df_mm['gex_lots_50pt'] = _df_mm.apply(
                                 lambda r: (50.0 * r['gamma_mm'] * (r['oi'] if _is_shares else r['oi'] * _lot_mm) / _lot_mm) if r['type'] == 'CE'
                                 else (-50.0 * r['gamma_mm'] * (r['oi'] if _is_shares else r['oi'] * _lot_mm) / _lot_mm), axis=1)
@@ -5159,12 +5420,12 @@ class VolatilityAnalyzer:
                             _hedge_lots_50pt = -_net_gex_lots
 
                             # Dealer Gamma Regime
-                            if _net_gex_lots >= 0:
+                            if _net_gex_crores >= 0:
                                 _regime_title = "LONG GAMMA · PINNING REGIME"
                                 _regime_badge = "STABILIZING FLOW"
                                 _regime_badge_col = GREEN
                                 _regime_desc = "Dealers counter-trade price swings (sell into rallies, buy dips). Volatility is dampened; mean-reversion & pinning expected within corridor."
-                                _hedge_act_txt = f"SELL {abs(_hedge_lots_50pt):,.0f} LOTS"
+                                _hedge_act_txt = f"SELL ₹{abs(_net_gex_crores * 0.5):.1f} Cr"
                                 _hedge_act_col = GREEN
                                 _hedge_impact = "Dampens rally momentum"
                             else:
@@ -5172,21 +5433,21 @@ class VolatilityAnalyzer:
                                 _regime_badge = "SLIPPERY ACCELERATION"
                                 _regime_badge_col = RED
                                 _regime_desc = "Dealers chase momentum (buy into rallies, sell into breakdowns). Move magnification risk is elevated; expect rapid breakout acceleration."
-                                _hedge_act_txt = f"BUY {abs(_hedge_lots_50pt):,.0f} LOTS"
+                                _hedge_act_txt = f"BUY ₹{abs(_net_gex_crores * 0.5):.1f} Cr"
                                 _hedge_act_col = RED
                                 _hedge_impact = "Magnifies rally breakout"
 
                             # Dealer Net Delta Bias
-                            if _net_dex_lots < 0:
+                            if _net_dex_crores < 0:
                                 _dex_title = "SHORT DELTA"
                                 _dex_badge = "BULLISH SQUEEZE BIAS"
                                 _dex_badge_col = "#00e5ff"
-                                _dex_desc = f"Dealers short {abs(_net_dex_lots):,.0f} Lots (₹{abs(_net_dex_crores):.1f} Cr). Upward breakout triggers forced short covering."
+                                _dex_desc = f"Dealers short ₹{abs(_net_dex_crores):.1f} Cr notional. Upward breakout triggers forced short covering."
                             else:
                                 _dex_title = "LONG DELTA"
                                 _dex_badge = "BEARISH DRAG BIAS"
                                 _dex_badge_col = "#ff9100"
-                                _dex_desc = f"Dealers long {abs(_net_dex_lots):,.0f} Lots (₹{abs(_net_dex_crores):.1f} Cr). Downward break triggers forced long liquidation."
+                                _dex_desc = f"Dealers long ₹{abs(_net_dex_crores):.1f} Cr notional. Downward break triggers forced long liquidation."
 
                             # Key Institutional Landmarks
                             _ce_df = _df_mm[_df_mm['type'] == 'CE']
@@ -5211,6 +5472,7 @@ class VolatilityAnalyzer:
                             _pe_map = _pe_df.set_index('strike')['oi']
                             _by_strike = _df_mm.groupby('strike').agg(
                                 gex_lots=('gex_lots_50pt', 'sum'),
+                                gex_cr=('gex_cr_100pt', 'sum'),
                                 dex_lots=('dex_lots', 'sum')
                             ).reset_index().sort_values('strike', ascending=False)
                             _by_strike['oi_ce'] = _by_strike['strike'].map(_ce_map).fillna(0)
@@ -5220,10 +5482,11 @@ class VolatilityAnalyzer:
                             for _, _mr in _by_strike.iterrows():
                                 _msk = int(_mr['strike'])
                                 _dist = _msk - spot
-                                _ce_l = (_mr['oi_ce'] / _lot_mm) if _is_shares else _mr['oi_ce']
-                                _pe_l = (_mr['oi_pe'] / _lot_mm) if _is_shares else _mr['oi_pe']
-                                _g_l = float(_mr['gex_lots'])
+                                _ce_oi = int(_mr['oi_ce'])
+                                _pe_oi = int(_mr['oi_pe'])
+                                _g_cr = float(_mr['gex_cr'])
                                 _d_l = float(_mr['dex_lots'])
+                                _d_cr = float((_d_l * _lot_mm * spot) / 1e7)
 
                                 _is_atm = abs(_dist) < 75
                                 _is_cw = (_msk == _call_wall)
@@ -5238,9 +5501,9 @@ class VolatilityAnalyzer:
                                     _role_badge = '<span style="background:rgba(255,214,0,0.2);color:#ffd600;font-weight:700;padding:2px 6px;border-radius:4px;">MAX PAIN (Pin)</span>'
                                 elif _is_atm:
                                     _role_badge = '<span style="background:rgba(79,195,247,0.2);color:#4fc3f7;font-weight:700;padding:2px 6px;border-radius:4px;">ATM ZONE</span>'
-                                elif _g_l > 500:
+                                elif _g_cr > 2.0:
                                     _role_badge = '<span style="color:#00e676;">PIN ABSORPTION</span>'
-                                elif _g_l < -500:
+                                elif _g_cr < -2.0:
                                     _role_badge = '<span style="color:#ff3366;">SQUEEZE ACCEL</span>'
                                 else:
                                     _role_badge = '<span style="color:#777;">TRANSITION</span>'
@@ -5250,10 +5513,10 @@ class VolatilityAnalyzer:
                                     f'<tr style="background:{_row_bg};border-bottom:1px solid #1a1a2e;">'
                                     f'<td style="padding:7px 10px;font-weight:700;color:{ACCENT if _is_atm else WHITE};">{_msk}{" ◄ ATM" if _is_atm else ""}</td>'
                                     f'<td style="padding:7px 10px;text-align:right;color:{MUTED};">{_dist:+.0f}</td>'
-                                    f'<td style="padding:7px 10px;text-align:right;color:{WHITE};">{_ce_l:,.0f} L</td>'
-                                    f'<td style="padding:7px 10px;text-align:right;color:{WHITE};">{_pe_l:,.0f} L</td>'
-                                    f'<td style="padding:7px 10px;text-align:right;font-weight:700;color:{GREEN if _g_l>0 else RED};">{_g_l:+,.0f} L</td>'
-                                    f'<td style="padding:7px 10px;text-align:right;font-weight:600;color:{"#00e5ff" if _d_l<0 else "#ff9100"};">{_d_l:+,.0f} L</td>'
+                                    f'<td style="padding:7px 10px;text-align:right;color:{WHITE};">{_ce_oi:,}</td>'
+                                    f'<td style="padding:7px 10px;text-align:right;color:{WHITE};">{_pe_oi:,}</td>'
+                                    f'<td style="padding:7px 10px;text-align:right;font-weight:700;color:{GREEN if _g_cr>0 else RED};">{_g_cr:+.1f} Cr</td>'
+                                    f'<td style="padding:7px 10px;text-align:right;font-weight:600;color:{"#00e5ff" if _d_cr<0 else "#ff9100"};">{_d_cr:+.1f} Cr</td>'
                                     f'<td style="padding:7px 10px;text-align:left;">{_role_badge}</td>'
                                     f'</tr>'
                                 )
@@ -5265,7 +5528,7 @@ class VolatilityAnalyzer:
                                 <div class="ge-card">
                                     <div class="ge-card-header">
                                         <div class="ge-card-title">
-                                            <span style="font-weight:700;">STRIKE GEX LADDER &amp; INSTITUTIONAL DISTRIBUTION</span>
+                                            <span style="font-weight:700;">STRIKE GEX LADDER &amp; GEX DISTRIBUTION</span>
                                         </div>
                                         <span class="num-mono" style="font-size:11px; color:{MUTED};">Signed Dealer Gamma (₹ Cr)</span>
                                     </div>
@@ -5278,55 +5541,55 @@ class VolatilityAnalyzer:
                             <div style="margin-top: 24px; margin-bottom: 14px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
                                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                                     <div style="font-size: 13px; font-weight: 800; letter-spacing: 1.2px; color: {ACCENT}; text-transform: uppercase;">
-                                        UNIFIED NSE INSTITUTIONAL DEALER POSITIONING &amp; HEDGING FLOWS
+                                        GEX &amp; DEALER POSITIONING
                                     </div>
-                                    <span style="font-size:11px; color:{MUTED};">Standardized Nifty Lots ({_lot_mm} per contract) &amp; ₹ Notional</span>
+                                    <span style="font-size:11px; color:{MUTED};">Dealer Gamma &amp; Delta Exposure in ₹ Crores (Notional)</span>
                                 </div>
                             </div>
 
                             <!-- Executive Metric Cards -->
                             <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:12px;margin-bottom:14px;">
                                 <!-- Card 1: Gamma Regime -->
-                                <div class="card" style="border-top:4px solid {_regime_badge_col};">
+                                <div id="dealer-regime-card" class="card" style="border-top:4px solid {_regime_badge_col};">
                                     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
                                         <div style="color:{ACCENT};font-size:11px;font-weight:800;letter-spacing:1px;">DEALER GAMMA REGIME</div>
-                                        <span style="background:rgba(255,255,255,0.06);color:{_regime_badge_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">{_regime_badge}</span>
+                                        <span id="dealer-regime-badge" style="background:rgba(255,255,255,0.06);color:{_regime_badge_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">{_regime_badge}</span>
                                     </div>
-                                    <div style="font-size:20px;font-weight:800;color:{_regime_badge_col};margin-bottom:2px;">{_net_gex_lots:+,.0f} Lots</div>
-                                    <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">{_net_gex_crores:+.1f} ₹ Cr per 100-pt move</div>
-                                    <div style="font-size:11px;color:#aaa;line-height:1.4;">{_regime_desc}</div>
+                                    <div id="dealer-gex-val" style="font-size:20px;font-weight:800;color:{_regime_badge_col};margin-bottom:2px;">{_net_gex_crores:+.1f} Cr</div>
+                                    <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">Net GEX per 100-pt move</div>
+                                    <div id="dealer-regime-desc" style="font-size:11px;color:#aaa;line-height:1.4;">{_regime_desc}</div>
                                 </div>
 
                                 <!-- Card 2: Net Delta Exposure -->
-                                <div class="card" style="border-top:4px solid {_dex_badge_col};">
+                                <div id="dealer-dex-card" class="card" style="border-top:4px solid {_dex_badge_col};">
                                     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
                                         <div style="color:{ACCENT};font-size:11px;font-weight:800;letter-spacing:1px;">DEALER DELTA (DEX)</div>
-                                        <span style="background:rgba(255,255,255,0.06);color:{_dex_badge_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">{_dex_title}</span>
+                                        <span id="dealer-dex-badge" style="background:rgba(255,255,255,0.06);color:{_dex_badge_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">{_dex_title}</span>
                                     </div>
-                                    <div style="font-size:20px;font-weight:800;color:{_dex_badge_col};margin-bottom:2px;">{_net_dex_lots:+,.0f} Lots</div>
-                                    <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">₹{abs(_net_dex_crores):.1f} Cr Notional Exposure</div>
-                                    <div style="font-size:11px;color:#aaa;line-height:1.4;">{_dex_desc}</div>
+                                    <div id="dealer-dex-val" style="font-size:20px;font-weight:800;color:{_dex_badge_col};margin-bottom:2px;">₹{_net_dex_crores:+.1f} Cr</div>
+                                    <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">Notional Exposure</div>
+                                    <div id="dealer-dex-desc" style="font-size:11px;color:#aaa;line-height:1.4;">{_dex_desc}</div>
                                 </div>
 
                                 <!-- Card 3: 50-pt Hedge Requirement -->
-                                <div class="card" style="border-top:4px solid {_hedge_act_col};">
+                                <div id="dealer-hedge-card" class="card" style="border-top:4px solid {_hedge_act_col};">
                                     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
                                         <div style="color:{ACCENT};font-size:11px;font-weight:800;letter-spacing:1px;">50-PT HEDGE FLOW</div>
-                                        <span style="background:rgba(255,255,255,0.06);color:{_hedge_act_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">REBALANCING</span>
+                                        <span id="dealer-hedge-badge" style="background:rgba(255,255,255,0.06);color:{_hedge_act_col};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">REBALANCING</span>
                                     </div>
-                                    <div style="font-size:20px;font-weight:800;color:{_hedge_act_col};margin-bottom:2px;">{_hedge_act_txt}</div>
+                                    <div id="dealer-hedge-val" style="font-size:20px;font-weight:800;color:{_hedge_act_col};margin-bottom:2px;">{_hedge_act_txt}</div>
                                     <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">Required on a +50 pt Nifty advance</div>
-                                    <div style="font-size:11px;color:#aaa;line-height:1.4;">Dealers forced flow { 'dampens upside momentum' if _hedge_lots_50pt < 0 else 'accelerates upside momentum' }.</div>
+                                    <div id="dealer-hedge-desc" style="font-size:11px;color:#aaa;line-height:1.4;">Dealers forced flow {'dampens upside momentum' if _net_gex_crores >= 0 else 'accelerates upside momentum'}.</div>
                                 </div>
 
                                 <!-- Card 4: Pin Anchor / Max Pain -->
-                                <div class="card" style="border-top:4px solid {YELLOW};">
+                                <div id="dealer-pain-card" class="card" style="border-top:4px solid {YELLOW};">
                                     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
                                         <div style="color:{ACCENT};font-size:11px;font-weight:800;letter-spacing:1px;">EXPIRY PIN ANCHOR</div>
                                         <span style="background:rgba(255,214,0,0.15);color:{YELLOW};font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;">MAX PAIN</span>
                                     </div>
-                                    <div style="font-size:20px;font-weight:800;color:{YELLOW};margin-bottom:2px;">{_max_pain}</div>
-                                    <div style="font-size:11px;color:{MUTED};margin-bottom:8px;">{abs(spot - _max_pain):.0f} pts away ({'Above' if spot > _max_pain else 'Below'} Spot)</div>
+                                    <div id="dealer-pain-val" style="font-size:20px;font-weight:800;color:{YELLOW};margin-bottom:2px;">{_max_pain}</div>
+                                    <div id="dealer-pain-dist" style="font-size:11px;color:{MUTED};margin-bottom:8px;">{abs(spot - _max_pain):.0f} pts away ({'Above' if spot > _max_pain else 'Below'} Spot)</div>
                                     <div style="font-size:11px;color:#aaa;line-height:1.4;">Option sellers' maximum profitability strike; acts as magnetic gravity near expiry.</div>
                                 </div>
                             </div>
@@ -5336,22 +5599,22 @@ class VolatilityAnalyzer:
                                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
                                     <span style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1px;">TACTICAL EXPIRY CORRIDOR &amp; VOLATILITY TRIGGERS</span>
                                     <div style="display:flex;gap:8px;font-size:11px;">
-                                        <span style="background:rgba(255,51,102,0.15);color:#ff3366;padding:2px 8px;border-radius:4px;font-weight:700;">Upper Barrier: {_up_barrier}</span>
-                                        <span style="background:rgba(0,230,118,0.15);color:#00e676;padding:2px 8px;border-radius:4px;font-weight:700;">Lower Barrier: {_down_barrier}</span>
+                                        <span id="dealer-upper-barrier" style="background:rgba(255,51,102,0.15);color:#ff3366;padding:2px 8px;border-radius:4px;font-weight:700;">Upper Barrier: {_up_barrier}</span>
+                                        <span id="dealer-lower-barrier" style="background:rgba(0,230,118,0.15);color:#00e676;padding:2px 8px;border-radius:4px;font-weight:700;">Lower Barrier: {_down_barrier}</span>
                                     </div>
                                 </div>
-                                <div style="font-size:12px;color:#ccc;line-height:1.5;">
+                                <div id="dealer-tactical-text" style="font-size:12px;color:#ccc;line-height:1.5;">
                                     Safe Pinning Corridor: <strong style="color:{WHITE};">{_put_wall} — {_call_wall}</strong> ({_call_wall - _put_wall:.0f} pts). 
                                     A sustained push <strong>above {_up_barrier}</strong> triggers a violent Call Gamma Squeeze as dealers cover short strikes. 
                                     A decisive break <strong>below {_down_barrier}</strong> sparks rapid put unwinding and cascade selling.
                                 </div>
                             </div>
 
-                            <!-- Per-Strike Institutional Inventory Table -->
+                            <!-- Per-Strike Inventory & Dealer Exposure Table -->
                             <div class="card">
                                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                                    <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">PER-STRIKE INSTITUTIONAL INVENTORY &amp; DEALER EXPOSURE</div>
-                                    <div style="font-size:11px;color:{MUTED};">Open Interest in Nifty Lots · Signed Dealer Gamma &amp; Delta</div>
+                                    <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">PER-STRIKE INVENTORY &amp; DEALER EXPOSURE</div>
+                                    <div style="font-size:11px;color:{MUTED};">Open Interest · Signed Dealer Gamma (₹ Cr) &amp; Delta Exposure</div>
                                 </div>
                                 <div style="max-height:420px;overflow-y:auto;">
                                     <table style="width:100%;border-collapse:collapse;font-size:11px;">
@@ -5359,14 +5622,14 @@ class VolatilityAnalyzer:
                                             <tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;position:sticky;top:0;background:{CARD_BG};z-index:2;">
                                                 <th style="padding:7px 10px;text-align:left;">Strike</th>
                                                 <th style="padding:7px 10px;text-align:right;">Dist (pts)</th>
-                                                <th style="padding:7px 10px;text-align:right;">Call OI (Lots)</th>
-                                                <th style="padding:7px 10px;text-align:right;">Put OI (Lots)</th>
-                                                <th style="padding:7px 10px;text-align:right;">Dealer Gamma (50pt)</th>
-                                                <th style="padding:7px 10px;text-align:right;">Dealer Delta (Lots)</th>
-                                                <th style="padding:7px 10px;text-align:left;">Institutional Role</th>
+                                                <th style="padding:7px 10px;text-align:right;">Call OI</th>
+                                                <th style="padding:7px 10px;text-align:right;">Put OI</th>
+                                                <th style="padding:7px 10px;text-align:right;">Dealer Gamma (₹ Cr)</th>
+                                                <th style="padding:7px 10px;text-align:right;">Dealer Delta (₹ Cr)</th>
+                                                <th style="padding:7px 10px;text-align:left;">Dealer Role / Wall</th>
                                             </tr>
                                         </thead>
-                                        <tbody>{_mm_rows}</tbody>
+                                        <tbody id="dealer-inventory-tbody">{_mm_rows}</tbody>
                                     </table>
                                 </div>
                             </div>'''
@@ -5428,7 +5691,7 @@ class VolatilityAnalyzer:
                         _fvrp = _econ.get('forward_vrp', {})
                         _fvrp_val = _fvrp.get('vrp_5d', _vrp_val)
                         _fvrp_verdict = _fvrp.get('verdict', 'FAVORABLE_PREMIUM')
-                        _atm_iv = _econ.get('atm_iv', 13.5)
+                        _atm_iv = float(regime_snapshot.get('atm_iv', 0) or _econ.get('atm_iv', 0) or _pd_iv or _live_iv or _live_hv or _hv_20d or 12.0)
 
                         _sz_opt_lots = _sz.get('optimal_lots', 14)
                         _sz_base_lots = _sz.get('base_lots', 11)
@@ -5440,253 +5703,374 @@ class VolatilityAnalyzer:
                         _sz_stress_loss = _sz.get('stress_test', {}).get('estimated_loss_inr', 18000.0)
                         _sz_stress_pct = _sz.get('stress_test', {}).get('risk_pct_of_capital', 0.90)
 
+                        # ── MULTI-HORIZON MACRO & PRICE-GROUNDED VRP METRICS ──
+                        _macro = regime_snapshot.get('macro', {})
+                        _macro_stage = _macro.get('stage', 'MACRO MID-RANGE')
+                        _macro_min = _macro.get('hv_min', _hv_20d * 0.7)
+                        _macro_max = _macro.get('hv_max', _hv_20d * 1.5)
+                        _curve_badge = _macro.get('curve_badge', 'CONTANGO (Theta Favorable)')
+                        _curve_color = _macro.get('curve_color', GREEN)
+
+                        _pvrp = regime_snapshot.get('price_vrp', {})
+                        _lot = int(_pvrp.get('lot_size', _get_cfg("nifty_lot_size", 65)))
+
+                        # ── DAILY 1D METRICS ──
+                        _daily_iv_pts = _pvrp.get('daily_iv_pts', 0.0)
+                        if _daily_iv_pts <= 0:
+                            _daily_iv_pts = spot * (_atm_iv / 100.0) / 15.874
+                        _daily_rv_pts = _pvrp.get('daily_rv_pts', 0.0)
+                        if _daily_rv_pts <= 0:
+                            _daily_rv_pts = spot * (_rv_cons / 100.0) / 15.874
+                        _daily_vrp_pts = _pvrp.get('daily_vrp_pts', _daily_iv_pts - _daily_rv_pts)
+                        _daily_iv_inr = _pvrp.get('daily_iv_inr', _daily_iv_pts * _lot)
+                        _daily_rv_inr = _pvrp.get('daily_rv_inr', _daily_rv_pts * _lot)
+                        _daily_vrp_inr = _pvrp.get('daily_vrp_inr', _daily_vrp_pts * _lot)
+                        _daily_edge_pct = (_daily_vrp_pts / _daily_rv_pts * 100.0) if _daily_rv_pts > 0 else 0.0
+
+                        # ── WEEKLY 5 DTE STRADDLE METRICS ──
+                        _straddle_iv_pts = _pvrp.get('straddle_iv_pts', 0.0)
+                        if _straddle_iv_pts <= 0:
+                            _straddle_iv_pts = 0.8 * spot * (_atm_iv / 100.0) * ((5.0 / 365.0) ** 0.5)
+                        _straddle_rv_pts = _pvrp.get('straddle_rv_pts', 0.0)
+                        if _straddle_rv_pts <= 0:
+                            _straddle_rv_pts = 0.8 * spot * (_rv_cons / 100.0) * ((5.0 / 365.0) ** 0.5)
+                        _straddle_vrp_pts = _pvrp.get('straddle_vrp_pts', _straddle_iv_pts - _straddle_rv_pts)
+                        _straddle_iv_inr = _pvrp.get('straddle_iv_inr', _straddle_iv_pts * _lot)
+                        _straddle_rv_inr = _pvrp.get('straddle_rv_inr', _straddle_rv_pts * _lot)
+                        _straddle_vrp_inr = _pvrp.get('straddle_vrp_inr', _straddle_vrp_pts * _lot)
+                        _straddle_edge_pct = _pvrp.get('straddle_edge_pct', ((_straddle_iv_pts - _straddle_rv_pts) / _straddle_rv_pts * 100.0) if _straddle_rv_pts > 0 else 0.0)
+
+                        # Weekly 5D 1-Sigma Expected Move (Spot * IV * sqrt(5/365))
+                        _weekly_iv_pts = spot * (_atm_iv / 100.0) * ((5.0 / 365.0) ** 0.5)
+                        _weekly_rv_pts = spot * (_rv_5d / 100.0) * ((5.0 / 365.0) ** 0.5)
+                        _weekly_iv_inr = _weekly_iv_pts * _lot
+
+                        _edge_ratio = _pvrp.get('sellers_edge_ratio', (_atm_iv / _rv_cons) if _rv_cons > 0 else 1.0)
+                        _notional_per_lot = (spot * _lot) / 100_000.0
+
+                        _hpts = regime_snapshot.get('horizon_points', {})
+                        _pts_1d = _hpts.get('1d', _daily_rv_pts)
+                        _pts_5d = _hpts.get('5d', spot * (_rv_5d / 100.0) / 15.874)
+                        _pts_20d = _hpts.get('20d', spot * (_rv_20d / 100.0) / 15.874)
+                        _pts_60d = _hpts.get('60d', spot * (_rv_60d / 100.0) / 15.874)
+                        _pts_1y = _hpts.get('1y', spot * (_hv_20d / 100.0) / 15.874)
+
+                        _har_1d_pts = spot * (_har_1d / 100.0) / 15.874
+                        _har_5d_pts = spot * (_har_5d / 100.0) / 15.874
+
+                        # ── PLOTLY MULTI-HORIZON VOLATILITY CASCADE LINE PLOT ──
+                        try:
+                            fig_cascade = go.Figure()
+
+                            _h_names = ['1D Session', '5D Weekly', '20D Monthly', '60D Quarterly', '252D 1Y Macro']
+                            _h_rvs = [
+                                float(_rv_intra if _rv_intra > 0 else _rv_cons),
+                                float(_rv_5d),
+                                float(_rv_cons),
+                                float(_rv_60d),
+                                float(_hv_20d)
+                            ]
+                            _h_pts = [float(_pts_1d), float(_pts_5d), float(_pts_20d), float(_pts_60d), float(_pts_1y)]
+                            _h_iv = [float(_atm_iv)] * 5
+                            _h_inr = [p * _lot for p in _h_pts]
+
+                            # 1. 1-Year Historical Cone Bounds (Ceiling & Floor Lines)
+                            if _macro_max > 0:
+                                fig_cascade.add_trace(
+                                    go.Scatter(
+                                        x=_h_names,
+                                        y=[_macro_max] * 5,
+                                        mode='lines',
+                                        name=f"1Y Ceiling ({_macro_max:.1f}%)",
+                                        line=dict(color='rgba(255, 51, 102, 0.45)', width=1.5, dash='dot'),
+                                        hovertemplate="<b>1-Year Vol Ceiling</b>: %{y:.2f}%<extra></extra>"
+                                    )
+                                )
+                            if _macro_min > 0:
+                                fig_cascade.add_trace(
+                                    go.Scatter(
+                                        x=_h_names,
+                                        y=[_macro_min] * 5,
+                                        mode='lines',
+                                        name=f"1Y Floor ({_macro_min:.1f}%)",
+                                        line=dict(color='rgba(0, 230, 118, 0.45)', width=1.5, dash='dot'),
+                                        hovertemplate="<b>1-Year Vol Floor</b>: %{y:.2f}%<extra></extra>"
+                                    )
+                                )
+
+                            # 2. Live ATM Implied Volatility Benchmark Line (Gold Dashed)
+                            fig_cascade.add_trace(
+                                go.Scatter(
+                                    x=_h_names,
+                                    y=_h_iv,
+                                    mode='lines+markers',
+                                    name=f"Live ATM IV ({_atm_iv:.1f}%)",
+                                    line=dict(color='#ffd54f', width=2.5, dash='dash'),
+                                    marker=dict(size=7, color='#ffd54f', symbol='diamond'),
+                                    hovertemplate="<b>Live ATM Implied Vol</b>: <b>%{y:.2f}%</b><extra></extra>"
+                                )
+                            )
+
+                            # 3. Realized Volatility Term Curve (Vibrant Solid Cyan Line)
+                            _custom_rv = [
+                                [pts, inr, rv - _atm_iv, name]
+                                for pts, inr, rv, name in zip(_h_pts, _h_inr, _h_rvs, _h_names)
+                            ]
+                            fig_cascade.add_trace(
+                                go.Scatter(
+                                    x=_h_names,
+                                    y=_h_rvs,
+                                    mode='lines+markers+text',
+                                    name="Realized Vol Curve (RV)",
+                                    line=dict(color='#00e5ff', width=3.5),
+                                    marker=dict(
+                                        size=10,
+                                        color='#00e5ff',
+                                        symbol='circle',
+                                        line=dict(color='#ffffff', width=2)
+                                    ),
+                                    text=[f"{v:.1f}%" for v in _h_rvs],
+                                    textposition="top center",
+                                    textfont=dict(color="#00e5ff", size=11, family="JetBrains Mono, monospace"),
+                                    customdata=_custom_rv,
+                                    hovertemplate=(
+                                        "<b>%{x}</b><br>"
+                                        "Realized Vol: <b>%{y:.2f}%</b><br>"
+                                        "ATM IV: <b>" + f"{_atm_iv:.2f}%" + "</b> (VRP: <b>%{customdata[2]:+.2f}%</b>)<br>"
+                                        "Daily Expected Move: <b>±%{customdata[0]:.0f} pts</b> (₹%{customdata[1]:,.0f}/lot)<extra></extra>"
+                                    )
+                                )
+                            )
+
+                            fig_cascade.update_layout(
+                                height=340,
+                                margin=dict(l=45, r=40, t=25, b=25),
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                showlegend=True,
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=1.02,
+                                    xanchor="right",
+                                    x=1,
+                                    font=dict(size=11, color="#cbd5e1")
+                                ),
+                                xaxis=dict(
+                                    showgrid=True,
+                                    gridcolor='#2a2e39',
+                                    gridwidth=1,
+                                    tickfont=dict(size=11, color="#cbd5e1", family="Inter, sans-serif")
+                                ),
+                                yaxis=dict(
+                                    title=dict(text="Annualized Volatility (%)", font=dict(color="#00e5ff", size=11)),
+                                    showgrid=True,
+                                    gridcolor='#2a2e39',
+                                    gridwidth=1,
+                                    tickfont=dict(size=10, color="#868993", family="JetBrains Mono, monospace")
+                                ),
+                                hovermode="x unified"
+                            )
+
+                            cascade_chart_html = fig_cascade.to_html(include_plotlyjs=False, full_html=False, div_id='cascade-term-structure-plot', default_height='340px', default_width='100%')
+                        except Exception as _casc_err:
+                            cascade_chart_html = f'<div style="color:#ff4444; padding:20px;">Cascade chart error: {_casc_err}</div>'
+
                         regime_tab_html = f'''
                         <div style="display:flex; flex-direction:column; gap:14px;">
-                            <!-- Institutional Gamma Explosion Quick-Launch Banner -->
-                            <div class="ge-quick-banner" onclick="switchTab('mm')">
-                                <div style="display:flex; align-items:center; gap:14px;">
-                                    <span style="display:inline-flex; width:10px; height:10px; border-radius:50%; background:#00f0ff; box-shadow:0 0 10px #00f0ff; animation:pulseBadgeCyan 1.5s infinite;"></span>
-                                    <div>
-                                        <div style="font-weight:800; font-size:13px; color:#00f0ff; letter-spacing:0.5px; display:flex; align-items:center; gap:8px;">
-                                            <span>⚡ NEW: MARKET MAKER GAMMA EXPLOSION & PINNING TERMINAL</span>
-                                            <span style="font-size:10px; background:rgba(0,240,255,0.25); color:#00f0ff; padding:2px 8px; border-radius:4px; font-weight:700;">LIVE MODEL</span>
-                                        </div>
-                                        <div style="font-size:12px; color:#cbd5e1; margin-top:3px;">
-                                            Real-time Dealer Gamma Pins, Duration Timer (4h+), GEX Retest Absorption & Directional Squeeze Targets.
-                                        </div>
-                                    </div>
-                                </div>
-                                <div style="display:flex; align-items:center; gap:6px; background:#00f0ff; color:#060812; font-weight:800; font-size:11px; padding:8px 16px; border-radius:6px; letter-spacing:0.5px; text-transform:uppercase;">
-                                    LAUNCH TERMINAL &rarr;
-                                </div>
-                            </div>
 
-                            <!-- Executive Market Regime Banner -->
-                            <div class="card" style="border-left: 4px solid {ACCENT}; background:linear-gradient(135deg, rgba(18,18,42,0.95), rgba(10,14,28,0.95)); padding:16px;">
+                            <!-- 1. Executive Multi-Horizon Regime Header -->
+                            <div class="card" style="border-left: 4px solid {ACCENT}; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e); padding:16px;">
                                 <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
                                     <div>
                                         <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px; margin-bottom:3px;">ACTIVE MARKET REGIME</div>
-                                        <h2 style="color:{ACCENT}; font-size:22px; font-weight:900; margin:0 0 4px 0;">{regime_snapshot['regime']['name']}</h2>
+                                        <h2 style="color:{ACCENT}; font-size:24px; font-weight:900; margin:0 0 4px 0;">{regime_snapshot['regime']['name']}</h2>
                                     </div>
-                                    <div style="display:flex; gap:8px; align-items:center;">
-                                        <span style="background:rgba(255,255,255,0.06); color:{WHITE}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid #2a2a4a;">BIAS: <strong style="color:{ACCENT};">{regime_snapshot['regime']['bias']}</strong></span>
-                                        <span style="background:{GREEN}18; color:{GREEN}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {GREEN}44;">VOL: {regime_snapshot['regime']['vol_action']}</span>
-                                    </div>
-                                </div>
-                                <p style="color:#cbd5e1; font-size:13px; line-height:1.5; margin:0 0 10px 0;">{regime_snapshot['regime']['description']}</p>
-                            </div>
-
-                            <!-- STRANGLE POSITION SIZER & RISK COCKPIT -->
-                            <div class="card" id="card-strangle-cockpit" style="border-left: 4px solid {_sz_color}; background:linear-gradient(135deg, rgba(16,20,44,0.95), rgba(10,14,28,0.95)); padding:16px;">
-                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
-                                    <div>
-                                        <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px; display:flex; align-items:center; gap:6px;">
-                                            <span>⚡ QUANT SIZING ENGINE</span>
-                                            <span style="background:rgba(0,240,255,0.15); color:#00f0ff; padding:2px 6px; border-radius:4px; font-size:9px; font-weight:800;">CORSI HAR-RV × SEMI-VARIANCE</span>
-                                        </div>
-                                        <h3 style="color:{WHITE}; font-size:18px; font-weight:800; margin:2px 0 0 0;">STRANGLE POSITION SIZER & CAPITAL ALLOCATOR</h3>
-                                    </div>
-                                    <div style="display:flex; align-items:center; gap:10px;">
-                                        <span id="sz-verdict-pill" style="font-size:12px; font-weight:800; padding:6px 14px; border-radius:6px; background:{_sz_color}22; color:{_sz_color}; border:1px solid {_sz_color}66; font-family:'JetBrains Mono', monospace;">
-                                            {_sz_badge}
+                                    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                                        <span style="background:rgba(0, 229, 255, 0.1); color:{ACCENT}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid rgba(0, 229, 255, 0.25);">
+                                            MACRO (1-YR): <strong>{_macro_stage}</strong> ({_hv_pctile:.0f}th %ile)
+                                        </span>
+                                        <span style="background:rgba(255,255,255,0.04); color:{_curve_color}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {_curve_color}44;">
+                                            CURVE: {_curve_badge}
+                                        </span>
+                                        <span style="background:rgba(255,255,255,0.04); color:{WHITE}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid var(--border-subtle, #2a2e39);">
+                                            BIAS: <strong style="color:{ACCENT};">{regime_snapshot['regime']['bias']}</strong>
+                                        </span>
+                                        <span style="background:{GREEN}18; color:{GREEN}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {GREEN}44;">
+                                            VOL: {regime_snapshot['regime']['vol_action']}
                                         </span>
                                     </div>
                                 </div>
+                                <p style="color:#cbd5e1; font-size:13px; line-height:1.5; margin:0;">{regime_snapshot['regime']['description']}</p>
+                            </div>
 
-                                <!-- Capital Selector Strip -->
-                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:rgba(255,255,255,0.03); padding:10px 14px; border-radius:8px; border:1px solid #2a2a4a; margin-bottom:14px;">
-                                    <div style="display:flex; align-items:center; gap:8px;">
-                                        <span style="font-size:12px; color:{MUTED}; font-weight:700;">ACCOUNT CAPITAL:</span>
-                                        <div style="position:relative; display:inline-flex; align-items:center;">
-                                            <span style="position:absolute; left:10px; color:{MUTED}; font-size:12px; font-weight:700;">₹</span>
-                                            <input type="number" id="sz-capital-input" value="2000000" step="100000" style="background:#0a0e1c; border:1px solid #3b4261; border-radius:6px; padding:6px 10px 6px 24px; color:{WHITE}; font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:700; width:140px;" onchange="updateStrangleSizing(this.value)">
-                                        </div>
-                                    </div>
-                                    <div style="display:flex; align-items:center; gap:6px;">
-                                        <span style="font-size:11px; color:{MUTED}; margin-right:4px;">QUICK:</span>
-                                        <button type="button" class="sz-quick-btn" onclick="setStrangleCapital(500000)" style="background:rgba(255,255,255,0.06); border:1px solid #2a2a4a; color:#cbd5e1; font-size:11px; font-weight:700; padding:4px 8px; border-radius:4px; cursor:pointer;">₹5L</button>
-                                        <button type="button" class="sz-quick-btn" onclick="setStrangleCapital(1000000)" style="background:rgba(255,255,255,0.06); border:1px solid #2a2a4a; color:#cbd5e1; font-size:11px; font-weight:700; padding:4px 8px; border-radius:4px; cursor:pointer;">₹10L</button>
-                                        <button type="button" class="sz-quick-btn active" onclick="setStrangleCapital(2000000)" style="background:rgba(0,240,255,0.15); border:1px solid #00f0ff66; color:#00f0ff; font-size:11px; font-weight:700; padding:4px 8px; border-radius:4px; cursor:pointer;">₹20L</button>
-                                        <button type="button" class="sz-quick-btn" onclick="setStrangleCapital(5000000)" style="background:rgba(255,255,255,0.06); border:1px solid #2a2a4a; color:#cbd5e1; font-size:11px; font-weight:700; padding:4px 8px; border-radius:4px; cursor:pointer;">₹50L</button>
+                            <!-- 2. Price-Grounded VRP & Expected Move Matrix -->
+                            <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+                                    <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
+                                        💰 VOLATILITY RISK PREMIUM IN PRICE (POINTS & RUPEES)
                                     </div>
                                     <div style="font-size:11px; color:{MUTED};">
-                                        Margin: <strong>₹1.2L / Lot</strong> (70% Max Usage · 30% MTM Buffer)
+                                        NIFTY Spot: <strong style="color:{WHITE}; font-family:var(--font-mono);">{spot:,.2f}</strong> · Lot Size: <strong style="color:{ACCENT};">{_lot} Qty</strong> <span style="color:{MUTED};">(₹{_notional_per_lot:.2f}L Notional/Lot)</span>
                                     </div>
                                 </div>
-
-                                <!-- 4-Box Primary Sizing Grid -->
-                                <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:14px;">
-                                    <div class="metric-box" style="padding:12px; text-align:left; background:rgba(10,14,28,0.7); border-top:3px solid {_sz_color};">
-                                        <div class="metric-label" style="font-size:10px; color:{MUTED};">RECOMMENDED STRANGLE LOTS</div>
-                                        <div id="sz-opt-lots-val" style="font-size:26px; font-weight:900; color:{_sz_color}; font-family:'JetBrains Mono', monospace; margin:2px 0;">{_sz_opt_lots} Lots</div>
-                                        <div id="sz-base-lots-sub" class="metric-sub" style="color:#94a3b8; font-size:11px;">Base Capacity: {_sz_base_lots} Lots ({_sz_deploy_pct:.0f}%)</div>
-                                    </div>
-                                    <div class="metric-box" style="padding:12px; text-align:left; background:rgba(10,14,28,0.7); border-top:3px solid #38bdf8;">
-                                        <div class="metric-label" style="font-size:10px; color:{MUTED};">LEG ALLOCATION (ASYMMETRY)</div>
-                                        <div id="sz-leg-alloc-val" style="font-size:20px; font-weight:800; color:{WHITE}; font-family:'JetBrains Mono', monospace; margin:4px 0;">
-                                            <span id="sz-ce-lots-lbl" style="color:#38bdf8;">{_sz_ce_lots} CE</span> : <span id="sz-pe-lots-lbl" style="color:#ff7043;">{_sz_pe_lots} PE</span>
+                                <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;">
+                                    <!-- Card 1: Daily Points VRP Buffer & Edge -->
+                                    <div class="metric-box" style="padding:14px; text-align:left; background:rgba(30, 34, 45, 0.7); border-top:3px solid {'#00e676' if _daily_vrp_pts > 0 else '#ff3366'}; display:flex; flex-direction:column; justify-content:space-between;">
+                                        <div>
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <div class="metric-label" style="font-size:10px;">DAILY VRP PRICE BUFFER (1D)</div>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:{'rgba(0,230,118,0.15)' if _daily_vrp_pts > 0 else 'rgba(255,51,102,0.15)'}; color:{'#00e676' if _daily_vrp_pts > 0 else '#ff3366'}; font-family:var(--font-mono);">
+                                                    {'+' if _daily_edge_pct > 0 else ''}{_daily_edge_pct:.0f}% EDGE
+                                                </span>
+                                            </div>
+                                            <div style="font-size:24px; font-weight:900; color:{'#00e676' if _daily_vrp_pts > 0 else '#ff3366'}; margin:4px 0 2px 0; font-family:var(--font-mono);">
+                                                {_daily_vrp_pts:+.1f} PTS <span style="font-size:13px; font-weight:700; color:{WHITE};">/ day</span>
+                                            </div>
+                                            <div style="font-size:13px; font-weight:800; color:{'#00e676' if _daily_vrp_inr >= 0 else '#ff3366'}; margin-bottom:10px; font-family:var(--font-mono);">
+                                                {'+₹' if _daily_vrp_inr >= 0 else '-₹'}{abs(_daily_vrp_inr):,.0f} <span style="font-size:10px; font-weight:600; color:{MUTED};">/ lot edge ({_lot} qty)</span>
+                                            </div>
                                         </div>
-                                        <div id="sz-skew-bias-sub" class="metric-sub" style="color:#ffd54f; font-size:11px; font-weight:700;">{_semi_bias.replace('_', ' ')}</div>
-                                    </div>
-                                    <div class="metric-box" style="padding:12px; text-align:left; background:rgba(10,14,28,0.7); border-top:3px solid #00e676;">
-                                        <div class="metric-label" style="font-size:10px; color:{MUTED};">FORWARD VRP EDGE</div>
-                                        <div style="font-size:24px; font-weight:900; color:{GREEN if _fvrp_val >= 0 else RED}; font-family:'JetBrains Mono', monospace; margin:2px 0;">{_fvrp_val:+.2f}%</div>
-                                        <div class="metric-sub" style="color:#cbd5e1; font-size:11px;">Forecast: {_har_5d:.1f}% vs IV: {_atm_iv:.1f}%</div>
-                                    </div>
-                                    <div class="metric-box" style="padding:12px; text-align:left; background:rgba(10,14,28,0.7); border-top:3px solid #ffd54f;">
-                                        <div class="metric-label" style="font-size:10px; color:{MUTED};">2σ OVERNIGHT GAP RISK</div>
-                                        <div id="sz-gap-risk-val" style="font-size:20px; font-weight:800; color:{WHITE}; font-family:'JetBrains Mono', monospace; margin:4px 0;">₹{_sz_stress_loss:,.0f}</div>
-                                        <div id="sz-gap-pct-sub" class="metric-sub" style="color:#10b981; font-size:11px; font-weight:700;">{_sz_stress_pct:.2f}% of capital (Safe)</div>
-                                    </div>
-                                </div>
-
-                                <!-- Dual Volatility Intelligence Meters -->
-                                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
-                                    <!-- Semi-Variance Downside Hazard vs Upside Potential -->
-                                    <div style="background:rgba(255,255,255,0.02); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                                            <div style="font-size:11px; font-weight:800; color:#cbd5e1;">REALIZED SEMI-VARIANCE (DOWNSIDE VS UPSIDE)</div>
-                                            <span id="sz-vai-score" style="font-size:11px; font-weight:700; color:{'#ff7043' if _vai > 0.1 else '#10b981'}; font-family:'JetBrains Mono', monospace;">VAI: {_vai:+.3f}</span>
+                                        <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                            <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                <span style="color:{MUTED};">Priced 1D Move (IV):</span>
+                                                <strong style="color:{WHITE}; font-family:var(--font-mono);">±{_daily_iv_pts:.1f} pts <span style="color:{ACCENT}; font-size:10px;">(₹{_daily_iv_inr:,.0f})</span></strong>
+                                            </div>
+                                            <div style="display:flex; justify-content:space-between;">
+                                                <span style="color:{MUTED};">Realized Reality (RV):</span>
+                                                <strong style="color:{WHITE}; font-family:var(--font-mono);">±{_daily_rv_pts:.1f} pts <span style="color:#94a3b8; font-size:10px;">(₹{_daily_rv_inr:,.0f})</span></strong>
+                                            </div>
                                         </div>
-                                        <div style="display:flex; height:12px; border-radius:6px; overflow:hidden; background:#121226; margin-bottom:6px;">
-                                            <div id="sz-gauge-rv-plus" style="width:{_rv_plus_pct:.1f}%; background:#10b981; transition:width 0.4s ease;" title="Upside Momentum RV+"></div>
-                                            <div id="sz-gauge-rv-minus" style="width:{_rv_minus_pct:.1f}%; background:#ef4444; transition:width 0.4s ease;" title="Downside Crash Hazard RV-"></div>
-                                        </div>
-                                        <div style="display:flex; justify-content:space-between; font-size:11px; color:{MUTED};">
-                                            <span>🟢 Upside Potential (RV+): <strong style="color:#10b981;">{_rv_plus_pct:.1f}%</strong></span>
-                                            <span>🔴 Downside Hazard (RV-): <strong style="color:#ef4444;">{_rv_minus_pct:.1f}%</strong></span>
-                                        </div>
-                                        <div style="font-size:11px; color:#94a3b8; margin-top:6px; line-height:1.4;">
-                                            {_semi_interp}
+                                        <div class="metric-sub" style="color:{'#00e676' if _daily_vrp_pts > 0 else '#ff3366'}; font-weight:700; margin-top:8px;">
+                                            {'⚡ Sellers harvest +' + f'{_daily_vrp_pts:.1f} pts daily theta buffer' if _daily_vrp_pts > 0 else '⚠️ Buyers hold statistical vol discount (-' + f'{abs(_daily_vrp_pts):.1f} pts)'}
                                         </div>
                                     </div>
 
-                                    <!-- Corsi HAR-RV Multi-Horizon Forecast & Bipower Jump Radar -->
-                                    <div style="background:rgba(255,255,255,0.02); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                                            <div style="font-size:11px; font-weight:800; color:#cbd5e1;">CORSI (2009) HAR-RV FORECAST & JUMP RADAR</div>
-                                            <span style="font-size:10px; font-weight:800; padding:2px 8px; border-radius:4px; background:{'rgba(239,68,68,0.2)' if _jump_ratio_pct > 30 else 'rgba(16,185,129,0.2)'}; color:{'#ef4444' if _jump_ratio_pct > 30 else '#10b981'};">
-                                                {_jump_badge}
-                                            </span>
-                                        </div>
-                                        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:6px; text-align:center; margin-bottom:8px;">
-                                            <div style="background:#0d1124; padding:6px; border-radius:4px; border:1px solid #222744;">
-                                                <div style="font-size:9px; color:{MUTED};">1D FORWARD</div>
-                                                <div style="font-size:14px; font-weight:800; color:{WHITE};">{_har_1d:.2f}%</div>
+                                    <!-- Card 2: Weekly Straddle Mispricing & Exact Values -->
+                                    <div class="metric-box" style="padding:14px; text-align:left; background:rgba(30, 34, 45, 0.7); border-top:3px solid {'#00e676' if _straddle_vrp_pts > 0 else '#ff3366'}; display:flex; flex-direction:column; justify-content:space-between;">
+                                        <div>
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <div class="metric-label" style="font-size:10px;">WEEKLY ATM STRADDLE (5 DTE)</div>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:{'rgba(0,230,118,0.15)' if _straddle_vrp_pts > 0 else 'rgba(255,51,102,0.15)'}; color:{'#00e676' if _straddle_vrp_pts > 0 else '#ff3366'}; font-family:var(--font-mono);">
+                                                    {'+' if _straddle_edge_pct > 0 else ''}{_straddle_edge_pct:.1f}% MISPRICING
+                                                </span>
                                             </div>
-                                            <div style="background:#0d1124; padding:6px; border-radius:4px; border:1px solid #222744;">
-                                                <div style="font-size:9px; color:{MUTED};">5D WEEKLY FORECAST</div>
-                                                <div style="font-size:14px; font-weight:800; color:#38bdf8;">{_har_5d:.2f}%</div>
+                                            <div style="font-size:24px; font-weight:900; color:{WHITE}; margin:4px 0 2px 0; font-family:var(--font-mono);">
+                                                {_straddle_vrp_pts:+.1f} PTS <span style="font-size:13px; font-weight:700; color:{'#00e676' if _straddle_vrp_pts > 0 else '#ff3366'};">EDGE</span>
                                             </div>
-                                            <div style="background:#0d1124; padding:6px; border-radius:4px; border:1px solid #222744;">
-                                                <div style="font-size:9px; color:{MUTED};">JUMP RATIO (RJ)</div>
-                                                <div style="font-size:14px; font-weight:800; color:{'#ef4444' if _jump_ratio_pct > 30 else '#10b981'};">{_jump_ratio_pct:.1f}%</div>
+                                            <div style="font-size:13px; font-weight:800; color:{'#00e676' if _straddle_vrp_inr >= 0 else '#ff3366'}; margin-bottom:10px; font-family:var(--font-mono);">
+                                                {'+₹' if _straddle_vrp_inr >= 0 else '-₹'}{abs(_straddle_vrp_inr):,.0f} <span style="font-size:10px; font-weight:600; color:{MUTED};">/ lot edge ({_lot} qty)</span>
                                             </div>
                                         </div>
-                                        <div style="font-size:11px; color:#94a3b8; line-height:1.4;">
-                                            {_jump_desc}
+                                        <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                            <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                <span style="color:{MUTED};">Market Price (at IV):</span>
+                                                <strong style="color:{WHITE}; font-family:var(--font-mono);">{_straddle_iv_pts:.1f} pts <span style="color:{ACCENT}; font-size:10px;">(₹{_straddle_iv_inr:,.0f})</span></strong>
+                                            </div>
+                                            <div style="display:flex; justify-content:space-between;">
+                                                <span style="color:{MUTED};">Fair Value (at RV):</span>
+                                                <strong style="color:{WHITE}; font-family:var(--font-mono);">{_straddle_rv_pts:.1f} pts <span style="color:#94a3b8; font-size:10px;">(₹{_straddle_rv_inr:,.0f})</span></strong>
+                                            </div>
+                                        </div>
+                                        <div class="metric-sub" style="color:{'#00e676' if _straddle_vrp_pts > 0 else '#ff3366'}; font-weight:700; margin-top:8px;">
+                                            {'💰 Option Sellers Edge: Premium Overpriced by ' + f'{_straddle_edge_pct:+.1f}%' if _straddle_vrp_pts > 0 else '🎯 Option Buyers Edge: Straddle Discounted by ' + f'{abs(_straddle_edge_pct):.1f}%'}
+                                        </div>
+                                    </div>
+
+                                    <!-- Card 3: Weekly 5-Day Expected Move Range -->
+                                    <div class="metric-box" style="padding:14px; text-align:left; background:rgba(30, 34, 45, 0.7); border-top:3px solid {ACCENT}; display:flex; flex-direction:column; justify-content:space-between;">
+                                        <div>
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <div class="metric-label" style="font-size:10px;">WEEKLY 5-DAY RANGE (1σ)</div>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:rgba(0,229,255,0.15); color:{ACCENT};">
+                                                    68.3% PROBABILITY
+                                                </span>
+                                            </div>
+                                            <div style="font-size:24px; font-weight:900; color:{WHITE}; margin:4px 0 2px 0; font-family:var(--font-mono);">
+                                                ±{_weekly_iv_pts:.0f} PTS
+                                            </div>
+                                            <div style="font-size:13px; font-weight:800; color:{ACCENT}; margin-bottom:10px; font-family:var(--font-mono);">
+                                                ₹{_weekly_iv_inr:,.0f} <span style="font-size:10px; font-weight:600; color:{MUTED};">1σ range / lot ({_lot} qty)</span>
+                                            </div>
+                                        </div>
+                                        <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                            <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                <span style="color:{MUTED};">Lower Bound:</span>
+                                                <strong style="color:#ff3366; font-family:var(--font-mono);">{spot - _weekly_iv_pts:,.0f}</strong>
+                                            </div>
+                                            <div style="display:flex; justify-content:space-between;">
+                                                <span style="color:{MUTED};">Upper Bound:</span>
+                                                <strong style="color:#00e676; font-family:var(--font-mono);">{spot + _weekly_iv_pts:,.0f}</strong>
+                                            </div>
+                                        </div>
+                                        <div class="metric-sub" style="color:{MUTED}; font-weight:600; margin-top:8px;">
+                                            Priced weekly ATM break-even corridor on spot
+                                        </div>
+                                    </div>
+
+                                    <!-- Card 4: Overpricing Multiple / Ratio -->
+                                    <div class="metric-box" style="padding:14px; text-align:left; background:rgba(30, 34, 45, 0.7); border-top:3px solid {'#00e676' if _edge_ratio > 1.15 else '#ffd54f' if _edge_ratio >= 0.85 else '#ff3366'}; display:flex; flex-direction:column; justify-content:space-between;">
+                                        <div>
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <div class="metric-label" style="font-size:10px;">SELLERS' PREMIUM MULTIPLE</div>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:{'rgba(0,230,118,0.15)' if _edge_ratio > 1.15 else 'rgba(255,213,79,0.15)' if _edge_ratio >= 0.85 else 'rgba(255,51,102,0.15)'}; color:{'#00e676' if _edge_ratio > 1.15 else '#ffd54f' if _edge_ratio >= 0.85 else '#ff3366'}; font-family:var(--font-mono);">
+                                                    {_atm_iv - _rv_cons:+.1f}% VRP SPREAD
+                                                </span>
+                                            </div>
+                                            <div style="font-size:24px; font-weight:900; color:{'#00e676' if _edge_ratio > 1.15 else '#ffd54f' if _edge_ratio >= 0.85 else '#ff3366'}; margin:4px 0 2px 0; font-family:var(--font-mono);">
+                                                {_edge_ratio:.2f}x
+                                            </div>
+                                            <div style="font-size:13px; font-weight:800; color:{WHITE}; margin-bottom:10px; font-family:var(--font-mono);">
+                                                IV {_atm_iv:.1f}% <span style="font-size:10px; font-weight:600; color:{MUTED};">vs RV {_rv_cons:.1f}%</span>
+                                            </div>
+                                        </div>
+                                        <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                            <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                <span style="color:{MUTED};">Premium Status:</span>
+                                                <strong style="color:{'#00e676' if _edge_ratio > 1.0 else '#ff3366'}; font-family:var(--font-mono);">{f'+{(_edge_ratio - 1.0)*100:.1f}% Overpriced' if _edge_ratio > 1.0 else f'{(_edge_ratio - 1.0)*100:.1f}% Discounted'}</strong>
+                                            </div>
+                                            <div style="display:flex; justify-content:space-between;">
+                                                <span style="color:{MUTED};">Optimal Action:</span>
+                                                <strong style="color:{ACCENT};">{'Credit & Theta Harvest' if _edge_ratio > 1.10 else 'Debit & Directional' if _edge_ratio < 0.90 else 'Selective Tactical'}</strong>
+                                            </div>
+                                        </div>
+                                        <div class="metric-sub" style="color:{MUTED}; font-weight:600; margin-top:8px;">
+                                            Implied vs Realized Volatility dispersion ratio
                                         </div>
                                     </div>
                                 </div>
                             </div>
 
-                            <!-- 3 Core Quantitative Metrics Grid -->
-                            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px;">
-                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid {ACCENT};">
-                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">CONSENSUS REALIZED VOL</div>
-                                    <div style="font-size:26px; font-weight:900; color:{WHITE}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_rv_cons:.2f}%</div>
-                                    <div class="metric-sub" style="color:{_rv_trend_col}; font-weight:700;">Trend: {_rv_trend}</div>
-                                </div>
-                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid {_vrp_badge_col};">
-                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">VOLATILITY RISK PREMIUM (VRP)</div>
-                                    <div style="font-size:26px; font-weight:900; color:{_vrp_badge_col}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_vrp_val:+.2f}%</div>
-                                    <div class="metric-sub" style="color:{_vrp_badge_col}; font-weight:700;">{_vrp_badge}</div>
-                                </div>
-                                <div class="metric-box" style="padding:14px; text-align:left; background:rgba(18,18,42,0.85); border-top:3px solid #ffd54f;">
-                                    <div class="metric-label" style="font-size:11px; color:{MUTED};">HISTORICAL VOLATILITY (20D)</div>
-                                    <div style="font-size:26px; font-weight:900; color:{WHITE}; margin:4px 0; font-family:'JetBrains Mono', monospace;">{_hv_20d:.2f}%</div>
-                                    <div class="metric-sub" style="color:#ffd54f; font-weight:700;">Rank: {_hv_pctile:.0f}th Percentile (1-Yr)</div>
-                                </div>
-                            </div>
-
-                            <!-- Actionable Trading Playbook (3 Clean Pillars) -->
-                            <div class="card" style="padding:14px; background:rgba(18,18,42,0.85);">
-                                <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">🎯 ACTIONABLE TRADING PLAYBOOK FOR THIS REGIME</div>
-                                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
-                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
-                                        <div style="font-size:11px; font-weight:800; color:{GREEN}; margin-bottom:4px;">1. RECOMMENDED STRATEGIES</div>
-                                        <div style="font-size:13px; font-weight:700; color:{WHITE}; line-height:1.4;">{_rec_trades}</div>
-                                        <div style="font-size:11px; color:{MUTED}; margin-top:4px;">Aligned with current VRP and regime dynamics.</div>
-                                    </div>
-                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
-                                        <div style="font-size:11px; font-weight:800; color:#ffd54f; margin-bottom:4px;">2. RISK & DEFENSE BOUNDARY</div>
-                                        <div style="font-size:12px; color:#e2e8f0; line-height:1.4;">{_rec_risk}</div>
-                                    </div>
-                                    <div style="background:rgba(255,255,255,0.03); border:1px solid #2a2a4a; border-radius:8px; padding:12px;">
-                                        <div style="font-size:11px; font-weight:800; color:#38bdf8; margin-bottom:4px;">3. TIMING & INTRADAY CONTEXT</div>
-                                        <div style="font-size:12px; color:#e2e8f0; line-height:1.4;">Intraday RV: <strong style="color:{WHITE};">{_rv_intra:.2f}%</strong>. {_vrp_sub}</div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Streamlined Volatility Horizon Strip -->
-                            <div class="card" style="padding:14px; background:rgba(18,18,42,0.85);">
+                            <!-- 3. Multi-Horizon Volatility Term Structure Cascade (Plot) -->
+                            <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                                    <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">📊 REALIZED VOLATILITY TERM STRUCTURE HORIZON</div>
-                                    <div style="font-size:11px; color:{MUTED};">Consensus Benchmark: <strong style="color:{ACCENT};">{_rv_cons:.2f}%</strong></div>
-                                </div>
-                                <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px;">
-                                    <div class="metric-box" style="padding:10px; text-align:center;">
-                                        <div class="metric-label" style="font-size:10px;">INTRADAY (1D)</div>
-                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_intra:.2f}%</div>
-                                        <div class="metric-sub">Session Realized</div>
+                                    <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
+                                        📊 MULTI-HORIZON VOLATILITY TERM STRUCTURE CASCADE (1D &rarr; 252D MACRO)
                                     </div>
-                                    <div class="metric-box" style="padding:10px; text-align:center;">
-                                        <div class="metric-label" style="font-size:10px;">SHORT-TERM (5D)</div>
-                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_5d:.2f}%</div>
-                                        <div class="metric-sub">Weekly Trend</div>
-                                    </div>
-                                    <div class="metric-box" style="padding:10px; text-align:center;">
-                                        <div class="metric-label" style="font-size:10px;">MEDIUM-TERM (20D)</div>
-                                        <div style="font-size:18px; font-weight:800; color:{ACCENT}; margin:2px 0;">{_rv_20d:.2f}%</div>
-                                        <div class="metric-sub">Monthly Base</div>
-                                    </div>
-                                    <div class="metric-box" style="padding:10px; text-align:center;">
-                                        <div class="metric-label" style="font-size:10px;">QUARTERLY (60D)</div>
-                                        <div style="font-size:18px; font-weight:800; color:{WHITE}; margin:2px 0;">{_rv_60d:.2f}%</div>
-                                        <div class="metric-sub">Quarterly Anchor</div>
+                                    <div style="font-size:11px; color:{MUTED};">
+                                        Term Slope (5D - 60D): <strong style="color:{'#ff3366' if (_rv_5d - _rv_60d) > 1 else '#00e676' if (_rv_5d - _rv_60d) < -1 else ACCENT}; font-family:var(--font-mono);">{_rv_5d - _rv_60d:+.2f}%</strong> ({'Inverted / Stress' if (_rv_5d - _rv_60d) > 1 else 'Normal Contango' if (_rv_5d - _rv_60d) < -1 else 'Flat Curve'}) · Consensus RV: <strong style="color:{WHITE}; font-family:var(--font-mono);">{_rv_cons:.2f}%</strong>
                                     </div>
                                 </div>
+                                {cascade_chart_html}
                             </div>
+                            <!-- 4. 1-Year Realized Volatility Cone & HV Statistics -->
+                            {vol_tab_html}
                         </div>
                         '''
                     else:
                         regime_tab_html = "<div style='padding:40px; color:#ff4444; text-align:center;'>Waiting for sufficient daily history data (requires 20+ trading days).</div>"
-
-                    # ── CONFLUENCE HEADER HTML ──
-                    vd = verdict_data
-                    v_color = GREEN if 'BULLISH' in vd['verdict'] else RED if 'BEARISH' in vd['verdict'] else YELLOW
-                    verdict_html = f'''
-                    <div style="display:flex; flex-direction:column; align-items:center; background:var(--bg-card); padding:5px 12px; border-radius:6px; border:1px solid {v_color};">
-                        <div style="font-size:9px; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:1px;">CONFLUENCE VERDICT</div>
-                        <div style="font-size:13px; font-weight:800; color:{v_color}; font-family:var(--font-mono);">{vd['verdict']}</div>
-                        <div style="font-size:10px; color:var(--text-secondary); margin-top:1px;">Confidence: {vd['confidence']:.0%} | Score: {vd['score']:.2f}</div>
-                    </div>
-                    '''
 
                     # Write fragment file that the running page will fetch
                     frag_path = html_path.replace('.html', '_fragment.html')
                     fragment_html = f'''
 <div id="frag-regime">{regime_tab_html}</div>
 <div id="frag-iv">{iv_tab_html}</div>
-<div id="frag-vol">{vol_tab_html}</div>
+<div id="frag-vol"></div>
 <div id="frag-chain">{chain_tab_html}</div>
 <div id="frag-theta">{theta_tab_html}</div>
 <div id="frag-prob">{prob_tab_html}</div>
 <div id="frag-mm">{mm_tab_html}</div>
-<div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}">
-    <span id="frag-verdict-transfer" style="display:none;">{verdict_html}</span>
-</div>'''
+<div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}"></div>'''
                     # Atomic write to prevent lock contention on Windows
                     frag_tmp = frag_path + '.tmp'
                     with open(frag_tmp, 'w', encoding='utf-8') as f:
@@ -5719,6 +6103,7 @@ class VolatilityAnalyzer:
     <link rel="stylesheet" href="/static/css/theme.css">
     <link rel="stylesheet" href="/static/css/layout.css">
     <link rel="stylesheet" href="/static/css/gamma_explosion.css">
+    <link rel="stylesheet" href="/static/css/iv_surface.css">
 </head>
 <body>
 
@@ -5731,8 +6116,6 @@ class VolatilityAnalyzer:
                 </svg>
                 <span>F-INTEL</span>
             </div>
-            <span class="brand-badge">PRO QUANT</span>
-            <div id="top-verdict-pill" style="display:inline-flex; margin-left:8px;">{verdict_html}</div>
         </div>
 
         <div class="market-strip">
@@ -5746,39 +6129,23 @@ class VolatilityAnalyzer:
                 </span>
                 <span id="time-display" class="num-mono" style="font-size:12px; color:var(--text-muted);">{now_str}</span>
             </div>
-
-            <div class="theme-toggle-wrap" title="Toggle Day / Night mode">
-                <span class="theme-toggle-icon" id="theme-icon">&#127769;</span>
-                <label class="theme-toggle">
-                    <input type="checkbox" id="theme-toggle-input">
-                    <span class="theme-slider"></span>
-                </label>
-                <span style="font-size:11px; color:var(--text-muted); font-weight:600;" id="theme-label">NIGHT</span>
-            </div>
         </div>
     </header>
 
     <!-- Tab Navigation -->
     <nav class="tab-navigation">
-        <button class="tab-btn active" data-tab="regime"><span>REGIME SYSTEM</span></button>
-        <button class="tab-btn" data-tab="iv"><span>IV SURFACE & SMILE</span></button>
-        <button class="tab-btn" data-tab="vol"><span>REALIZED VOL & VRP</span></button>
+        <button class="tab-btn active" data-tab="regime"><span>REGIME & VOLATILITY</span></button>
+        <button class="tab-btn" data-tab="iv"><span>IV SURFACE</span></button>
         <button class="tab-btn" data-tab="chain"><span>OPTION CHAIN & GREEKS</span></button>
         <button class="tab-btn" data-tab="theta"><span>GREEKS</span></button>
-        <button class="tab-btn mm-tab-btn" data-tab="mm">
-            <span style="display:inline-flex; align-items:center; gap:6px;">
-                <span style="color:var(--accent-cyan);">⚡</span>
-                <span style="font-weight:700;">GAMMA EXPLOSION & MM</span>
-                <span class="pulse-badge" style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:var(--accent-cyan); color:#060812; letter-spacing:0.5px;">NEW</span>
-            </span>
-        </button>
+        <button class="tab-btn mm-tab-btn" data-tab="mm"><span>GAMMA EXPLOSION & MM</span></button>
     </nav>
 
     <!-- Main Workspace Container -->
     <main class="workspace-container" id="dash-container">
         <section id="tab-regime" class="tab-content active">{regime_tab_html}</section>
         <section id="tab-iv" class="tab-content">{iv_tab_html}</section>
-        <section id="tab-vol" class="tab-content">{vol_tab_html}</section>
+        <section id="tab-vol" class="tab-content" style="display:none;"></section>
         <section id="tab-chain" class="tab-content">{chain_tab_html}</section>
         <section id="tab-theta" class="tab-content">{theta_tab_html}</section>
         <section id="tab-mm" class="tab-content">{mm_tab_html}</section>
@@ -5790,6 +6157,8 @@ class VolatilityAnalyzer:
     <script src="/static/js/gamma_explosion_terminal.js"></script>
     <script src="/static/js/advanced_vol_terminal.js"></script>
     <script src="/static/js/gex_rebalance_radar.js"></script>
+    <script src="/static/js/oi_velocity_radar.js"></script>
+    <script src="/static/js/iv_surface_terminal.js"></script>
     <script src="/static/js/dashboard_core.js"></script>
 </body>
 </html>'''
@@ -5820,12 +6189,12 @@ class VolatilityAnalyzer:
                         frag_dest = os.path.join(dashboard_dir, 'unified_dashboard_fragment.html')
                         frag_tmp = frag_dest + '.tmp'
                         with open(frag_tmp, 'w', encoding='utf-8') as f:
-                            f.write(regime_tab_html)
+                            f.write(fragment_html)
                         try:
                             os.replace(frag_tmp, frag_dest)
                         except Exception:
                             with open(frag_dest, 'w', encoding='utf-8') as f:
-                                f.write(regime_tab_html)
+                                f.write(fragment_html)
                     except Exception:
                         pass
 
@@ -5843,10 +6212,12 @@ class VolatilityAnalyzer:
                         print(f"  Dashboard opened: {_dashboard_url}")
 
                     print(f"  [{now_str}] Updated | {pred['direction']} ({pred['confidence']:.0%}) | Spot:{spot:.0f}")
-                    import gc; gc.collect()  # free Plotly figure memory
+                    _gc_tick = locals().get('_gc_tick', 0) + 1
+                    if _gc_tick % 10 == 0:
+                        import gc; gc.collect()  # free Plotly figure memory
                     if single_run:
                         break
-                    time.sleep(15)
+                    time.sleep(1)
 
                 except Exception as e:
                     import traceback

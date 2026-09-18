@@ -16,7 +16,7 @@ import sys
 import os
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -70,24 +70,24 @@ class GammaExplosionEngine:
             return []
 
         # Positive GEX strikes where dealers are Long Gamma (stabilizing mean-reverting pin)
-        pos_strikes = profile[profile > 0].sort_values(ascending=False)
+        pos_strikes = pd.Series(profile[profile > 0]).sort_values(ascending=False)
         total_pos_gex = max(pos_strikes.sum(), 1.0)
 
         # Select candidate: dominant positive strike closest to spot (within 300 pts) or highest overall
         dominant_candidate = None
         for strike, raw_val in pos_strikes.items():
-            strike = float(strike)
-            dist = abs(spot_price - strike)
+            strike_f = float(cast(Any, strike))
+            dist = abs(spot_price - strike_f)
             gex_cr = raw_val / 1e7
             share_pct = (raw_val / total_pos_gex) * 100
             if dist <= 160:  # Immediate active pin near spot
-                dominant_candidate = (strike, gex_cr, share_pct)
+                dominant_candidate = (strike_f, gex_cr, share_pct)
                 break
             elif dominant_candidate is None and dist <= 350:
-                dominant_candidate = (strike, gex_cr, share_pct)
+                dominant_candidate = (strike_f, gex_cr, share_pct)
 
         if not dominant_candidate and not pos_strikes.empty:
-            top_s = float(pos_strikes.index[0])
+            top_s = float(cast(Any, pos_strikes.index[0]))
             dominant_candidate = (top_s, pos_strikes.iloc[0] / 1e7, (pos_strikes.iloc[0] / total_pos_gex) * 100)
 
         if not dominant_candidate:
@@ -149,8 +149,8 @@ class GammaExplosionEngine:
             status_desc = f"Active magnetic lock. Price pinned within {pin_strike - self.CORRIDOR_PTS:.0f} - {pin_strike + self.CORRIDOR_PTS:.0f}."
 
         # Cascade Target if unpinned (next major strike below or above)
-        put_wall = float(profile.idxmin())
-        cascade_next_strike = put_wall if dist_pts <= 0 else float(profile.idxmax())
+        put_wall = float(cast(Any, profile.idxmin()))
+        cascade_next_strike = put_wall if dist_pts <= 0 else float(cast(Any, profile.idxmax()))
 
         return [{
             'strike': pin_strike,
@@ -208,8 +208,8 @@ class GammaExplosionEngine:
 
         now_dt_str = datetime.fromtimestamp(now_ts or time.time()).strftime("%H:%M:%S")
 
-        call_wall = float(profile.idxmax())
-        put_wall  = float(profile.idxmin())
+        call_wall = float(cast(Any, profile.idxmax()))
+        put_wall  = float(cast(Any, profile.idxmin()))
         call_wall_gex_cr = round(profile[call_wall] / 1e7, 1)
         put_wall_gex_cr  = round(profile[put_wall] / 1e7, 1)
 
@@ -357,11 +357,14 @@ class GammaExplosionEngine:
         """
         if profile is None:
             gex_res = self.gex_engine.calculate_gex(chain_df, spot_price)
-            profile = gex_res.get('profile', pd.Series()).sort_index()
+            p = gex_res.get('profile')
+            profile = p.sort_index() if isinstance(p, pd.Series) else pd.Series(dtype=float)
+        elif not isinstance(profile, pd.Series):
+            profile = pd.Series(dtype=float)
 
         top_abs = confirmed_event or top_absorption
-        call_wall = float(profile.idxmax()) if not profile.empty else spot_price + 200.0
-        put_wall  = float(profile.idxmin()) if not profile.empty else spot_price - 200.0
+        call_wall = float(cast(Any, profile.idxmax())) if not profile.empty else spot_price + 200.0
+        put_wall  = float(cast(Any, profile.idxmin())) if not profile.empty else spot_price - 200.0
 
         direction = "BULLISH"
         anchor_barrier = put_wall
@@ -420,7 +423,7 @@ class GammaExplosionEngine:
             'risk_reward_ratio': float(rr_ratio),
             'hedge_acceleration': {
                 'shares_to_hedge_25pts': int(abs(req_shares)),
-                'lots_to_hedge_25pts': int(req_lots),
+                'lots_to_hedge_25pts': req_lots,
                 'flow_action': 'BUYING_PRESSURE' if direction == 'BULLISH' else 'SELLING_PRESSURE'
             }
         }

@@ -5,7 +5,7 @@
 
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
-/* ── DARK THEME (Default / Night Mode) ── */
+/* ── DARK THEME (IV Surface Terminal Style) ── */
 :root,
 [data-theme="dark"] {
     /* Surfaces */
@@ -18,20 +18,21 @@
     /* Borders */
     --border-subtle:  #2a2e39;
     --border-card:    #363c4e;
-    --border-focus:   #2962ff;
+    --border-focus:   #00e5ff;
 
-    /* Accent */
-    --accent:         #2962ff;
-    --accent-dim:     rgba(41, 98, 255, 0.12);
-    --accent-light:   #4c7fff;
+    /* Accent (Electric Cyan from IV Surface Terminal) */
+    --accent:         #00e5ff;
+    --accent-dim:     rgba(0, 229, 255, 0.12);
+    --accent-light:   #33ebff;
+    --accent-cyan:    #00e5ff;
 
     /* Financial semantic */
-    --color-bullish:      #26a69a;
-    --color-bullish-dim:  rgba(38, 166, 154, 0.12);
-    --color-bearish:      #ef5350;
-    --color-bearish-dim:  rgba(239, 83, 80, 0.12);
-    --color-warning:      #ff9800;
-    --color-warning-dim:  rgba(255, 152, 0, 0.12);
+    --color-bullish:      #00e676;
+    --color-bullish-dim:  rgba(0, 230, 118, 0.12);
+    --color-bearish:      #ff3366;
+    --color-bearish-dim:  rgba(255, 51, 102, 0.12);
+    --color-warning:      #ffd54f;
+    --color-warning-dim:  rgba(255, 213, 79, 0.12);
     --color-neutral:      #78909c;
 
     /* Text */
@@ -44,14 +45,14 @@
     --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'JetBrains Mono', 'Consolas', monospace;
 
-    /* Shadows — flat, no glow */
+    /* Shadows — sleek terminal elevation */
     --shadow-card:   0 1px 4px rgba(0, 0, 0, 0.35);
     --shadow-soft:   0 2px 8px rgba(0, 0, 0, 0.25);
 
     /* Border radius */
     --radius-sm: 4px;
     --radius-md: 6px;
-    --radius-lg: 8px;
+    --radius-lg: 6px;
 
     /* Transitions */
     --transition-fast:   120ms ease;
@@ -184,3 +185,21 @@ body {
 .warn  { color: var(--color-warning) !important; }
 .muted { color: var(--text-muted)   !important; }
 .accent-text { color: var(--accent) !important; }
+
+/* ── Real-Time Broker Tick Flash Micro-Animations ── */
+.flash-up {
+    animation: tickFlashGreen 350ms ease forwards;
+}
+.flash-down {
+    animation: tickFlashRed 350ms ease forwards;
+}
+
+@keyframes tickFlashGreen {
+    0%   { background-color: rgba(38, 166, 154, 0.45); color: #00ffc4; }
+    100% { background-color: transparent; }
+}
+
+@keyframes tickFlashRed {
+    0%   { background-color: rgba(239, 83, 80, 0.45); color: #ff5252; }
+    100% { background-color: transparent; }
+}

@@ -331,6 +331,10 @@ class RealizedVolEngine:
             if cur_rv_5 / cur_rv_20 > 1.3: rv_trend = "ACCELERATING"
             elif cur_rv_5 / cur_rv_20 < 0.7: rv_trend = "DECELERATING"
 
+        # Fallback for off-market hours or missing live IV
+        if atm_iv <= 0:
+            atm_iv = cur_hv if cur_hv > 0 else (consensus_rv if consensus_rv > 0 else 12.0)
+
         vrp_iv_hv = atm_iv - cur_hv
         vrp_iv_rv = atm_iv - consensus_rv
         rv_term_slope = cur_rv_5 - cur_rv_60 # short term vs long term spread
@@ -363,6 +367,65 @@ class RealizedVolEngine:
             except Exception as e:
                 strangle_sizing = {}
 
+        # 1-Year (252D) Macro Volatility Cone
+        hv_1y_min = float(hv_series.min()) if len(hv_series) > 0 else cur_hv
+        hv_1y_max = float(hv_series.max()) if len(hv_series) > 0 else cur_hv
+        hv_1y_median = float(hv_series.median()) if len(hv_series) > 0 else cur_hv
+        if hv_pctile < 20:
+            macro_stage = "COMPRESSION (Historical Lows)"
+        elif hv_pctile > 80:
+            macro_stage = "EXPANSION (Historical Highs)"
+        elif hv_pctile > 50:
+            macro_stage = "UPPER-NEUTRAL"
+        else:
+            macro_stage = "LOWER-NEUTRAL"
+
+        # Term Structure Curve
+        if cur_rv_5 <= cur_rv_20 and cur_rv_20 <= cur_rv_60 and atm_iv >= consensus_rv:
+            curve_badge = "CONTANGO (Theta Favorable)"
+            curve_color = "#00e676"
+        elif cur_rv_5 > cur_rv_20 or atm_iv < consensus_rv:
+            curve_badge = "BACKWARDATION (Event Risk)"
+            curve_color = "#ff3366"
+        else:
+            curve_badge = "FLAT / TRANSITIONAL"
+            curve_color = "#ffd54f"
+
+        # Price-Grounded VRP & Expected Moves (Nifty Index Points & INR)
+        sqrt_252 = np.sqrt(252.0)
+        daily_iv_pts = spot * (atm_iv / 100.0) / sqrt_252 if spot > 0 else 0.0
+        daily_rv_pts = spot * (consensus_rv / 100.0) / sqrt_252 if spot > 0 else 0.0
+        daily_vrp_pts = daily_iv_pts - daily_rv_pts
+
+        # Lot size configuration (NIFTY 50 default = 65)
+        lot_size = int(_cfg.get("nifty_lot_size", 65)) if _cfg else 65
+
+        # Daily Expected Move INR per lot
+        daily_iv_inr = daily_iv_pts * float(lot_size)
+        daily_rv_inr = daily_rv_pts * float(lot_size)
+        daily_vrp_inr = daily_vrp_pts * float(lot_size)
+
+        # Weekly Expiry ATM Straddle Price & Mispricing (5 DTE standard benchmark)
+        dte_weekly = 5.0
+        sqrt_t_weekly = np.sqrt(dte_weekly / 365.0)
+        # Brenner-Subrahmanyam approximation for ATM straddle: Price ≈ 0.8 * S * sigma * sqrt(T)
+        straddle_iv_pts = 0.8 * spot * (atm_iv / 100.0) * sqrt_t_weekly if spot > 0 else 0.0
+        straddle_rv_pts = 0.8 * spot * (consensus_rv / 100.0) * sqrt_t_weekly if spot > 0 else 0.0
+        straddle_vrp_pts = straddle_iv_pts - straddle_rv_pts
+        straddle_iv_inr = straddle_iv_pts * float(lot_size)
+        straddle_rv_inr = straddle_rv_pts * float(lot_size)
+        straddle_vrp_inr = straddle_vrp_pts * float(lot_size)
+        straddle_edge_pct = ((straddle_iv_pts - straddle_rv_pts) / straddle_rv_pts * 100.0) if straddle_rv_pts > 0 else 0.0
+
+        sellers_edge_ratio = (atm_iv / consensus_rv) if consensus_rv > 0 else 1.0
+
+        # Point equivalent for each horizon
+        pts_1d = daily_rv_pts if intra_rv <= 0 else spot * (intra_rv / 100.0) / sqrt_252
+        pts_5d = spot * (cur_rv_5 / 100.0) / sqrt_252 if spot > 0 else 0.0
+        pts_20d = spot * (cur_rv_20 / 100.0) / sqrt_252 if spot > 0 else 0.0
+        pts_60d = spot * (cur_rv_60 / 100.0) / sqrt_252 if spot > 0 else 0.0
+        pts_1y = spot * (cur_hv / 100.0) / sqrt_252 if spot > 0 else 0.0
+
         return {
             'spot': spot,
             'atm_iv': atm_iv,
@@ -374,6 +437,39 @@ class RealizedVolEngine:
             },
             'hv': {'20d': cur_hv, 'percentile': hv_pctile, 'mean': hv_mean},
             'vrp': {'iv_hv': vrp_iv_hv, 'iv_rv': vrp_iv_rv},
+            'macro': {
+                'hv_min': hv_1y_min,
+                'hv_max': hv_1y_max,
+                'hv_median': hv_1y_median,
+                'hv_pctile': hv_pctile,
+                'stage': macro_stage,
+                'curve_badge': curve_badge,
+                'curve_color': curve_color
+            },
+            'price_vrp': {
+                'daily_iv_pts': daily_iv_pts,
+                'daily_rv_pts': daily_rv_pts,
+                'daily_vrp_pts': daily_vrp_pts,
+                'daily_iv_inr': daily_iv_inr,
+                'daily_rv_inr': daily_rv_inr,
+                'daily_vrp_inr': daily_vrp_inr,
+                'straddle_iv_pts': straddle_iv_pts,
+                'straddle_rv_pts': straddle_rv_pts,
+                'straddle_vrp_pts': straddle_vrp_pts,
+                'straddle_iv_inr': straddle_iv_inr,
+                'straddle_rv_inr': straddle_rv_inr,
+                'straddle_vrp_inr': straddle_vrp_inr,
+                'straddle_edge_pct': straddle_edge_pct,
+                'sellers_edge_ratio': sellers_edge_ratio,
+                'lot_size': lot_size
+            },
+            'horizon_points': {
+                '1d': pts_1d,
+                '5d': pts_5d,
+                '20d': pts_20d,
+                '60d': pts_60d,
+                '1y': pts_1y
+            },
             'regime': regime,
             'econometric': econometric,
             'strangle_sizing': strangle_sizing

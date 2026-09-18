@@ -230,6 +230,7 @@ class TestMergedOptionChain:
 
         res = va._compute_seller_data(df_chain, spot=spot, T=7/365, DTE=7, near_exp="2026-09-25")
 
+        assert res is not None
         assert 'chain_rows' in res
         assert len(res['chain_rows']) > 0
 

@@ -165,6 +165,84 @@ class TestGexRebalanceEngine(unittest.TestCase):
         self.assertGreater(res['dealer_fuel_lots'], 0)
         self.assertIsNotNone(res['primary_option'])
 
+    def test_chop_filter_stands_aside(self):
+        """Validates that CHOPPY market swing quality suppresses trade ideas to protect capital."""
+        intraday_data = {
+            'swing_quality': {'quality': 'CHOPPY', 'adr_pct': 22.0, 'session_phase': 'MID_TREND'},
+            'absorption': {'setup_quality': 'NONE'}
+        }
+        res = self.engine.evaluate(self.df_chain, self.spot, intraday_signal_data=intraday_data)
+        self.assertTrue(res['ok'])
+        self.assertFalse(res['trade_ready'])
+        self.assertEqual(res['status'], "STAND_ASIDE")
+        self.assertIn("STAND ASIDE", res['action_summary'])
+        self.assertTrue(any("Chop" in r for r in res['rejection_reasons']))
+
+    def test_opposing_writer_trap_veto(self):
+        """Validates that when opposing writers are actively fortifying (+40k/m addition), buy trades are vetoed."""
+        vel_data = {
+            'vel_by_strike': {(24750.0, 'CE'): +45_000}  # Call writers adding contracts
+        }
+        res = self.engine.evaluate(self.df_chain, 24753.0, oi_velocity_data=vel_data, dte=1.0)
+        self.assertFalse(res['trade_ready'])
+        self.assertEqual(res['status'], "STAND_ASIDE")
+        self.assertIn("defend", res['action_summary'].lower())
+
+    def test_tier_1_roi_guarantee(self):
+        """Validates that Tier 1 momentum setups deliver at least 20% ROI on Target 1 with tight SL."""
+        vel_data = {
+            'vel_by_strike': {(24750.0, 'CE'): -95_000}
+        }
+        intraday_data = {
+            'swing_quality': {'quality': 'TRENDING', 'adr_pct': 68.0, 'session_phase': 'MID_TREND'},
+            'absorption': {'setup_quality': 'STRONG', 'wick_bars': 3, 'vol_accel': 1.8}
+        }
+        gex_res = {'net_gex': -2.5e10, 'zero_gamma_level': 24700.0}
+        res = self.engine.evaluate(
+            self.df_chain, 24755.0,
+            oi_velocity_data=vel_data,
+            dte=2.0,
+            gex_res=gex_res,
+            intraday_signal_data=intraday_data
+        )
+        self.assertTrue(res['trade_ready'])
+        self.assertGreaterEqual(res['confluence_score'], 65.0)
+        primary = res['primary_option']
+        self.assertGreaterEqual(primary['target_gain_pct'], 20.0, "Target 1 ROI must be >= 20%")
+        self.assertGreaterEqual(primary['runner_gain_pct'], 35.0, "Runner Target ROI must be >= 35%")
+        self.assertLessEqual(abs(primary['stop_loss_pct']), 16.0, "Stop loss must be tight (<= 16%)")
+        self.assertGreaterEqual(primary['rr_ratio'], 1.3, "R:R ratio must be >= 1.3")
+
+    def test_tier_3_0dte_expiry_mega_move(self):
+        """Validates that 0DTE/1DTE expiry with high confluence activates Tier 3 Expiry Mega Move (100%+ ROI)."""
+        vel_data = {
+            'vel_by_strike': {(24750.0, 'CE'): -120_000}
+        }
+        intraday_data = {
+            'swing_quality': {'quality': 'TRENDING', 'adr_pct': 85.0, 'session_phase': 'EXPIRY_HEAT'},
+            'absorption': {'setup_quality': 'STRONG', 'wick_bars': 4, 'vol_accel': 2.4}
+        }
+        gamma_exp_data = {
+            'active_pins': [{'strike': 24750.0, 'duration_secs': 7200, 'unpinning_risk': 'IMMINENT'}]
+        }
+        gex_res = {'net_gex': -5e10, 'zero_gamma_level': 24720.0}
+        res = self.engine.evaluate(
+            self.df_chain, 24754.0,
+            oi_velocity_data=vel_data,
+            dte=0.5,  # 0DTE
+            gex_res=gex_res,
+            intraday_signal_data=intraday_data,
+            gamma_explosion_data=gamma_exp_data
+        )
+        self.assertTrue(res['trade_ready'])
+        self.assertEqual(res['active_tier'], "TIER_3_EXPIRY_MEGA_MOVE")
+        self.assertIn("0DTE EXPIRY MEGA MOVE", res['tier_name'])
+        otm_rocket = res['otm_gamma_rocket']
+        self.assertTrue(otm_rocket['is_active'])
+        self.assertGreaterEqual(otm_rocket['target_gain_pct'], 100.0, "0DTE Rocket Target 1 must be >= 100% (2x)")
+        self.assertGreaterEqual(otm_rocket['runner_gain_pct'], 200.0, "0DTE Rocket Runner must be >= 200%")
+
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -34,13 +34,16 @@ try:
     dte_val = hub_cache.get_T() * 365.0
     print(f"dte_val: {dte_val}")
     
-    gr_payload = _gex_rebalance_engine.evaluate(
-        df, spot,
-        oi_velocity_data=None,
-        dte=dte_val
-    )
-    print("GexRebalanceEngine payload:")
-    print(json.dumps(gr_payload, indent=2, default=str))
+    if _gex_rebalance_engine is not None:
+        gr_payload = _gex_rebalance_engine.evaluate(
+            df, spot,
+            oi_velocity_data=None,
+            dte=dte_val
+        )
+        print("GexRebalanceEngine payload:")
+        print(json.dumps(gr_payload, indent=2, default=str))
+    else:
+        print("GexRebalanceEngine is not initialized")
 
 except Exception as e:
     print(f"ERROR: {e}")

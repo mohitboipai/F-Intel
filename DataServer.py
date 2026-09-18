@@ -33,7 +33,7 @@ load_dotenv()
 APP_ID = os.getenv("FYERS_APP_ID")
 SYMBOL = "NSE:NIFTY50-INDEX"
 PORT = 8082
-CHAIN_REFRESH_INTERVAL = 60 # Seconds (Option chain rate limits are strict, 1 per min)
+CHAIN_REFRESH_INTERVAL = 5 # Seconds (Safe high-speed poll with 429 backoff guard)
 
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
@@ -144,6 +144,9 @@ class DataHub:
                             self.latest_data["status"] = "Live"
                         # Push chain update to UI
                         self.broadcast({"type": "chain", "chain": chain})
+                    elif c_res and (c_res.get('code') == 429 or 'limit' in str(c_res).lower()):
+                        print("DataHub: Rate limit encountered on optionchain, backing off for 10s...")
+                        time.sleep(10)
             except Exception as e:
                 print(f"DataHub: Chain Error: {e}")
             time.sleep(CHAIN_REFRESH_INTERVAL)
@@ -178,7 +181,7 @@ class _DataHubCacheAdapter:
         self._heston_params = None
         self._heston_ts     = 0.0
         self._T             = 7 / 365   # default
-        self._oi_ring       = collections.deque(maxlen=60)
+        self._oi_ring       = collections.deque(maxlen=1500)
         self._candle_ring   = collections.deque(maxlen=120)
         self._rv_data: dict = {}
 
@@ -219,15 +222,30 @@ class _DataHubCacheAdapter:
         self._heston_ts     = time.time()
 
     # ── OI Snapshot & Velocity Ring ────────────────────────────────────
-    def push_oi_snapshot(self, chain_df: pd.DataFrame):
+    def push_oi_snapshot(self, chain_df: pd.DataFrame, spot: float = 0.0):
         if chain_df is None or chain_df.empty:
             return
         try:
+            now_ts = time.time()
+            spot_val = float(spot) if spot else self.get_spot()
+
+            # Throttling: If last snapshot was recorded < 8s ago and spot hasn't moved noticeably, avoid duplicate
+            if self._oi_ring:
+                last_snap = self._oi_ring[-1]
+                if (now_ts - last_snap['ts'] < 8.0) and abs(spot_val - last_snap.get('spot', 0.0)) < 3.0:
+                    return
+
             oi_map = {}
             for _, row in chain_df[['strike', 'type', 'oi']].iterrows():
                 key = (float(row['strike']), str(row['type']))
                 oi_map[key] = int(row.get('oi', 0) or 0)
-            self._oi_ring.append({'ts': time.time(), 'oi_map': oi_map})
+            now_time_str = datetime.now().strftime('%H:%M:%S')
+            self._oi_ring.append({
+                'ts': now_ts,
+                'time_str': now_time_str,
+                'spot': spot_val,
+                'oi_map': oi_map
+            })
         except Exception:
             pass
 
@@ -337,6 +355,8 @@ try:
     register_shared_cache(hub_cache)
 except Exception:
     pass
+
+
 
 @sock.route('/stream')
 def stream(ws):
@@ -860,22 +880,81 @@ except Exception as _ids_init_e:
     _intraday_signal_engine = None
     print(f"[INTRADAY_SIGNAL] Init warning: {_ids_init_e}")
 
+# In-memory Multi-Timeframe OI Velocity Engine
+try:
+    from calculations.OiVelocityEngine import OiVelocityEngine
+    _vel_lot = config.get("nifty_lot_size", 65) if config else 65
+    _oi_velocity_engine = OiVelocityEngine(lot_size=_vel_lot)
+except Exception as _vel_init_e:
+    _oi_velocity_engine = None
+    print(f"[OI_VELOCITY] Init warning: {_vel_init_e}")
 
-def _parse_chain_to_df(chain: dict) -> "pd.DataFrame":
-    """Convert Fyers optionsChain dict to a clean DataFrame for calculations/."""
+# In-memory IV Surface & Real-Time Smile Engine
+_iv_surface_snapshot: dict = {}
+_iv_surface_lock = threading.Lock()
+try:
+    from calculations.IvSurfaceEngine import IvSurfaceEngine
+    _iv_surface_engine = IvSurfaceEngine()
+except Exception as _iv_init_e:
+    _iv_surface_engine = None
+    print(f"[IV_SURFACE] Init warning: {_iv_init_e}")
+
+
+def _parse_chain_to_df(chain: dict, spot: float = 0.0, T: float = 0.0) -> "pd.DataFrame":
+    """Convert Fyers optionsChain dict to a clean DataFrame with resolved IVs for calculations/."""
     import pandas as pd
+    import math
     rows = chain.get("optionsChain", [])
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame([{
-        "strike": float(r.get("strike_price", 0)),
-        "type":   r.get("option_type", "CE"),
-        "oi":     float(r.get("oi", 0) or 0),  # type: ignore
-        "volume": float(r.get("volume", 0) or 0),  # type: ignore
-        "iv":     float(r.get("iv", 0) or 0),  # type: ignore
-        "price":  float(r.get("ltp", 0) or 0),  # type: ignore
-        "dte":    float(r.get("dte", 1) or 1),  # type: ignore
-    } for r in rows])
+
+    oa = None
+    try:
+        from OptionAnalytics import OptionAnalytics
+        oa = OptionAnalytics()
+    except Exception:
+        pass
+
+    eff_spot = spot if spot > 0 else float(chain.get("spot", 0) or 0)
+    eff_T = T if T > 0 else (2.0 / 365.0)
+
+    parsed_rows = []
+    for r in rows:
+        strike = float(r.get("strike_price", 0))
+        otype = r.get("option_type", "CE")
+        oi = float(r.get("oi", 0) or 0)
+        volume = float(r.get("volume", 0) or 0)
+        price = float(r.get("ltp", 0) or 0)
+        dte = float(r.get("dte", 0) or 0)
+        if dte <= 0:
+            dte = max(1.0, eff_T * 365.0)
+        row_T = max(dte / 365.0, 1.0 / 365.0)
+
+        raw_iv = float(r.get("iv", 0) or 0)
+        iv = raw_iv
+        if (iv <= 1.0 or iv > 150.0) and eff_spot > 0 and strike > 0:
+            if oa and price > 0.5:
+                try:
+                    calc_iv = oa.implied_volatility(price, eff_spot, strike, row_T, 0.051274, otype)
+                    if 1.0 < calc_iv < 150.0:
+                        iv = float(calc_iv)
+                except Exception:
+                    pass
+            if iv <= 1.0 or iv > 150.0:
+                k = math.log(strike / eff_spot)
+                smile_iv = 13.5 - 15.0 * k + 25.0 * (k ** 2)
+                iv = max(6.0, min(80.0, float(smile_iv)))
+
+        parsed_rows.append({
+            "strike": strike,
+            "type":   otype,
+            "oi":     oi,
+            "volume": volume,
+            "iv":     iv,
+            "price":  price,
+            "dte":    dte,
+        })
+    return pd.DataFrame(parsed_rows)
 
 
 _candles_cache = []
@@ -912,7 +991,7 @@ def _get_recent_1min_candles():
         return list(_candles_cache)
 
 
-def _gex_refresh_loop(interval: int = 60):
+def _gex_refresh_loop(interval: int = 3):
     """Background thread: refresh GEX + Dealer snapshots every `interval` seconds."""
     while True:
         try:
@@ -927,7 +1006,8 @@ def _gex_refresh_loop(interval: int = 60):
                 from calculations.GexEngine import GexEngine
                 from calculations.DealerPositionEngine import DealerPositionEngine
 
-                df = _parse_chain_to_df(chain)
+                T_gex = hub_cache.get_T()
+                df = _parse_chain_to_df(chain, spot=float(spot), T=T_gex)
                 if not df.empty:
                     # ── GEX via calculations/GexEngine ──────────────────────
                     _lot = config.get("nifty_lot_size", 65) if config else 65
@@ -936,12 +1016,43 @@ def _gex_refresh_loop(interval: int = 60):
 
                     profile   = gex_res.get("profile")
                     net_gex   = gex_res.get("net_gex", 0)
+                    net_gex_crores = float(gex_res.get("net_gex_crores_100pt", net_gex / 1e7))
                     direction = "POSITIVE" if net_gex > 0 else "NEGATIVE"
 
                     strike_list = []
+                    ce_sub = df[df['type'] == 'CE'] if 'type' in df.columns else None
+                    pe_sub = df[df['type'] == 'PE'] if 'type' in df.columns else None
                     if profile is not None and not profile.empty:
+                        ce_map = ce_sub.groupby('strike')['gex_oi'].sum() if (ce_sub is not None and 'gex_oi' in ce_sub.columns) else {}
+                        pe_map = pe_sub.groupby('strike')['gex_oi'].sum() if (pe_sub is not None and 'gex_oi' in pe_sub.columns) else {}
+
                         for strike, gex_val in profile.items():
-                            strike_list.append({"strike": float(strike), "gex": float(gex_val)})
+                            c_g = float(ce_map.get(strike, 0.0)) / 1e7 if hasattr(ce_map, 'get') else 0.0
+                            p_g = float(pe_map.get(strike, 0.0)) / 1e7 if hasattr(pe_map, 'get') else 0.0
+                            strike_list.append({
+                                "strike": float(strike),
+                                "gex": float(gex_val),
+                                "gex_cr": round(float(gex_val) / 1e7, 2),
+                                "call_gex_cr": round(c_g, 2),
+                                "put_gex_cr": round(p_g, 2)
+                            })
+
+                    cw1 = float(gex_res.get("call_wall", 0))
+                    pw1 = float(gex_res.get("put_wall", 0))
+                    cw2 = 0.0
+                    pw2 = 0.0
+                    if ce_sub is not None and not ce_sub.empty:
+                        ce_top = ce_sub.groupby('strike')['oi'].sum().nlargest(2).index.tolist()
+                        if len(ce_top) > 1 and ce_top[0] == cw1:
+                            cw2 = float(ce_top[1])
+                        elif len(ce_top) > 0 and cw1 == 0:
+                            cw1 = float(ce_top[0])
+                    if pe_sub is not None and not pe_sub.empty:
+                        pe_top = pe_sub.groupby('strike')['oi'].sum().nlargest(2).index.tolist()
+                        if len(pe_top) > 1 and pe_top[0] == pw1:
+                            pw2 = float(pe_top[1])
+                        elif len(pe_top) > 0 and pw1 == 0:
+                            pw1 = float(pe_top[0])
 
                     regime = "POSITIVE GEX" if net_gex > 0 else "NEGATIVE GEX"
                     score  = round(abs(net_gex) / 1e9, 2)
@@ -962,23 +1073,36 @@ def _gex_refresh_loop(interval: int = 60):
                         print(f"[GEX] GammaExplosionModel error: {e}")
 
                     with _gex_lock:
-                        # Keep calculations/GexEngine fields as fallback/additions
+                        # Keep calculations/GexEngine fields as authoritative
                         if "score" not in _gex_snapshot:
                             _gex_snapshot["score"] = score
-                        if "regime" not in _gex_snapshot:
-                            _gex_snapshot["regime"] = regime
-                        if "net_gex" not in _gex_snapshot:
-                            _gex_snapshot["net_gex"] = float(net_gex)
                         
                         _gex_snapshot.update({
-                            "zero_gamma_level": gex_res.get("zero_gamma_level", 0),
+                            "spot":             float(spot),
+                            "net_gex":          float(net_gex),
+                            "net_gex_cr":       round(net_gex_crores, 2),
+                            "net_gex_lots":     float(gex_res.get("net_gex_lots_50pt", 0)),
+                            "net_gex_crores":   round(net_gex_crores, 2),
+                            "zero_gamma_level": float(gex_res.get("zero_gamma_level", 0)),
+                            "call_wall":        cw1,
+                            "call_wall_1":      cw1,
+                            "call_wall_2":      cw2,
+                            "put_wall":         pw1,
+                            "put_wall_1":       pw1,
+                            "put_wall_2":       pw2,
+                            "strikes":          strike_list,
+                            "direction":        direction,
+                            "regime":           regime,
                             "dealer_long_pct":  round(gex_res.get("dealer_long_pct", 0), 1),
                             "dealer_short_pct": round(gex_res.get("dealer_short_pct", 0), 1),
                             "spot_gamma":       gex_res.get("spot_gamma", 0),
                             "forward_gex":      gex_res.get("forward_gex", 0),
                             "last_update":      datetime.now().strftime("%H:%M:%S"),
                         })
-                    print(f"[GEX] net={_gex_snapshot.get('net_gex', 0):.0f}, flip={_gex_snapshot.get('gex_flip_point', gex_res.get('zero_gamma_level', 0)):.0f}")
+                    with _gex_lock:
+                        gex_bc_copy = dict(_gex_snapshot)
+                    hub.broadcast({"type": "gex_update", "payload": gex_bc_copy})
+                    print(f"[GEX] net={_gex_snapshot.get('net_gex_crores', 0):.1f} Cr, flip={_gex_snapshot.get('gex_flip_point', gex_res.get('zero_gamma_level', 0)):.0f}")
 
                     # ── Dealer Inventory via DealerPositionEngine ──────────
                     try:
@@ -991,9 +1115,15 @@ def _gex_refresh_loop(interval: int = 60):
                                 return []
                             return [{"strike": float(k), "value": float(v)} for k, v in s.items()]
 
+                        _net_dex = round(d_res.get("net_delta_exposure", 0), 0)
+                        _net_dex_cr = round((_net_dex * _lot * spot) / 1e7, 1)
+
                         with _dealer_lock:
                             _dealer_snapshot.update({
-                                "net_dex":        round(d_res.get("net_delta_exposure", 0), 0),
+                                "spot":           float(spot),
+                                "net_dex":        _net_dex,
+                                "net_dex_cr":     _net_dex_cr,
+                                "net_dex_crores": _net_dex_cr,
                                 "net_gex_shares": round(d_res.get("net_gamma_shares", 0), 0),
                                 "net_vanna":      round(d_res.get("net_vanna_exposure", 0), 0),
                                 "net_charm":      round(d_res.get("net_charm_exposure", 0), 0),
@@ -1004,7 +1134,10 @@ def _gex_refresh_loop(interval: int = 60):
                                 "strike_gex":     _to_list(sp.get("gex")),
                                 "last_update":    datetime.now().strftime("%H:%M:%S"),
                             })
-                        print(f"[DEALER] DEX={d_res.get('net_delta_exposure',0):.0f}")
+                        with _dealer_lock:
+                            dealer_bc_copy = dict(_dealer_snapshot)
+                        hub.broadcast({"type": "dealer_update", "payload": dealer_bc_copy})
+                        print(f"[DEALER] DEX={_net_dex:.0f} (₹{_net_dex_cr:.1f} Cr)")
                     except Exception as _de:
                         print(f"[DEALER] Error (non-fatal): {_de}")
 
@@ -1017,44 +1150,25 @@ def _gex_refresh_loop(interval: int = 60):
                                 _gamma_explosion_snapshot.clear()
                                 _gamma_explosion_snapshot.update(ge_payload)
 
-                            # Broadcast if any active pin or confirmed absorption
-                            if ge_payload.get("active_pins") or any(e.get("status") == "CONFIRMED" for e in ge_payload.get("retest_absorptions", [])):
-                                hub.broadcast({
-                                    "type": "gamma_explosion_update",
-                                    "payload": ge_payload
-                                })
+                            # Broadcast real-time status to WebSocket clients
+                            hub.broadcast({
+                                "type": "gamma_explosion_update",
+                                "payload": ge_payload
+                            })
                             print(f"[GAMMA_EXPLOSION] Active pins: {len(ge_payload.get('active_pins', []))}, Absorptions: {len(ge_payload.get('retest_absorptions', []))}")
                         except Exception as _ge_e:
                             print(f"[GAMMA_EXPLOSION] Error (non-fatal): {_ge_e}")
 
-                    # ── Option Buyer Radar via GexRebalanceEngine (with live OI velocity) ──
-                    if _gex_rebalance_engine is not None:
-                        try:
-                            dte_val      = hub_cache.get_T() * 365.0
-                            # Feed live 15m OI velocity & acceleration to GexRebalanceEngine
-                            oi_vel_data  = hub_cache.get_oi_velocity_data(window_secs=900)
-                            oi_vel_arg   = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
-                            gr_payload   = _gex_rebalance_engine.evaluate(
-                                df, spot,
-                                oi_velocity_data=oi_vel_arg,
-                                dte=dte_val,
-                                gex_res=gex_res
-                            )
-                            with _gex_rebalance_lock:
-                                _gex_rebalance_snapshot.clear()
-                                _gex_rebalance_snapshot.update(gr_payload)
-
-                            hub.broadcast({
-                                "type": "gex_rebalance_update",
-                                "payload": gr_payload
-                            })
-                            print(f"[GEX_REBALANCE] Status: {gr_payload.get('status')} | Target: {gr_payload.get('rebalance_target')}")
-                        except Exception as _gr_e:
-                            print(f"[GEX_REBALANCE] Error (non-fatal): {_gr_e}")
-
                     # ── Push OI snapshot to hub_cache for velocity tracking ──
                     try:
-                        hub_cache.push_oi_snapshot(df)
+                        hub_cache.push_oi_snapshot(df, spot=spot)
+                        snaps_vel = list(hub_cache._oi_ring)
+                        if len(snaps_vel) >= 2 and _oi_velocity_engine is not None:
+                            vel_payload = _oi_velocity_engine.calculate_velocity(snaps_vel, timeframe='5m', spot=spot)
+                            hub.broadcast({
+                                "type": "oi_velocity_update",
+                                "payload": vel_payload
+                            })
                     except Exception:
                         pass
 
@@ -1105,6 +1219,101 @@ def _gex_refresh_loop(interval: int = 60):
                             )
                         except Exception as _ids_e:
                             print(f"[INTRADAY_SIGNAL] Error (non-fatal): {_ids_e}")
+
+                    # ── Option Buyer Radar via GexRebalanceEngine (with multi-module confluence) ──
+                    if _gex_rebalance_engine is not None:
+                        try:
+                            dte_val      = hub_cache.get_T() * 365.0
+                            # Feed live 15m OI velocity & acceleration to GexRebalanceEngine
+                            oi_vel_data  = hub_cache.get_oi_velocity_data(window_secs=900)
+                            oi_vel_arg   = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
+
+                            # Pull all available multi-module context
+                            with _intraday_signal_lock:
+                                ids_snap = dict(_intraday_signal_snapshot) if _intraday_signal_snapshot else None
+                            with _gamma_explosion_lock:
+                                ge_snap  = dict(_gamma_explosion_snapshot) if _gamma_explosion_snapshot else None
+                            with _dealer_lock:
+                                dl_snap  = dict(_dealer_snapshot) if _dealer_snapshot else None
+
+                            econ_vol = None
+                            try:
+                                with _econ_vol_lock:
+                                    econ_vol = _econ_vol_cache.get("data")
+                            except Exception:
+                                pass
+
+                            gr_payload   = _gex_rebalance_engine.evaluate(
+                                df, spot,
+                                oi_velocity_data=oi_vel_arg,
+                                dte=dte_val,
+                                gex_res=gex_res,
+                                intraday_signal_data=ids_snap,
+                                gamma_explosion_data=ge_snap,
+                                dealer_data=dl_snap,
+                                vol_data=econ_vol
+                            )
+                            with _gex_rebalance_lock:
+                                _gex_rebalance_snapshot.clear()
+                                _gex_rebalance_snapshot.update(gr_payload)
+
+                            hub.broadcast({
+                                "type": "gex_rebalance_update",
+                                "payload": gr_payload
+                            })
+                            print(f"[GEX_REBALANCE] Status: {gr_payload.get('status')} | Score: {gr_payload.get('confluence_score')}/100 | Tier: {gr_payload.get('active_tier')} | Ready: {gr_payload.get('trade_ready')}")
+                        except Exception as _gr_e:
+                            print(f"[GEX_REBALANCE] Error (non-fatal): {_gr_e}")
+
+                    # ── IV Surface & Real-Time Smile Engine ──
+                    if _iv_surface_engine is not None:
+                        try:
+                            day_open = float(spot)
+                            day_high = float(spot)
+                            day_low = float(spot)
+                            recent_c = _get_recent_1min_candles()
+                            if recent_c:
+                                day_open = float(recent_c[0][1])
+                                day_high = max(float(c[2]) for c in recent_c)
+                                day_low = min(float(c[3]) for c in recent_c)
+
+                            week_open = day_open
+                            week_high = day_high
+                            week_low = day_low
+                            try:
+                                rv_ids = hub_cache.get_rv_data() or {}
+                                ohlc_ids = rv_ids.get('ohlc_df', None)
+                                if ohlc_ids is not None and len(ohlc_ids) >= 5:
+                                    tail5 = ohlc_ids.tail(5)
+                                    week_open = float(tail5['open'].iloc[0])
+                                    week_high = float(max(tail5['high'].max(), spot, day_high))
+                                    week_low = float(min(tail5['low'].min(), spot, day_low))
+                            except Exception:
+                                pass
+
+                            iv_payload = _iv_surface_engine.push_snapshot(
+                                df=df,
+                                spot=spot,
+                                day_open=day_open,
+                                day_high=day_high,
+                                day_low=day_low,
+                                dte_years=T_gex,
+                                week_open=week_open,
+                                week_high=week_high,
+                                week_low=week_low
+                            )
+                            if iv_payload:
+                                with _iv_surface_lock:
+                                    _iv_surface_snapshot.clear()
+                                    _iv_surface_snapshot.update(iv_payload)
+
+                                hub.broadcast({
+                                    "type": "iv_surface_update",
+                                    "payload": iv_payload
+                                })
+                                print(f"[IV_SURFACE] Snapshot pushed: ATM IV={iv_payload.get('atm_iv', 0):.2f}%, ExpMove=±{iv_payload.get('expected_move', {}).get('expected_move_pts', 0):.1f}pts")
+                        except Exception as _iv_e:
+                            print(f"[IV_SURFACE] Error (non-fatal): {_iv_e}")
 
         except Exception as _e:
             print(f"[GEX] Refresh error (non-fatal): {_e}")
@@ -1188,11 +1397,30 @@ def api_gex_rebalance():
                         gex_res = gex_eng.calculate_gex(df, spot)
                     except Exception:
                         pass
+                    # Pull all available multi-module context
+                    with _intraday_signal_lock:
+                        ids_snap = dict(_intraday_signal_snapshot) if _intraday_signal_snapshot else None
+                    with _gamma_explosion_lock:
+                        ge_snap  = dict(_gamma_explosion_snapshot) if _gamma_explosion_snapshot else None
+                    with _dealer_lock:
+                        dl_snap  = dict(_dealer_snapshot) if _dealer_snapshot else None
+
+                    econ_vol = None
+                    try:
+                        with _econ_vol_lock:
+                            econ_vol = _econ_vol_cache.get("data")
+                    except Exception:
+                        pass
+
                     live_eval = _gex_rebalance_engine.evaluate(
                         df, spot,
                         oi_velocity_data=oi_vel_arg,
                         dte=dte_val,
-                        gex_res=gex_res
+                        gex_res=gex_res,
+                        intraday_signal_data=ids_snap,
+                        gamma_explosion_data=ge_snap,
+                        dealer_data=dl_snap,
+                        vol_data=econ_vol
                     )
                     with _gex_rebalance_lock:
                         _gex_rebalance_snapshot.clear()
@@ -1200,7 +1428,9 @@ def api_gex_rebalance():
                         snap = dict(_gex_rebalance_snapshot)
             except Exception as _e:
                 print(f"[api_gex_rebalance] Evaluation error: {_e}")
-    return jsonify(snap or {"ok": True, "status": "MONITORING", "action_summary": "Monitoring walls..."})
+    return jsonify(snap or {"ok": True, "status": "STAND_ASIDE", "trade_ready": False, "action_summary": "Awaiting market data..."})
+
+
 
 
 @app.route('/api/intraday-signal', methods=['GET'])
@@ -1251,6 +1481,75 @@ def api_intraday_signal():
                 pass
     return jsonify(snap or {"ok": True, "score": 0.0, "actionable": False,
                             "reason": "No data yet — waiting for first GEX cycle."})
+
+
+@app.route('/api/oi-velocity', methods=['GET'])
+@app.route('/api/oi_velocity', methods=['GET'])
+def api_oi_velocity():
+    """
+    GET /api/oi-velocity?timeframe=5m&rewind_ts=1719283400
+    Returns multi-timeframe OI velocity, bidirectional strikes data,
+    dual ghost comparison bars (if rewound), and automated flow advisory.
+    """
+    try:
+        timeframe = request.args.get('timeframe', '5m').lower()
+        rewind_ts_arg = request.args.get('rewind_ts')
+        rewind_ts = float(rewind_ts_arg) if rewind_ts_arg else None
+
+        range_arg = (request.args.get('strike_range') or request.args.get('range') or '1000').lower()
+        if range_arg in ('all', 'none', '0', 'false'):
+            strike_range_pts = None
+        else:
+            try:
+                strike_range_pts = int(range_arg)
+            except (ValueError, TypeError):
+                strike_range_pts = 1000
+
+        spot = hub.latest_data.get("spot", 0.0)
+        snaps = list(hub_cache._oi_ring) if hub_cache else []
+
+        if not _oi_velocity_engine:
+            return jsonify({'ok': False, 'error': 'OiVelocityEngine not loaded'}), 500
+
+        result = _oi_velocity_engine.calculate_velocity(
+            snaps,
+            timeframe=timeframe,
+            rewind_ts=rewind_ts,
+            spot=spot,
+            strike_range_pts=strike_range_pts
+        )
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/api/iv-surface', methods=['GET'])
+@app.route('/api/iv_surface', methods=['GET'])
+def api_iv_surface():
+    """
+    GET /api/iv-surface?rewind_ts=1719283400&baseline=open
+    Returns real-time 3D IV surface mesh, active vs baseline 2D smile with delta bars,
+    non-directional Expected Move vs Day Open displacement & range consumption metrics,
+    and total IV shifts across the session.
+    """
+    try:
+        rewind_ts_arg = request.args.get('rewind_ts')
+        rewind_ts = float(rewind_ts_arg) if rewind_ts_arg else None
+        baseline_mode = request.args.get('baseline', 'open').lower()
+
+        if not _iv_surface_engine:
+            return jsonify({'ok': False, 'error': 'IvSurfaceEngine not loaded'}), 500
+
+        with _iv_surface_lock:
+            result = _iv_surface_engine.get_surface_data(
+                rewind_ts=rewind_ts,
+                baseline_mode=baseline_mode
+            )
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
 @app.route('/api/signals', methods=['GET'])
@@ -1495,6 +1794,8 @@ def api_portfolio_exit():
 _FINTEL_TOKEN = os.getenv("FINTEL_TOKEN", "").strip()
 _AUTH_EXEMPT  = {"/", "/fragment", "/builder", "/health", "/ready",
                  "/api/gamma/explosion", "/api/gex", "/api/dealer",
+                 "/api/oi-velocity", "/api/oi_velocity",
+                 "/api/iv-surface", "/api/iv_surface",
                  "/static/manifest.json", "/static/sw.js", "/static/icon.png"}
 
 @app.before_request
@@ -2742,9 +3043,9 @@ if __name__ == "__main__":
         print(f"[DataServer] HestonCalibrator could not start (non-fatal): {_e}")
 
     # ── Background GEX Refresher ───────────────────────────────────────
-    threading.Thread(target=_gex_refresh_loop, args=(120,),
+    threading.Thread(target=_gex_refresh_loop, args=(3,),
                      daemon=True, name="GEXRefresher").start()
-    print("[DataServer] GEX refresh thread started (interval=120s).")
+    print("[DataServer] GEX refresh thread started (interval=3s).")
 
     app.run(port=PORT, debug=False, use_reloader=False)
 

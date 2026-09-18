@@ -22,7 +22,8 @@ import os
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        if hasattr(sys.stdout, 'reconfigure'):
+            getattr(sys.stdout, 'reconfigure')(encoding='utf-8')
     except Exception:
         pass
 

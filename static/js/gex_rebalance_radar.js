@@ -33,21 +33,27 @@
         if (!data || !data.ok) return;
         _lastData = data;
 
-        // 1. Status & Direction Badges
+        // 1. Status, Direction & Active Tier Badges
         const statusEl = document.getElementById('gr-status-badge');
         const dirEl = document.getElementById('gr-direction-badge');
+        const tierEl = document.getElementById('gr-tier-badge');
         const descEl = document.getElementById('gr-desc');
         const actionEl = document.getElementById('gr-action-text');
         const tsEl = document.getElementById('gr-update-ts');
 
         const status = data.status || 'MONITORING';
         if (statusEl) {
-            statusEl.textContent = status.replace('_', ' ');
+            statusEl.textContent = status.replace(/_/g, ' ');
             if (status === 'IGNITED') {
                 statusEl.style.background = 'rgba(0, 230, 118, 0.2)';
                 statusEl.style.color = '#00e676';
                 statusEl.style.borderColor = '#00e676';
                 statusEl.style.boxShadow = '0 0 12px rgba(0, 230, 118, 0.4)';
+            } else if (status === 'STAND_ASIDE') {
+                statusEl.style.background = 'rgba(255, 82, 82, 0.2)';
+                statusEl.style.color = '#ff5252';
+                statusEl.style.borderColor = '#ff5252';
+                statusEl.style.boxShadow = '0 0 10px rgba(255, 82, 82, 0.3)';
             } else if (status === 'COILING' || status === 'ARMED') {
                 statusEl.style.background = 'rgba(255, 213, 79, 0.2)';
                 statusEl.style.color = '#ffd54f';
@@ -91,6 +97,114 @@
             }
         }
 
+        if (tierEl) {
+            if (data.tier_name) {
+                tierEl.textContent = data.tier_name;
+                tierEl.style.display = 'inline-block';
+                if (data.active_tier === 'TIER_3_EXPIRY_MEGA_MOVE') {
+                    tierEl.style.background = 'rgba(255, 112, 67, 0.2)';
+                    tierEl.style.color = '#ff7043';
+                    tierEl.style.borderColor = '#ff7043';
+                } else if (data.active_tier === 'TIER_2_RUNWAY_SQUEEZE') {
+                    tierEl.style.background = 'rgba(0, 240, 255, 0.18)';
+                    tierEl.style.color = '#00f0ff';
+                    tierEl.style.borderColor = '#00f0ff';
+                } else {
+                    tierEl.style.background = 'rgba(0, 230, 118, 0.15)';
+                    tierEl.style.color = '#00e676';
+                    tierEl.style.borderColor = 'rgba(0, 230, 118, 0.3)';
+                }
+            } else {
+                tierEl.style.display = 'none';
+            }
+        }
+
+        // 2. Confluence Score & Multi-Module Sensor Strip
+        const confValEl = document.getElementById('gr-confluence-val');
+        const confBarEl = document.getElementById('gr-confluence-bar');
+        const score = Number(data.confluence_score !== undefined ? data.confluence_score : 50);
+
+        if (confValEl) {
+            confValEl.textContent = score.toFixed(0) + ' / 100';
+            if (score >= 70) {
+                confValEl.style.color = '#00e676';
+            } else if (score >= 50) {
+                confValEl.style.color = '#ffd54f';
+            } else {
+                confValEl.style.color = '#ff5252';
+            }
+        }
+
+        if (confBarEl) {
+            confBarEl.style.width = Math.min(100, Math.max(0, score)) + '%';
+            if (score >= 70) {
+                confBarEl.style.background = 'linear-gradient(90deg, #ffd54f, #00e676)';
+            } else if (score >= 50) {
+                confBarEl.style.background = 'linear-gradient(90deg, #ff9800, #ffd54f)';
+            } else {
+                confBarEl.style.background = 'linear-gradient(90deg, #b71c1c, #ff5252)';
+            }
+        }
+
+        // Sensor Badges
+        const checklist = data.confluence_checklist || {};
+        const updateSensor = (id, checkKey, defaultIcon, defaultName) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const item = checklist[checkKey];
+            if (item) {
+                el.textContent = `${item.label}: ${item.detail}`;
+                if (item.status === 'PASS') {
+                    el.style.color = '#00e676';
+                    el.style.borderColor = 'rgba(0, 230, 118, 0.4)';
+                    el.style.background = 'rgba(0, 230, 118, 0.1)';
+                } else if (item.status === 'WARN') {
+                    el.style.color = '#ffd54f';
+                    el.style.borderColor = 'rgba(255, 213, 79, 0.4)';
+                    el.style.background = 'rgba(255, 213, 79, 0.1)';
+                } else if (item.status === 'FAIL') {
+                    el.style.color = '#ff5252';
+                    el.style.borderColor = 'rgba(255, 82, 82, 0.4)';
+                    el.style.background = 'rgba(255, 82, 82, 0.1)';
+                } else {
+                    el.style.color = '#94a3b8';
+                    el.style.borderColor = '#334155';
+                    el.style.background = 'rgba(255, 255, 255, 0.05)';
+                }
+            } else {
+                el.textContent = `${defaultIcon} ${defaultName}: Checking`;
+                el.style.color = '#94a3b8';
+            }
+        };
+
+        updateSensor('gr-sensor-gex', 'dealer_gex', '⚡', 'GEX');
+        updateSensor('gr-sensor-oi', 'oi_flow', '🌊', 'OI Flow');
+        updateSensor('gr-sensor-abs', 'absorption', '🕯️', 'Absorption');
+        updateSensor('gr-sensor-vol', 'vol_skew', '📊', 'Vol Skew');
+        updateSensor('gr-sensor-pin', 'pin_cascade', '⏱️', 'Pin Status');
+
+        // 3. Stand-Aside Shield Banner
+        const standAsideBanner = document.getElementById('gr-stand-aside-banner');
+        const standAsideText = document.getElementById('gr-stand-aside-text');
+        const isStandAside = (data.trade_ready === false) || (data.status === 'STAND_ASIDE');
+
+        if (standAsideBanner) {
+            if (isStandAside) {
+                standAsideBanner.style.display = 'flex';
+                if (standAsideText) {
+                    if (data.rejection_reasons && data.rejection_reasons.length > 0) {
+                        standAsideText.textContent = 'STAND ASIDE: ' + data.rejection_reasons[0];
+                    } else if (data.status_desc) {
+                        standAsideText.textContent = data.status_desc.replace(/🛡️\s*/, '');
+                    } else {
+                        standAsideText.textContent = 'STAND ASIDE: Market in chop / low confluence. No high-ROI edge. Cash is a position.';
+                    }
+                }
+            } else {
+                standAsideBanner.style.display = 'none';
+            }
+        }
+
         if (descEl && data.status_desc) {
             descEl.textContent = data.status_desc;
         }
@@ -103,7 +217,7 @@
             tsEl.textContent = 'Updated: ' + data.timestamp;
         }
 
-        // 2. The 4 Essential Levels
+        // 4. The 4 Essential Levels
         const spotEl = document.getElementById('gr-spot-val');
         const trigEl = document.getElementById('gr-trigger-val');
         const tgtEl = document.getElementById('gr-target-val');
@@ -114,7 +228,7 @@
         if (tgtEl && data.rebalance_target) tgtEl.textContent = Number(data.rebalance_target).toLocaleString('en-IN', { maximumFractionDigits: 0 });
         if (fortEl && data.terminal_fortress) fortEl.textContent = Number(data.terminal_fortress).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
-        // 3. Runway Progress Bar
+        // 5. Runway Progress Bar
         const barStart = document.getElementById('gr-bar-start');
         const barRunway = document.getElementById('gr-bar-runway');
         const barTarget = document.getElementById('gr-bar-target');
@@ -133,7 +247,7 @@
             fuelEl.textContent = 'Dealer Futures Fuel: ' + Number(data.dealer_fuel_lots).toLocaleString('en-IN') + ' Lots';
         }
 
-        // 4. Primary ATM Option Card
+        // 6. Primary ATM Option Card
         const pOpt = data.primary_option;
         if (pOpt) {
             const pStrike = document.getElementById('gr-p-strike-name');
@@ -145,6 +259,7 @@
             const pT2Pct = document.getElementById('gr-p-t2-pct');
             const pSl = document.getElementById('gr-p-sl');
             const pSlPct = document.getElementById('gr-p-sl-pct');
+            const pRr = document.getElementById('gr-p-rr');
 
             const ltpVal = pOpt.current_price ?? pOpt.ltp ?? 0;
             const t1Val = pOpt.target_1 ?? 0;
@@ -163,9 +278,10 @@
             if (pT2Pct) pT2Pct.textContent = '+' + Number(t2PctVal).toFixed(0) + '%';
             if (pSl) pSl.textContent = '₹' + Number(slVal).toFixed(1);
             if (pSlPct) pSlPct.textContent = Number(slPctVal).toFixed(0) + '%';
+            if (pRr) pRr.textContent = `R:R ${(pOpt.rr_ratio || 1.8).toFixed(1)} : 1`;
         }
 
-        // 5. 0DTE OTM Gamma Rocket Option Card
+        // 7. 0DTE OTM Gamma Rocket Option Card
         const oOpt = data.otm_gamma_rocket;
         if (oOpt) {
             const oStrike = document.getElementById('gr-o-strike-name');
@@ -198,7 +314,7 @@
             if (oSlPct) oSlPct.textContent = Number(slPctVal).toFixed(0) + '%';
             if (oStatus) {
                 if (oOpt.is_active) {
-                    oStatus.textContent = '🔥 Convexity In Vacuum Runway';
+                    oStatus.textContent = '🔥 0DTE Convexity Hero Active';
                     oStatus.style.color = '#00e676';
                 } else {
                     oStatus.textContent = 'Outside Runway / High DTE';
@@ -368,7 +484,7 @@
     function startPolling() {
         if (_pollTimer) clearInterval(_pollTimer);
         poll();
-        _pollTimer = setInterval(poll, 3000);
+        _pollTimer = setInterval(poll, 1500);
     }
 
     // Export to window
