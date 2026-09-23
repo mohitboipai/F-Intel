@@ -1,6 +1,12 @@
 import math
 import logging
 
+try:
+    import config as _cfg
+    _DEFAULT_LOT_SIZE = int(_cfg.get("nifty_lot_size", 65))
+except Exception:
+    _DEFAULT_LOT_SIZE = 65
+
 logger = logging.getLogger(__name__)
 
 class PositionSizer:
@@ -11,7 +17,7 @@ class PositionSizer:
         self.account_equity = account_equity
         self.risk_per_trade_pct = risk_per_trade_pct # Max % of account willing to lose on one trade
 
-    def calculate_size(self, confidence: float, entry_price: float, stop_loss: float, lot_size: int = 25) -> int:
+    def calculate_size(self, confidence: float, entry_price: float, stop_loss: float, lot_size: int | None = None) -> int:
         """
         Calculate the number of lots to trade.
         :param confidence: 0.0 to 1.0 (from MasterSignalEngine)
@@ -20,6 +26,8 @@ class PositionSizer:
         :param lot_size: Broker lot size (NIFTY = 25)
         :return: Integer number of lots to buy/sell
         """
+        if lot_size is None:
+            lot_size = _DEFAULT_LOT_SIZE
         if entry_price <= stop_loss or confidence <= 0:
             return 0
             

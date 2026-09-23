@@ -25,8 +25,13 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-LOT_SIZE  = 75
-RISK_FREE = 0.07
+try:
+    import config as _cfg
+    LOT_SIZE  = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE = float(_cfg.get("risk_free_rate", 0.051274))
+except Exception:
+    LOT_SIZE  = 65
+    RISK_FREE = 0.051274
 
 
 def _to_date(d) -> date_type:
@@ -113,7 +118,7 @@ class PositionLedger:
         cashflow_pu = +price_per_unit if action == 'SELL' else -price_per_unit
         tx = LegTransaction(
             position_id=self.position_id,
-            date=str(date)[:10],
+            date=date[:10],
             time_type=time_type,
             option_type=option_type,
             strike=float(strike),

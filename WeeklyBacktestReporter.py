@@ -26,6 +26,7 @@ import json
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,7 +35,11 @@ DB_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 REPORT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'data', 'weekly_backtest_report.html')
 
-LOT_SIZE = 75
+try:
+    import config as _cfg
+    LOT_SIZE = int(_cfg.get("nifty_lot_size", 65))
+except Exception:
+    LOT_SIZE = 65
 
 
 class WeeklyBacktestReporter:
@@ -108,17 +113,19 @@ class WeeklyBacktestReporter:
     def _stats(df: pd.DataFrame) -> dict:
         if df.empty:
             return {}
-        pnls = df['final_pnl_rupees'].values
+        pnls = df['final_pnl_rupees'].to_numpy(dtype=float)
         wins  = pnls[pnls > 0]
         cum   = np.cumsum(pnls)
         peak  = np.maximum.accumulate(cum)
         dd    = cum - peak
-        sharpe = (pnls.mean() / (pnls.std() + 1e-9)) * np.sqrt(52) if len(pnls) > 1 else 0
+        sharpe = (float(pnls.mean()) / (float(pnls.std()) + 1e-9)) * np.sqrt(52) if len(pnls) > 1 else 0.0
         wr    = len(wins) / len(pnls)
-        avg_w = float(wins.mean()) if len(wins) > 0 else 0
-        avg_l = float(abs(pnls[pnls <= 0].mean())) if any(pnls <= 0) else 1
-        b     = avg_w / avg_l if avg_l > 0 else 0
-        kelly = min(max((wr * b - (1 - wr)) / b if b > 0 else 0, 0), 0.25)
+        avg_w = float(wins.mean()) if len(wins) > 0 else 0.0
+        losses = pnls[pnls <= 0]
+        avg_l = float(abs(losses.mean())) if len(losses) > 0 else 1.0
+        b     = avg_w / avg_l if avg_l > 0 else 0.0
+        kelly = min(max((wr * b - (1 - wr)) / b if b > 0 else 0.0, 0.0), 0.25)
+        avg_shifts = float(np.mean(df['shift_count'])) if ('shift_count' in df.columns and len(df) > 0) else 0.0
         return {
             'positions':   len(pnls),
             'total_pnl':   round(float(pnls.sum()), 0),
@@ -127,7 +134,7 @@ class WeeklyBacktestReporter:
             'max_dd':      round(float(dd.min()), 0),
             'sharpe':      round(float(sharpe), 2),
             'kelly':       round(kelly * 100, 1),
-            'avg_shifts':  round(float(df['shift_count'].mean()), 2) if 'shift_count' in df.columns else 0,
+            'avg_shifts':  round(avg_shifts, 2),
             'cumulative':  cum.tolist(),
         }
 
@@ -206,9 +213,8 @@ class WeeklyBacktestReporter:
         # Shift trigger breakdown from leg_transactions
         trigger_html = '<div style="color:#555;font-size:11px">No shift transactions found.</div>'
         if not lt.empty:
-            shifts = lt[lt['time_type'] == 'OPEN'][
-                lt[lt['time_type'] == 'OPEN']['shift_number'] > 0]
-            if not shifts.empty:
+            shifts: Any = lt[(lt['time_type'] == 'OPEN') & (lt['shift_number'] > 0)]
+            if len(shifts) > 0:
                 spot_ce = len(shifts[shifts['reason'].str.contains('SPOT_CE', na=False)])
                 spot_pe = len(shifts[shifts['reason'].str.contains('SPOT_PE', na=False)])
                 spot_bo = len(shifts[shifts['reason'].str.contains('SPOT_BOTH', na=False)])
@@ -345,6 +351,7 @@ class WeeklyBacktestReporter:
 
         rows_html = ''
         for _, row in ps_sorted.iterrows():
+            row: Any = row
             pnl   = row['final_pnl_rupees']
             pc    = '#66bb6a' if pnl >= 0 else '#ef5350'
             bg    = 'rgba(102,187,106,0.06)' if pnl >= 0 else 'rgba(239,83,80,0.06)'
@@ -360,6 +367,7 @@ class WeeklyBacktestReporter:
                 if not sub_rows.empty:
                     inner = ''
                     for _, tx in sub_rows.iterrows():
+                        tx: Any = tx
                         tc = '#66bb6a' if tx['cashflow_per_unit'] >= 0 else '#ef5350'
                         tt_col = {'OPEN': '#4fc3f7', 'CLOSE': '#ffd54f',
                                   'SETTLE': '#ab47bc'}.get(tx['time_type'], '#888')
@@ -453,7 +461,7 @@ class WeeklyBacktestReporter:
             if df.empty:
                 return f'<p style="color:#555">No {label} data.</p>'
             d = df.copy()
-            d['month'] = pd.to_datetime(d['entry_date']).dt.to_period('M').astype(str)
+            d['month'] = pd.DatetimeIndex(d['entry_date']).strftime('%Y-%m')
             m = d.groupby('month').agg(
                 positions=('final_pnl_rupees', 'count'),
                 total_shifts=('shift_count', 'sum'),
@@ -509,6 +517,7 @@ class WeeklyBacktestReporter:
         color = '#4fc3f7' if 'Strangle' in title else '#66bb6a'
         rows = ''
         for _, tx in lt.sort_values(['position_id', 'date']).iterrows():
+            tx: Any = tx
             cc = '#66bb6a' if tx['cashflow_per_unit'] >= 0 else '#ef5350'
             tt_col = {'OPEN': '#4fc3f7', 'CLOSE': '#ffd54f',
                       'SETTLE': '#ab47bc'}.get(tx['time_type'], '#888')

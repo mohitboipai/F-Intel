@@ -163,11 +163,11 @@ class InteractiveOptionsAnalyzer:
             remote_expiry = item.get('expiry_date') # e.g. "28-Nov-2024"?? verify format
             
             # Identify Option Type
-            # Fyers: "option_type" -> "CALL" or "PUT"
-            otype = item.get('option_type')
-            if otype == "CALL":
+            # Fyers: "option_type" -> "CE"/"PE" or "CALL"/"PUT"
+            otype = str(item.get('option_type', '')).upper()
+            if otype in ("CALL", "CE"):
                 option_type = "CE" 
-            elif otype == "PUT": 
+            elif otype in ("PUT", "PE"): 
                 option_type = "PE"
             else:
                 continue # Skip if unknown

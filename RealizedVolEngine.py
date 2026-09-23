@@ -426,6 +426,64 @@ class RealizedVolEngine:
         pts_60d = spot * (cur_rv_60 / 100.0) / sqrt_252 if spot > 0 else 0.0
         pts_1y = spot * (cur_hv / 100.0) / sqrt_252 if spot > 0 else 0.0
 
+        # Historical Volatility Evolution & Past Numbers (Past 40 trading days)
+        try:
+            if 'date' in df_daily:
+                _dt_col = df_daily['date']
+            elif 'dates' in df_daily:
+                _dt_col = df_daily['dates']
+            elif 'timestamp' in df_daily:
+                _dt_col = df_daily['timestamp']
+            else:
+                _dt_col = df_daily.index
+
+            _hist_dates = []
+            for d in _dt_col:
+                if isinstance(d, (int, float)) and d > 1e8:
+                    _hist_dates.append(datetime.fromtimestamp(d).strftime('%Y-%m-%d'))
+                elif hasattr(d, 'strftime'):
+                    _hist_dates.append(d.strftime('%Y-%m-%d'))
+                else:
+                    _hist_dates.append(str(d)[:10])
+            _n_tail = min(40, len(_hist_dates))
+
+            _rv20_list = [round(float(v), 2) for v in rv_20d.dropna()]
+            _rv5_list = [round(float(v), 2) for v in rv_5d.dropna()]
+            _dates_tail = _hist_dates[-_n_tail:]
+            _rv20_tail = _rv20_list[-_n_tail:] if len(_rv20_list) >= _n_tail else _rv20_list
+            _rv5_tail = _rv5_list[-_n_tail:] if len(_rv5_list) >= _n_tail else _rv5_list
+
+            _yest_rv20 = round(float(rv_20d.iloc[-2]), 2) if len(rv_20d) >= 2 else round(cur_rv_20, 2)
+            _d5_rv20 = round(float(rv_20d.iloc[-6]), 2) if len(rv_20d) >= 6 else round(cur_rv_20, 2)
+            _d20_rv20 = round(float(rv_20d.iloc[-21]), 2) if len(rv_20d) >= 21 else round(cur_rv_20, 2)
+
+            _yest_rv5 = round(float(rv_5d.iloc[-2]), 2) if len(rv_5d) >= 2 else round(cur_rv_5, 2)
+            _d5_rv5 = round(float(rv_5d.iloc[-6]), 2) if len(rv_5d) >= 6 else round(cur_rv_5, 2)
+
+            vol_history = {
+                'dates': _dates_tail,
+                'rv20': _rv20_tail,
+                'rv5': _rv5_tail,
+                'cur_rv20': round(cur_rv_20, 2),
+                'cur_rv5': round(cur_rv_5, 2),
+                'yesterday_rv20': _yest_rv20,
+                'd5_ago_rv20': _d5_rv20,
+                'd20_ago_rv20': _d20_rv20,
+                'yesterday_rv5': _yest_rv5,
+                'd5_ago_rv5': _d5_rv5,
+                'hv_1y_min': round(hv_1y_min, 2),
+                'hv_1y_max': round(hv_1y_max, 2),
+                'hv_1y_median': round(hv_1y_median, 2),
+            }
+        except Exception:
+            vol_history = {
+                'dates': [], 'rv20': [], 'rv5': [],
+                'cur_rv20': round(cur_rv_20, 2), 'cur_rv5': round(cur_rv_5, 2),
+                'yesterday_rv20': round(cur_rv_20, 2), 'd5_ago_rv20': round(cur_rv_20, 2), 'd20_ago_rv20': round(cur_rv_20, 2),
+                'yesterday_rv5': round(cur_rv_5, 2), 'd5_ago_rv5': round(cur_rv_5, 2),
+                'hv_1y_min': round(hv_1y_min, 2), 'hv_1y_max': round(hv_1y_max, 2), 'hv_1y_median': round(hv_1y_median, 2)
+            }
+
         return {
             'spot': spot,
             'atm_iv': atm_iv,
@@ -472,7 +530,8 @@ class RealizedVolEngine:
             },
             'regime': regime,
             'econometric': econometric,
-            'strangle_sizing': strangle_sizing
+            'strangle_sizing': strangle_sizing,
+            'history': vol_history
         }
 
     # ══════════════════════════════════════════════════════════════════════

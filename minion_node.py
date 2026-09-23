@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import logging
 import json
+import os
 from datetime import datetime
 
 # Configure basic logging
@@ -13,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# A simple secret token to ensure only our Master can send trades
-SECRET_TOKEN = "fintel_master_secret_2026"
+# Secret token loaded from environment — never hardcode
+SECRET_TOKEN = os.environ.get("FINTEL_MINION_TOKEN", "change_me_in_env")
 
 @app.route('/', methods=['GET'])
 def index():

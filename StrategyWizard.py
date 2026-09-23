@@ -22,8 +22,13 @@ from typing import List
 
 from StrategyEngine import SmartStrategyGenerator, Strategy
 
-LOT_SIZE  = 75     # NIFTY lot size — must match StrategyEngine.NIFTY_LOT
-RISK_FREE = 0.07   # 7% Indian risk-free
+try:
+    import config as _cfg
+    LOT_SIZE  = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE = float(_cfg.get("risk_free_rate", 0.051274))
+except Exception:
+    LOT_SIZE  = 65     # NSE revised Aug 2024
+    RISK_FREE = 0.051274
 
 
 class StrategyWizard:

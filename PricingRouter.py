@@ -16,7 +16,7 @@ Heston pricing uses HestonMath.price_vanilla_call() (Fourier transform, fast).
 Heston POP uses heston_paths() MC (slow but accurate).
 BSM fallback is always available — calibration failure never propagates.
 
-Constants: LOT_SIZE=75, RISK_FREE=0.07
+Constants: LOT_SIZE and RISK_FREE sourced from config.py via StrategyEngine
 """
 
 import time
@@ -29,7 +29,7 @@ from StrategyEngine import bsm_price, RISK_FREE, NIFTY_LOT
 # ── Heston math / MC  ────────────────────────────────────────────────────────
 from NiftyHestonMC import HestonMath, NiftyHestonMC
 
-LOT_SIZE = NIFTY_LOT   # 75 — canonical reference
+LOT_SIZE = NIFTY_LOT   # sourced from config.py via StrategyEngine
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -232,8 +232,10 @@ class PricingRouter:
                 return None
 
             df['dist'] = abs(df['strike'] - spot)
-            subset = (df[(df['type'] == 'CE') & (df['dist'] < spot * 0.02)]
-                      .sort_values('dist').head(8))
+            ce_df = df[(df['type'] == 'CE') & (df['dist'] < spot * 0.02)]
+            if not isinstance(ce_df, pd.DataFrame):
+                return None
+            subset = ce_df.sort_values(by='dist').head(8)
             if len(subset) < 3:
                 return None
 

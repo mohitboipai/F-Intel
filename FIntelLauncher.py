@@ -130,28 +130,19 @@ def _step1_splash(session_ts: str):
     print(_cyan(f"  Session: {session_ts}"))
     print()
 
-    # ── Show last-known tunnel URL from .tunnel_url if it exists ─────────────
-    for fname in (".tunnel_url", "tunnel_url.txt"):
-        url_file = PROJECT_ROOT / fname
-        if url_file.exists():
-            try:
-                saved_url = url_file.read_text(encoding="utf-8").splitlines()[0].strip()
-                if saved_url.startswith("http"):
-                    inner = saved_url.center(58)
-                    box = (
-                        "╔══════════════════════════════════════════════════════════╗\n"
-                        "║         LAST SESSION — DASHBOARD URL (may still work)    ║\n"
-                        "╠══════════════════════════════════════════════════════════╣\n"
-                        f"║   {inner}   ║\n"
-                        "╚══════════════════════════════════════════════════════════╝"
-                    )
-                    print(_cyan(box))
-                    print(_bright_yellow(f"  ► {saved_url}"))
-                    print(_dim("  (A fresh URL will be shown once the new tunnel starts)"))
-                    print()
-                    break
-            except OSError:
-                pass
+    local_url = "http://127.0.0.1:8082/"
+    inner = local_url.center(58)
+    box = (
+        "╔══════════════════════════════════════════════════════════╗\n"
+        "║             LOCAL DASHBOARD URL                          ║\n"
+        "╠══════════════════════════════════════════════════════════╣\n"
+        f"║   {inner}   ║\n"
+        "╚══════════════════════════════════════════════════════════╝"
+    )
+    print(_cyan(box))
+    print(_bright_yellow(f"  ► Live Dashboard : {local_url}"))
+    print(_bright_yellow(f"  ► Backtest Studio: {local_url}builder"))
+    print()
 
     print(_dim("  Initializing logger and log directory..."))
 
@@ -233,7 +224,7 @@ def _step2_expiry(launcher_log) -> tuple[str, str]:
 
 def _step3_dataserver(launcher_log) -> subprocess.Popen:
     print()
-    print(_yellow("  [1/3] Starting DataHub (DataServer.py)..."))
+    print(_yellow("  [1/2] Starting DataHub (DataServer.py)..."))
 
     ds = _popen("DataServer.py")
     _start_stream_thread(ds, "DataServer")
@@ -247,97 +238,16 @@ def _step3_dataserver(launcher_log) -> subprocess.Popen:
     return ds
 
 
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 4 — CLOUDFLARE TUNNEL
+# STEP 4 — VOLATILITY ANALYZER (interactive — no stdout pipe)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Module-level mutable container for the discovered tunnel URL
-_TUNNEL_URL_HOLDER: list[str | None] = [None]
-
-
-def _step4_tunnel(launcher_log) -> subprocess.Popen:
+def _step4_analyzer(launcher_log) -> subprocess.Popen:
     print()
-    print(_yellow("  [3/3] Starting Cloudflare Tunnel (start_tunnel.py)..."))
-
-    url_found_event = threading.Event()
-
-    def url_callback(url: str) -> None:
-        _TUNNEL_URL_HOLDER[0] = url
-        url_found_event.set()
-
-        # Persist tunnel_url.txt AND .tunnel_url (keep both in sync)
-        ts_line = f"Session started: {datetime.datetime.now().isoformat()}"
-        for fname in ("tunnel_url.txt", ".tunnel_url"):
-            try:
-                (PROJECT_ROOT / fname).write_text(
-                    f"{url}\n{ts_line}", encoding="utf-8"
-                )
-            except OSError:
-                pass
-
-        # Update fintel_session.json
-        try:
-            session_path = PROJECT_ROOT / "fintel_session.json"
-            if session_path.exists():
-                data = json.loads(session_path.read_text(encoding="utf-8"))
-                data["tunnel_url"] = url
-                session_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except (OSError, json.JSONDecodeError):
-            pass
-
-        launcher_log.info(f"Tunnel URL detected: {url}")
-
-    tunnel_proc = _popen("start_tunnel.py")
-    _start_stream_thread(tunnel_proc, "Tunnel", url_callback=url_callback)
-
-    print(_cyan(f"  ✓ Tunnel process launched (PID: {tunnel_proc.pid}). Waiting for URL..."))
-
-    # Wait for URL or process exit (avoid waiting 30s if cloudflared is absent)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if url_found_event.wait(timeout=0.5):
-            break
-        if tunnel_proc.poll() is not None:
-            break
-
-    url = _TUNNEL_URL_HOLDER[0]
-
-    if url:
-        inner = url.center(58)
-        box = (
-            "╔══════════════════════════════════════════════════════════╗\n"
-            "║           F-INTEL DASHBOARD — LIVE ACCESS URL            ║\n"
-            "╠══════════════════════════════════════════════════════════╣\n"
-            f"║   {inner}   ║\n"
-            "╠══════════════════════════════════════════════════════════╣\n"
-            "║   Share this link to access the dashboard remotely       ║\n"
-            "║   Link changes every session — copy it now               ║\n"
-            "╚══════════════════════════════════════════════════════════╝"
-        )
-        print()
-        print(_cyan(box))
-        print()
-        print(_bright_yellow(f"  ► COPY: {url}"))
-        print(_dim("  (Also saved to tunnel_url.txt)"))
-    else:
-        # Build date/time strings for log path hint
-        dt_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        ts_str = FIntelLogger._TIME_STR
-        print()
-        print(_red("  ⚠ WARNING: Tunnel URL not detected within 30s."))
-        print(_red(f"    Check logs/{dt_str}/tunnel_{ts_str}.log for details."))
-        launcher_log.warning("Tunnel URL not detected within 30s timeout")
-
-    return tunnel_proc
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 5 — VOLATILITY ANALYZER (interactive — no stdout pipe)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _step5_analyzer(launcher_log) -> subprocess.Popen:
-    print()
-    print(_yellow("  [2/3] Starting Volatility Analyzer (VolatilityAnalyzer.py)..."))
+    print(_yellow("  [2/2] Starting Volatility Analyzer (VolatilityAnalyzer.py)..."))
     print(_dim("  " + "─" * 55))
     print(_dim("  Note: VolatilityAnalyzer will ask for expiries — enter the same dates above."))
     print(_dim("  (Future update will read them automatically from fintel_session.json)"))
@@ -352,11 +262,10 @@ def _step5_analyzer(launcher_log) -> subprocess.Popen:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 6 — PROCESS MONITOR LOOP
+# STEP 5 — PROCESS MONITOR LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _step6_monitor(ds_proc_ref: list, tunnel_proc: subprocess.Popen,
-                   va_proc: subprocess.Popen, launcher_log) -> None:
+def _step5_monitor(ds_proc_ref: list, va_proc: subprocess.Popen, launcher_log) -> None:
     """Run in a daemon thread. Monitors process health every 5 s.
 
     ds_proc_ref is a mutable list [ds_process] so we can update the reference
@@ -370,7 +279,6 @@ def _step6_monitor(ds_proc_ref: list, tunnel_proc: subprocess.Popen,
         # ── VolatilityAnalyzer exit → clean shutdown ──────────────────────────
         if va_proc.poll() is not None:
             # Signal the main thread to proceed to shutdown
-            # We raise a flag via a module-level event
             _shutdown_event.set()
             break
 
@@ -391,15 +299,9 @@ def _step6_monitor(ds_proc_ref: list, tunnel_proc: subprocess.Popen,
                 launcher_log.critical("DataServer failed after restart. Manual intervention required.")
                 print(_red("  ✗ DataHub failed again. Manual intervention required."))
 
-        # ── Tunnel health ─────────────────────────────────────────────────────
-        if tunnel_proc.poll() is not None:
-            launcher_log.warning("Tunnel process exited.")
-            print(_yellow("  ⚠ Tunnel process stopped. Remote access may be unavailable."))
-            # Do not attempt automatic tunnel restart
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 7 — GRACEFUL SHUTDOWN
+# STEP 6 — GRACEFUL SHUTDOWN
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _terminate_proc(proc: subprocess.Popen, label: str, launcher_log) -> None:
@@ -415,13 +317,11 @@ def _terminate_proc(proc: subprocess.Popen, label: str, launcher_log) -> None:
         pass
 
 
-def _step7_shutdown(ds_proc_ref: list, tunnel_proc: subprocess.Popen,
-                    launcher_log) -> None:
+def _step6_shutdown(ds_proc_ref: list, launcher_log) -> None:
     print()
     print(_cyan("─── Shutting down F-Intel... ───"))
 
     _terminate_proc(ds_proc_ref[0], "DataServer", launcher_log)
-    _terminate_proc(tunnel_proc,    "Tunnel",     launcher_log)
 
     summary = FIntelLogger.get_session_summary()
     lc = summary["lines_logged"]
@@ -433,7 +333,6 @@ def _step7_shutdown(ds_proc_ref: list, tunnel_proc: subprocess.Popen,
         f"║  Started : {summary['session_start'][:19]}  ║\n"
         f"║  Log Dir : {str(summary['log_dir'])[-27:]:27s}  ║\n"
         f"║  Lines   : DataServer: {lc.get('DataServer', 0):<6d}  ║\n"
-        f"║            Tunnel    : {lc.get('Tunnel', 0):<6d}  ║\n"
         f"║            Analyzer  : {lc.get('Analyzer', 0):<6d}  ║\n"
         f"║  Metrics : {summary['metrics_captured']:<6d} captured         ║\n"
         "╚═══════════════════════════════╝"
@@ -468,16 +367,13 @@ def main() -> None:
     ds_proc = _step3_dataserver(launcher_log)
     ds_proc_ref: list = [ds_proc]  # mutable ref for monitor thread
 
-    # Step 4 — VolatilityAnalyzer (interactive) — launched before tunnel
-    va_proc = _step5_analyzer(launcher_log)
+    # Step 4 — VolatilityAnalyzer (interactive)
+    va_proc = _step4_analyzer(launcher_log)
 
-    # Step 5 — Tunnel (starts after Analyzer so the dashboard is up first)
-    tunnel_proc = _step4_tunnel(launcher_log)
-
-    # Step 6 — Monitor (daemon thread)
+    # Step 5 — Monitor (daemon thread)
     monitor_thread = threading.Thread(
-        target=_step6_monitor,
-        args=(ds_proc_ref, tunnel_proc, va_proc, launcher_log),
+        target=_step5_monitor,
+        args=(ds_proc_ref, va_proc, launcher_log),
         daemon=True,
     )
     monitor_thread.start()
@@ -485,8 +381,8 @@ def main() -> None:
     # Wait until VolatilityAnalyzer exits (signalled by monitor thread)
     _shutdown_event.wait()
 
-    # Step 7 — Graceful shutdown
-    _step7_shutdown(ds_proc_ref, tunnel_proc, launcher_log)
+    # Step 6 — Graceful shutdown
+    _step6_shutdown(ds_proc_ref, launcher_log)
 
     sys.exit(0)
 

@@ -325,10 +325,10 @@
     background: rgba(41, 98, 255, 0.18);
 }
 
-/* MM Tab indicator */
-.mm-tab-btn {
-    border-bottom: 2px solid var(--accent) !important;
-    color: var(--accent) !important;
+/* MM Tab indicator only when active */
+.mm-tab-btn.active {
+    border-bottom: 2px solid var(--accent);
+    color: var(--accent);
 }
 
 .pulse-badge {

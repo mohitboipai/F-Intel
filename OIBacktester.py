@@ -171,11 +171,11 @@ class OIDataProcessor:
 
         return pd.DataFrame({
             'date': date_str,
-            'strike': pd.to_numeric(df['STRIKE_PR'], errors='coerce').fillna(0).astype(int),
+            'strike': pd.Series(pd.to_numeric(df['STRIKE_PR'], errors='coerce')).fillna(0).astype(int),
             'type': df['_type'].values,
-            'oi': pd.to_numeric(df['OPEN_INT'], errors='coerce').fillna(0).astype(int),
-            'oi_change': pd.to_numeric(df['CHG_IN_OI'], errors='coerce').fillna(0).astype(int),
-            'close': pd.to_numeric(df['CLOSE'], errors='coerce').fillna(0),
+            'oi': pd.Series(pd.to_numeric(df['OPEN_INT'], errors='coerce')).fillna(0).astype(int),
+            'oi_change': pd.Series(pd.to_numeric(df['CHG_IN_OI'], errors='coerce')).fillna(0).astype(int),
+            'close': pd.Series(pd.to_numeric(df['CLOSE'], errors='coerce')).fillna(0),
             'expiry': df['EXPIRY_DT'].values,
             'spot': 0,
         }).query('strike > 0').reset_index(drop=True)
@@ -200,20 +200,24 @@ class OIDataProcessor:
             return pd.DataFrame()
 
         # Extract spot from UndrlygPric (underlying price in bhavcopy!)
-        spot = 0
+        spot = 0.0
         if 'UndrlygPric' in df.columns:
-            spot_vals = pd.to_numeric(df['UndrlygPric'], errors='coerce').dropna()
-            spot_non_zero = spot_vals[spot_vals > 0]
-            if not spot_non_zero.empty:
-                spot = float(spot_non_zero.iloc[0])
+            for val in df['UndrlygPric'].values:
+                try:
+                    num = float(val)
+                    if num > 0:
+                        spot = num
+                        break
+                except (ValueError, TypeError):
+                    continue
 
         return pd.DataFrame({
             'date': date_str,
-            'strike': pd.to_numeric(df['StrkPric'], errors='coerce').fillna(0).astype(int),
+            'strike': pd.Series(pd.to_numeric(df['StrkPric'], errors='coerce')).fillna(0).astype(int),
             'type': df['_type'].values,
-            'oi': pd.to_numeric(df['OpnIntrst'], errors='coerce').fillna(0).astype(int),
-            'oi_change': pd.to_numeric(df['ChngInOpnIntrst'], errors='coerce').fillna(0).astype(int),
-            'close': pd.to_numeric(df['ClsPric'], errors='coerce').fillna(0),
+            'oi': pd.Series(pd.to_numeric(df['OpnIntrst'], errors='coerce')).fillna(0).astype(int),
+            'oi_change': pd.Series(pd.to_numeric(df['ChngInOpnIntrst'], errors='coerce')).fillna(0).astype(int),
+            'close': pd.Series(pd.to_numeric(df['ClsPric'], errors='coerce')).fillna(0),
             'expiry': df['XpryDt'].values if 'XpryDt' in df.columns else '',
             'spot': spot,
         }).query('strike > 0').reset_index(drop=True)
@@ -466,7 +470,7 @@ class PerformanceAnalyzer:
         # Monthly breakdown
         print(f"\n  Monthly Signal Win Rate (5d horizon):")
         results_df = results_df.copy()
-        results_df['month'] = pd.to_datetime(results_df['date']).dt.to_period('M')
+        results_df['month'] = pd.DatetimeIndex(pd.to_datetime(results_df['date'])).to_period('M')
 
         print(f"  {'Month':>10} | {'BULL Win%':>10} | {'BEAR Win%':>10} | {'Signals':>8}")
         print(f"  {'-'*10} | {'-'*10} | {'-'*10} | {'-'*8}")
@@ -618,7 +622,7 @@ class OIBacktester:
         spot_cache = os.path.join(CACHE_DIR, 'spot_prices.csv')
         if os.path.exists(spot_cache):
             cached = pd.read_csv(spot_cache)
-            cached['date'] = pd.to_datetime(cached['date']).dt.strftime('%Y-%m-%d')
+            cached['date'] = pd.DatetimeIndex(pd.to_datetime(cached['date'])).strftime('%Y-%m-%d')
             if len(cached) > 100:
                 print(f"  Using cached spot prices ({len(cached)} days)")
                 return dict(zip(cached['date'], cached['close']))
@@ -626,7 +630,7 @@ class OIBacktester:
         try:
             from FyersAuth import FyersAuthenticator
             from fyers_auth_manager import get_fyers_instance
-        fyers = get_fyers_instance()
+            fyers = get_fyers_instance()
             if fyers:
                 all_spots = {}
                 chunk_start = start_date

@@ -120,23 +120,26 @@ class GreeksEngine:
         # ── Second Order Greeks ────────────────────────────────────────────────
 
         # Gamma — scaled by e^{-qT}
-        gamma = eq_T * n_d1 / (S * iv * sqrt_T)
+        gamma = eq_T * n_d1 / np.maximum(S * iv * sqrt_T, 1e-8)
 
         # Vanna (sensitivity of Delta to IV, or Vega to Spot)
         # Vanna = -e^{-qT} · n(d1) · (d2 / σ) / 100
-        vanna = (-eq_T * n_d1 * d2 / iv) / 100.0
+        vanna = (-eq_T * n_d1 * d2 / np.maximum(iv, 1e-6)) / 100.0
 
         # Charm (Delta decay — sensitivity of Delta to time)
         # CE Charm: e^{-qT} · [q·N(d1) - n(d1)·(r−q)/(σ√T) + n(d1)·d2/(2T)]  (per day)
         # PE Charm: e^{-qT} · [-q·N(-d1) - n(d1)·(r−q)/(σ√T) + n(d1)·d2/(2T)] (per day)
-        charm_inner = n_d1 * (2 * (self.r - q_vec) * T - d2 * iv * sqrt_T) / (2 * T * iv * sqrt_T)
+        charm_denom = np.maximum(2.0 * T * iv * sqrt_T, 1e-6)
+        charm_inner = n_d1 * (2.0 * (self.r - q_vec) * T - d2 * iv * sqrt_T) / charm_denom
         charm_call = eq_T * (-q_vec * N_d1       + charm_inner)
         charm_put  = eq_T * ( q_vec * N_minus_d1 + charm_inner)
         charm = np.where(is_call, charm_call, charm_put) / self.days_in_year
+        # Physical boundary: delta decay per day cannot exceed total delta range [-1.0, 1.0]
+        charm = np.clip(np.nan_to_num(charm, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
 
         # Vomma (sensitivity of Vega to IV)
         # Vomma = Vega · (d1 · d2 / σ) / 100
-        vomma = vega * (d1 * d2 / iv) / 100.0
+        vomma = vega * (d1 * d2 / np.maximum(iv, 1e-6)) / 100.0
 
         return pd.DataFrame({
             'delta': delta,

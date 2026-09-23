@@ -90,9 +90,11 @@ class KeyLevelsEngine:
             strike = item.get('strike_price', 0)
             if strike <= 0: continue
             
+            raw_type = str(item.get('option_type', '')).upper()
+            opt_type = 'CE' if raw_type in ('CE', 'CALL') else 'PE'
             records.append({
                 'strike': strike,
-                'type': 'CE' if item.get('option_type') == 'CALL' else 'PE',
+                'type': opt_type,
                 'ltp': item.get('ltp', 0),
                 'oi': item.get('oi', 0),
                 'iv': item.get('iv', 0),
@@ -237,7 +239,9 @@ class KeyLevelsEngine:
         
         try:
             from GEXEngine import GEXEngine
-            res = GEXEngine.compute_gex(df, spot, T, lot_size=75) # NIFTY lot size
+            import config
+            lot = config.get("nifty_lot_size", 65)
+            res = GEXEngine.compute_gex(df, spot, T, lot_size=lot)
             return res['net_gex']
         except Exception as e:
             print(f"Error computing GEX: {e}")

@@ -340,7 +340,9 @@ class GexRebalanceEngine:
         otm_price = 0.0
         otm_delta = 0.0
         otm_gamma = 0.0
+        otm_theta = 0.0
         otm_active = False
+        best_otm = None
 
         if direction == "BULLISH_CE":
             target_high = max(spot + 50.0, rebalance_target + 50.0)
@@ -361,6 +363,7 @@ class GexRebalanceEngine:
             otm_price = max(0.5, float(best_otm['price']))
             otm_delta = float(best_otm.get('delta', 0.15 if opt_type == 'CE' else -0.15))
             otm_gamma = float(best_otm.get('gamma', 0.003))
+            otm_theta = float(best_otm.get('theta', 0.0))
             # Active on Expiry or 1DTE
             otm_active = (dte <= 1.5)
 
@@ -369,7 +372,8 @@ class GexRebalanceEngine:
             'type': opt_type,
             'price': atm_price,
             'delta': round(atm_delta, 2),
-            'gamma': round(atm_gamma, 4)
+            'gamma': round(atm_gamma, 4),
+            'theta': round(float(atm_row.get('theta', 0.0)), 2)
         }
 
         otm_rocket = {
@@ -378,17 +382,14 @@ class GexRebalanceEngine:
             'price': otm_price if otm_price > 0 else max(1.0, atm_price * 0.20),
             'delta': round(otm_delta, 2),
             'gamma': round(otm_gamma, 4),
+            'theta': round(otm_theta, 2),
             'is_active': otm_active
         }
 
         return primary_atm, otm_rocket
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 4. DIRECT PREMIUM CONVERTER
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 4. DIRECT PREMIUM CONVERTER WITH TIERED ROI GUARANTEES
+    # 4. DIRECT PREMIUM CONVERTER WITH TIERED ROI GUARANTEES & THETA BURN
     # ─────────────────────────────────────────────────────────────────────────
 
     def convert_to_premium(self, strike_dict: Dict[str, Any], spot_move_pts: float,
@@ -404,9 +405,19 @@ class GexRebalanceEngine:
         ltp = max(0.5, float(strike_dict.get('price', 50.0)))
         delta = max(0.05, abs(float(strike_dict.get('delta', 0.50))))
         gamma = max(0.0001, float(strike_dict.get('gamma', 0.002)))
+        raw_theta = abs(float(strike_dict.get('theta', 0.0)))
 
         # Taylor expansion base spot move
         dP_raw = delta * spot_move_pts + 0.5 * gamma * (spot_move_pts ** 2)
+
+        # 15-Minute Theta Decay Burn Calculation
+        # A normal Indian trading session is 375 minutes (25 fifteen-minute blocks)
+        # On 0DTE afternoon, decay accelerates significantly (1.35x standard daily theta)
+        accel = 1.35 if tier == "TIER_3_EXPIRY_MEGA_MOVE" else 1.0
+        effective_theta = raw_theta if raw_theta > 0.1 else max(1.0, ltp * (0.32 if tier == "TIER_3_EXPIRY_MEGA_MOVE" else 0.14))
+        theta_15m_pts = round((effective_theta / 25.0) * accel, 1)
+        theta_15m_inr = round(theta_15m_pts * float(self.lot_size), 0)
+        theta_burn_str = f"-₹{theta_15m_pts:.1f} pts (-₹{theta_15m_inr:,.0f}/lot)"
 
         if is_rocket and tier == "TIER_3_EXPIRY_MEGA_MOVE":
             # 0DTE Expiry Mega Move (Hero or Zero Gamma Rocket)
@@ -458,7 +469,11 @@ class GexRebalanceEngine:
             'runner_gain_pct': runner_gain_pct,
             'stop_loss': stop_price,
             'stop_loss_pct': loss_pct,
-            'rr_ratio': rr_ratio
+            'rr_ratio': rr_ratio,
+            'theta': round(effective_theta, 2),
+            'theta_15m_pts': theta_15m_pts,
+            'theta_15m_inr': theta_15m_inr,
+            'theta_burn_15m_str': theta_burn_str
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -473,7 +488,8 @@ class GexRebalanceEngine:
                  gamma_explosion_data: Optional[Dict[str, Any]] = None,
                  dealer_data: Optional[Dict[str, Any]] = None,
                  vol_data: Optional[Dict[str, Any]] = None,
-                 master_verdict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 master_verdict: Optional[Dict[str, Any]] = None,
+                 regime_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Master method called continuously. Performs deep multi-module confluence
         evaluation across GEX, OI velocity, microstructural absorption, econometric vol,
@@ -780,23 +796,63 @@ class GexRebalanceEngine:
             elif "AVOID" in mv or "NEUTRAL" in mv:
                 confluence_score -= 6.0
 
+        # 8. Realized Volatility Regime & Volatility Cone Fusion
+        if regime_data and isinstance(regime_data, dict):
+            macro = regime_data.get('macro', {})
+            m_stage = macro.get('stage', '')
+            rv_dict = regime_data.get('rv', {})
+            t_slope = rv_dict.get('term_slope', 0.0)
+
+            if 'COMPRESSION' in m_stage and dte > 6.0:
+                confluence_score += 10.0
+                checklist['vol_skew'] = {'status': 'PASS', 'label': 'Macro Squeeze', 'detail': 'Vol Cone at Lows'}
+            if t_slope > 1.0 and direction == "BEARISH_PE":
+                # Inverted term structure (short-term RV > long-term RV) indicates panic / downside rush
+                confluence_score += 8.0
+
         confluence_score = round(max(0.0, min(100.0, confluence_score)), 1)
 
-        # ── DETERMINE ACTIVE TIER & TRADE READINESS ──
-        # Strict Chop / Suppression Gate:
-        is_vetoed = (w2_oi_vel > 35_000) or (swing_q == 'CHOPPY' and confluence_score < 72.0)
-        trade_ready = (confluence_score >= 65.0) and not is_vetoed
-
-        active_tier = "TIER_1_QUICK_MOMENTUM"
-        tier_name = "INTRADAY MOMENTUM (20-35% ROI)"
-
-        # Check for Tier 3: 0DTE Expiry Mega Move
-        if (dte <= 1.2) and (confluence_score >= 78.0 or top_pin_risk == 'IMMINENT' or abs(w2_oi_vel) >= 70_000):
+        # ── MULTI-EXPIRY SETUP ARCHETYPE CLASSIFIER & DYNAMIC TIME HORIZONS ──
+        if dte <= 1.2:
+            setup_archetype = "0DTE_GAMMA_ROCKET"
+            archetype_name = "0DTE GAMMA ROCKET 🔥 (Expiry Squeeze)"
+            archetype_badge_color = "#ff7043"
+            recommended_horizon = "15 – 35 Mins (Fast Squeeze)"
+            max_hold_mins = 35
+            hard_time_stop = "EXIT if spot stalls <20 pts after 20 mins — 0DTE theta acceleration will destroy premium."
             active_tier = "TIER_3_EXPIRY_MEGA_MOVE"
             tier_name = "0DTE EXPIRY MEGA MOVE 🔥 (100-300%+ ROI)"
-        elif is_inverted or runway_pts >= 110.0 or confluence_score >= 75.0:
-            active_tier = "TIER_2_RUNWAY_SQUEEZE"
-            tier_name = "VACUUM RUNWAY SQUEEZE ⚡ (45-80% ROI)"
+
+            # On 0DTE, if spot breaks the trigger with dealer negative GEX or unwinding,
+            # gamma acceleration overpowers early session ADR compression
+            if is_broken and (net_gex < 0 or w2_oi_vel < 0):
+                confluence_score = max(confluence_score, 78.0)
+        elif dte <= 6.0:
+            setup_archetype = "WEEKLY_MOMENTUM_BREAKOUT"
+            archetype_name = "WEEKLY MOMENTUM SQUEEZE ⚡ (Absorption Retest)"
+            archetype_badge_color = "#00f0ff"
+            recommended_horizon = "1 – 3 Hours (Session Trend)"
+            max_hold_mins = 150
+            hard_time_stop = "EXIT if 5-min candle closes back across VWAP or 60 mins without directional follow-through."
+            if is_inverted or runway_pts >= 110.0 or confluence_score >= 75.0:
+                active_tier = "TIER_2_RUNWAY_SQUEEZE"
+                tier_name = "VACUUM RUNWAY SQUEEZE ⚡ (45-80% ROI)"
+            else:
+                active_tier = "TIER_1_QUICK_MOMENTUM"
+                tier_name = "INTRADAY MOMENTUM (20-35% ROI)"
+        else:
+            setup_archetype = "MACRO_VOL_EXPANSION"
+            archetype_name = "MACRO VOL EXPANSION 🌐 (Multi-Day Swing)"
+            archetype_badge_color = "#b388ff"
+            recommended_horizon = "1 – 2 Trading Days"
+            max_hold_mins = 900
+            hard_time_stop = "EXIT on 1D RV trailing stop or daily close below breakout pivot."
+            active_tier = "TIER_1_QUICK_MOMENTUM"
+            tier_name = "MACRO VOL EXPANSION 🌐 (30-60% ROI)"
+
+        # Strict Chop / Suppression Gate (0DTE exempt from low early morning ADR veto):
+        is_vetoed = (w2_oi_vel > 35_000) or (swing_q == 'CHOPPY' and confluence_score < 72.0 and dte > 1.2)
+        trade_ready = (confluence_score >= 65.0) and not is_vetoed
 
         # ── Squeeze State Transitions ──
         invalidation_stop = trigger_strike - 12.0 if direction == "BULLISH_CE" else trigger_strike + 12.0
@@ -826,7 +882,7 @@ class GexRebalanceEngine:
         elif is_broken and w2_oi_vel < 0:
             status = "IGNITED"
             prefix = "ACTIVE SQUEEZE DETECTED" if is_inverted else "BREAKOUT DETECTED"
-            status_desc = f"⚡ {prefix}: {trigger_strike:.0f} toll gate broken with -{abs(w2_oi_vel)/1000:.0f}k unwinding! [{tier_name}]"
+            status_desc = f"⚡ {prefix}: {trigger_strike:.0f} toll gate broken with -{abs(w2_oi_vel)/1000:.0f}k unwinding! [{archetype_name}]"
             self._active_setup = {'active': True, 'trigger': trigger_strike, 'target': rebalance_target, 'direction': direction}
         elif is_broken and self._active_setup and self._active_setup.get('active'):
             status = "REBALANCING"
@@ -857,16 +913,47 @@ class GexRebalanceEngine:
 
         opt_name = "CE" if direction == "BULLISH_CE" else "PE"
 
+        # ── Structured Exit Triggers ──
+        exit_triggers = {
+            'target_1': {
+                'label': 'Target 1 (Book 70%)',
+                'spot': rebalance_target,
+                'primary_premium': primary_premium.get('target_1', 0),
+                'otm_premium': otm_premium.get('target_1', 0),
+                'rationale': f'Zero-Gamma Fuel Apex ({rebalance_target:.0f}) reached'
+            },
+            'target_2': {
+                'label': 'Target 2 (Runner)',
+                'spot': fortress_wall_1,
+                'primary_premium': primary_premium.get('runner_target', 0),
+                'otm_premium': otm_premium.get('runner_target', 0),
+                'rationale': f'Terminal Fortress Wall ({fortress_wall_1:.0f}) extension'
+            },
+            'structural_stop': {
+                'label': 'Structural Stop Loss',
+                'spot': invalidation_stop,
+                'primary_premium': primary_premium.get('stop_loss', 0),
+                'otm_premium': otm_premium.get('stop_loss', 0),
+                'rationale': f'Spot failure back across {invalidation_stop:.0f}'
+            },
+            'time_stop': {
+                'label': 'Hard Time Stop',
+                'max_duration': f"{max_hold_mins} Mins",
+                'rule': hard_time_stop,
+                'theta_burn_15m': primary_premium.get('theta_burn_15m_str', '--')
+            }
+        }
+
         if status == "STAND_ASIDE":
             action_summary = f"STAND ASIDE: {rejection_reasons[0] if rejection_reasons else 'Confluence score ' + str(int(confluence_score)) + '/100 — no high-ROI edge.'}"
         elif status == "IGNITED":
-            action_summary = f"BUY {primary_premium['strike']:.0f} {opt_name} NOW | TARGET: ₹{primary_premium['target_1']} (+{primary_premium['target_gain_pct']}%) | SL: ₹{primary_premium['stop_loss']}"
+            action_summary = f"BUY {primary_premium['strike']:.0f} {opt_name} NOW | TARGET: ₹{primary_premium['target_1']} (+{primary_premium['target_gain_pct']}%) | SL: ₹{primary_premium['stop_loss']} | HOLD: {recommended_horizon}"
         elif status == "COILING" or status == "ARMED":
-            action_summary = f"WAIT FOR TRIGGER: Prepare to BUY {primary_premium['strike']:.0f} {opt_name} when spot breaks {trigger_strike:.0f}"
+            action_summary = f"WAIT FOR TRIGGER: Prepare to BUY {primary_premium['strike']:.0f} {opt_name} when spot breaks {trigger_strike:.0f} | HOLD: {recommended_horizon}"
         elif status == "TARGET_REACHED":
             action_summary = f"BOOK 75% PROFIT: Target {rebalance_target:.0f} hit (+{primary_premium['target_gain_pct']}% ROI)! Trail runners."
         elif status == "REBALANCING":
-            action_summary = f"HOLD {opt_name}: {tier_name} underway ({progress_pct:.0f}% towards {rebalance_target:.0f})."
+            action_summary = f"HOLD {opt_name}: {archetype_name} underway ({progress_pct:.0f}% towards {rebalance_target:.0f}) | MAX TIME: {max_hold_mins}m."
         else:
             action_summary = f"MONITORING: Spot {abs(dist_to_trigger):.0f} pts from {trigger_strike:.0f} {opt_name} barrier. Confluence: {confluence_score:.0f}/100."
 
@@ -878,6 +965,14 @@ class GexRebalanceEngine:
             'trade_ready': trade_ready,
             'active_tier': active_tier,
             'tier_name': tier_name,
+            'setup_archetype': setup_archetype,
+            'archetype_name': archetype_name,
+            'archetype_badge_color': archetype_badge_color,
+            'recommended_horizon': recommended_horizon,
+            'max_hold_mins': max_hold_mins,
+            'hard_time_stop': hard_time_stop,
+            'theta_decay_burn_15m': primary_premium.get('theta_burn_15m_str', '--'),
+            'exit_triggers': exit_triggers,
             'confluence_score': confluence_score,
             'confluence_checklist': checklist,
             'rejection_reasons': rejection_reasons,
@@ -898,4 +993,8 @@ class GexRebalanceEngine:
             'walls': walls,
             'timestamp': time.strftime("%H:%M:%S")
         }
+
+    def compute(self, spot: float, chain_df: pd.DataFrame, **kwargs) -> Dict[str, Any]:
+        """Convenience alias for evaluate(chain_df=chain_df, spot=spot, ...)."""
+        return self.evaluate(chain_df=chain_df, spot=spot, **kwargs)
 

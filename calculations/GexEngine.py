@@ -32,7 +32,8 @@ class GexEngine:
                  dividend_yield: float | None = None,
                  gex_scaling: float | None = None,
                  positioning_model: Literal['standard', 'inverted', 'flow'] = 'standard',
-                 default_iv: float | None = None):
+                 default_iv: float | None = None,
+                 oi_is_shares: bool | None = True):
         """
         Initialize the GexEngine.
         
@@ -47,6 +48,7 @@ class GexEngine:
                         Call GEX is Negative (-), Put GEX is Positive (+).
             'flow': Uses actual trade initiation to infer exact dealer positioning (requires 'initiator' column).
         :param default_iv: Fallback Implied Volatility when unobservable (defaults to config.iv_fallback_flat).
+        :param oi_is_shares: True if OI/volume data is already in shares (standard for NSE/Fyers). If False, multiplied by lot_size.
         """
         self.lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
         self.r = risk_free_rate if risk_free_rate is not None else _DEFAULT_R
@@ -54,6 +56,7 @@ class GexEngine:
         self.gex_scaling = gex_scaling if gex_scaling is not None else _DEFAULT_GEX_SCALING
         self.positioning_model = positioning_model
         self.default_iv = default_iv if default_iv is not None else _DEFAULT_IV
+        self.oi_is_shares = oi_is_shares if oi_is_shares is not None else True
 
     def compute_gamma_vectorized(self, S: float, K: np.ndarray, T: np.ndarray, iv: np.ndarray) -> np.ndarray:
         """
@@ -153,9 +156,9 @@ class GexEngine:
         dealer_sign = self._infer_dealer_sign(df)
         
         # GEX Scaling: Gamma * TotalShares * Spot^2 * 1%
-        # Note: In NSE / Fyers API, 'oi' and 'volume' are reported in underlying units/shares (e.g. 15M).
-        # If 'oi' is in contracts (< 100,000 max), multiply by lot_size to convert to shares.
-        is_shares = bool((df['oi'].max() > 100_000)) if not df.empty else False
+        # In NSE / Fyers API, 'oi' and 'volume' are reported in underlying units/shares (e.g. 15M).
+        # When oi_is_shares is False, multiply by lot_size to convert contract count to shares.
+        is_shares = self.oi_is_shares if self.oi_is_shares is not None else True
         total_shares = df['oi'] if is_shares else (df['oi'] * self.lot_size)
         total_vol_shares = df['volume'] if is_shares else (df['volume'] * self.lot_size)
 

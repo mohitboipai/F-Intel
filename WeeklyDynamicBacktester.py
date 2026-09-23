@@ -33,6 +33,7 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from datetime import date as date_type, datetime, timedelta
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -45,8 +46,13 @@ from ShiftEvaluator           import ShiftEvaluator
 from PositionLedger           import PositionLedger
 
 # ── constants ─────────────────────────────────────────────────────────────────
-LOT_SIZE  = 75
-RISK_FREE = 0.07
+try:
+    import config as _cfg
+    LOT_SIZE  = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE = float(_cfg.get("risk_free_rate", 0.051274))
+except Exception:
+    LOT_SIZE  = 65
+    RISK_FREE = 0.051274
 DB_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'data', 'backtest_results.db')
 STRANGLE_WIDTH_PCT = 2.0   # 2% from spot for short strikes
@@ -152,12 +158,11 @@ def _trading_days_between(min_fetcher: MinuteDataFetcher,
                            start: date_type, end: date_type) -> list[date_type]:
     """Return list of trading days in minute data between start and end inclusive."""
     try:
-        df = min_fetcher.get_data(start.year)
+        df = min_fetcher.get(str(start), str(end))
         if df is None or df.empty:
             return []
-        mask = (df.index.date >= start) & (df.index.date <= end)
-        sub  = df[mask]
-        return sorted(set(sub.index.date))
+        days = [ts.date() for ts in pd.DatetimeIndex(df.index)]
+        return sorted(set(d for d in days if start <= d <= end))
     except Exception:
         return []
 
@@ -186,7 +191,7 @@ class WeeklyDynamicBacktester:
         self.pricer      = OptionPriceReconstructor()
         self.shift_eval  = ShiftEvaluator(threshold_pct=shift_threshold_pct)
         self._minute_df  = pd.DataFrame()   # populated in run()
-        self.cal         = None             # populated in run()
+        self.cal: ExpiryCalendar = ExpiryCalendar(self.bhav)
         self.signals_df  = pd.DataFrame()   # populated in run()
 
         self._results: list[dict] = []
@@ -254,8 +259,9 @@ class WeeklyDynamicBacktester:
         """Get 15:29 bar close (daily) from minute data, fallback to bhavcopy."""
         try:
             if self._minute_df is not None and not self._minute_df.empty:
-                day_bars = self._minute_df[self._minute_df.index.date == trade_date]
-                if not day_bars.empty:
+                ds = str(trade_date)
+                day_bars: Any = self._minute_df.loc[ds:ds]
+                if len(day_bars) > 0:
                     return float(day_bars['close'].iloc[-1])
             uc = self.bhav.get_underlying_close(str(trade_date))
             return uc or 0.0
@@ -266,11 +272,12 @@ class WeeklyDynamicBacktester:
         """09:30 bar price for entry, fallback to daily close."""
         try:
             if self._minute_df is not None and not self._minute_df.empty:
-                day_bars = self._minute_df[self._minute_df.index.date == trade_date]
-                target   = day_bars.between_time('09:30', '09:31')
-                if not target.empty:
-                    return float(target['open'].iloc[0])
-                if not day_bars.empty:
+                ds = str(trade_date)
+                day_bars: Any = self._minute_df.loc[ds:ds]
+                if len(day_bars) > 0:
+                    target = day_bars.between_time('09:30', '09:31')
+                    if len(target) > 0:
+                        return float(target['open'].iloc[0])
                     return float(day_bars['close'].iloc[-1])
             uc = self.bhav.get_underlying_close(str(trade_date))
             return uc or 0.0
@@ -406,7 +413,7 @@ class WeeklyDynamicBacktester:
                 if decision.should_shift:
                     current_shift += 1
                     # Close breached legs
-                    if decision.ce_action == 'CLOSE_AND_REOPEN':
+                    if decision.ce_action == 'CLOSE_AND_REOPEN' and decision.new_ce_strike is not None:
                         close_p = _price(self.pricer, self.bhav, cur_spot, cur_ce, dte_now,
                                          expiry_str, 'CE', day_str)
                         ledger.add_transaction(day_str, 'CLOSE', 'CE', cur_ce, 'BUY',
@@ -419,7 +426,7 @@ class WeeklyDynamicBacktester:
                                                decision.new_ce_strike, 'SELL',
                                                new_ce_p, current_shift,
                                                f'CE new strike -- {decision.reason[:60]}')
-                    if decision.pe_action == 'CLOSE_AND_REOPEN':
+                    if decision.pe_action == 'CLOSE_AND_REOPEN' and decision.new_pe_strike is not None:
                         close_p = _price(self.pricer, self.bhav, cur_spot, cur_pe, dte_now,
                                          expiry_str, 'PE', day_str)
                         ledger.add_transaction(day_str, 'CLOSE', 'PE', cur_pe, 'BUY',
@@ -728,23 +735,28 @@ class WeeklyDynamicBacktester:
         if df.empty:
             return {'strategy': strategy, 'positions': 0}
 
-        pnls = df['final_pnl_rupees'].values
+        pnls = df['final_pnl_rupees'].to_numpy(dtype=float)
         wins = pnls[pnls > 0]
         cum  = np.cumsum(pnls)
         peak = np.maximum.accumulate(cum)
         dd   = cum - peak
 
-        sharpe = (pnls.mean() / (pnls.std() + 1e-9)) * np.sqrt(52) if len(pnls) > 1 else 0
+        sharpe = (float(pnls.mean()) / (float(pnls.std()) + 1e-9)) * np.sqrt(52) if len(pnls) > 1 else 0.0
         wr     = len(wins) / len(pnls)
-        avg_w  = float(wins.mean()) if len(wins) > 0 else 0
-        avg_l  = float(abs(pnls[pnls <= 0].mean())) if len(pnls[pnls <= 0]) > 0 else 1
-        b      = avg_w / avg_l if avg_l > 0 else 0
-        kelly  = min(max((wr * b - (1 - wr)) / b if b > 0 else 0, 0), 0.25)
+        avg_w  = float(wins.mean()) if len(wins) > 0 else 0.0
+        losses = pnls[pnls <= 0]
+        avg_l  = float(abs(losses.mean())) if len(losses) > 0 else 1.0
+        b      = avg_w / avg_l if avg_l > 0 else 0.0
+        kelly  = min(max((wr * b - (1 - wr)) / b if b > 0 else 0.0, 0.0), 0.25)
 
-        avg_shifts = df['shift_count'].mean()
+        avg_shifts = float(np.mean(df['shift_count'])) if len(df) > 0 else 0.0
         never_shifted = df[df['shift_count'] == 0]
         shifted_once  = df[df['shift_count'] == 1]
         shifted_multi = df[df['shift_count'] >= 2]
+
+        no_shift_pnl = float(np.mean(never_shifted['final_pnl_rupees'])) if len(never_shifted) > 0 else 0.0
+        once_shift_pnl = float(np.mean(shifted_once['final_pnl_rupees'])) if len(shifted_once) > 0 else 0.0
+        multi_shift_pnl = float(np.mean(shifted_multi['final_pnl_rupees'])) if len(shifted_multi) > 0 else 0.0
 
         return {
             'strategy':           strategy.upper(),
@@ -755,11 +767,11 @@ class WeeklyDynamicBacktester:
             'max_drawdown':       round(float(dd.min()), 0),
             'sharpe':             round(float(sharpe), 2),
             'kelly_pct':          round(kelly * 100, 1),
-            'avg_shifts':         round(float(avg_shifts), 2),
+            'avg_shifts':         round(avg_shifts, 2),
             'no_shift_count':     len(never_shifted),
-            'no_shift_avg_pnl':   round(float(never_shifted['final_pnl_rupees'].mean()), 0) if len(never_shifted) > 0 else 0,
+            'no_shift_avg_pnl':   round(no_shift_pnl, 0),
             'once_shift_count':   len(shifted_once),
-            'once_shift_avg_pnl': round(float(shifted_once['final_pnl_rupees'].mean()), 0) if len(shifted_once) > 0 else 0,
+            'once_shift_avg_pnl': round(once_shift_pnl, 0),
             'multi_shift_count':  len(shifted_multi),
-            'multi_shift_avg_pnl': round(float(shifted_multi['final_pnl_rupees'].mean()), 0) if len(shifted_multi) > 0 else 0,
+            'multi_shift_avg_pnl': round(multi_shift_pnl, 0),
         }

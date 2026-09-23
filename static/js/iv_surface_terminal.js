@@ -30,6 +30,8 @@
     var _historyIndex = [];
     var _latestPayload = null;
     var _pollTimer = null;
+    var _pendingSmileData = null;
+    var _pendingSurfaceData = null;
 
     // ── Fetch Helper ────────────────────────────────────────────────────────
     async function fetchSurfaceData(rewindTs, baselineMode) {
@@ -449,6 +451,13 @@
         var chartDiv = document.getElementById('iv-smile-plot');
         if (!chartDiv || typeof Plotly === 'undefined') return;
 
+        // Defer rendering if container is hidden to prevent 0x0 collapsed layout
+        if (chartDiv.offsetParent === null) {
+            _pendingSmileData = data;
+            return;
+        }
+        _pendingSmileData = null;
+
         var smileData = data.smile_2d || {};
         var activeStrikes = smileData.active_strikes || [];
         var activeIvs = smileData.active_ivs || [];
@@ -614,6 +623,13 @@
         var chartDiv = document.getElementById('iv-surface-3d-plot');
         if (!chartDiv || typeof Plotly === 'undefined') return;
 
+        // Defer rendering if container is hidden to prevent 0x0 WebGL context collapse
+        if (chartDiv.offsetParent === null) {
+            _pendingSurfaceData = data;
+            return;
+        }
+        _pendingSurfaceData = null;
+
         var mesh = data.surface_3d || {};
         var strikes = mesh.strikes || [];
         var dtes = mesh.dtes || [];
@@ -767,10 +783,29 @@
         }, 4000);
     }
 
+    function onTabActivated() {
+        var smileDiv = document.getElementById('iv-smile-plot');
+        var surfDiv = document.getElementById('iv-surface-3d-plot');
+        if (_pendingSmileData && smileDiv && smileDiv.offsetParent !== null) {
+            render2dSmileChart(_pendingSmileData);
+        }
+        if (_pendingSurfaceData && surfDiv && surfDiv.offsetParent !== null) {
+            render3dSurfaceChart(_pendingSurfaceData);
+        }
+        if (smileDiv && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+            try { window.Plotly.Plots.resize(smileDiv); } catch (e) {}
+        }
+        if (surfDiv && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+            try { window.Plotly.Plots.resize(surfDiv); } catch (e) {}
+        }
+        returnToLive();
+    }
+
     // Expose on window for WebSocket dispatch from dashboard_core.js
     window.IvSurfaceTerminal = {
         handleWsMessage: handleWsMessage,
         returnToLive: returnToLive,
+        onTabActivated: onTabActivated,
         jumpToPreset: jumpToPreset,
         setBaselineMode: setBaselineMode
     };

@@ -126,6 +126,25 @@ class SignalMemory:
         }
         self._data["active_signals"].append(entry)
         self._save()
+        try:
+            from HistoricalDataWriter import get_writer
+            get_writer().push_signal({
+                "signal_id": sig_id,
+                "source": source,
+                "direction": signal.get("direction", ""),
+                "action": signal.get("action", ""),
+                "strike": float(signal.get("strike", 0.0) or 0.0),
+                "entry_price": float(signal.get("entry", 0.0) or 0.0),
+                "sl_spot": float(signal.get("sl_spot", 0.0) or 0.0),
+                "t1_spot": float(signal.get("t1_spot", 0.0) or 0.0),
+                "t2_spot": float(signal.get("t2_spot", 0.0) or 0.0),
+                "score": float(signal.get("score", 0.0) or 0.0),
+                "status": "ACTIVE",
+                "outcome_pnl": 0.0,
+                "context": signal
+            })
+        except Exception:
+            pass
         return sig_id
 
     def resolve_signal(self, sig_id: str, outcome: dict):
@@ -141,6 +160,28 @@ class SignalMemory:
                 if len(self._data["resolved_signals"]) > MAX_HISTORY:
                     self._data["resolved_signals"] = self._data["resolved_signals"][-MAX_HISTORY:]
                 self._save()
+                try:
+                    from HistoricalDataWriter import get_writer
+                    s_data = sig.get("signal", {})
+                    pnl = float(outcome.get("pnl_pts", 0.0) or 0.0)
+                    status = "HIT_T1" if outcome.get("hit_t1") else ("HIT_SL" if outcome.get("hit_sl") else "RESOLVED")
+                    get_writer().push_signal({
+                        "signal_id": sig_id,
+                        "source": sig.get("source", ""),
+                        "direction": s_data.get("direction", ""),
+                        "action": s_data.get("action", ""),
+                        "strike": float(s_data.get("strike", 0.0) or 0.0),
+                        "entry_price": float(s_data.get("entry", 0.0) or 0.0),
+                        "sl_spot": float(s_data.get("sl_spot", 0.0) or 0.0),
+                        "t1_spot": float(s_data.get("t1_spot", 0.0) or 0.0),
+                        "t2_spot": float(s_data.get("t2_spot", 0.0) or 0.0),
+                        "score": float(s_data.get("score", 0.0) or 0.0),
+                        "status": status,
+                        "outcome_pnl": pnl,
+                        "context": outcome
+                    })
+                except Exception:
+                    pass
                 return
 
     def update_signal(self, sig_id: str, updates: dict):
@@ -197,6 +238,9 @@ class SignalMemory:
             if s.get("sl_spot"):
                 sl_levels.append(float(s["sl_spot"]))
 
+        # Detect signal clashes early for turbulence check
+        clashes = self.detect_clashes()
+
         # Context regime vote
         regime = (ctx.get("regime") or "").upper()
         if regime in ("UNDERPRICED", "SQUEEZE"):
@@ -209,8 +253,8 @@ class SignalMemory:
         # GEX regime vote
         gex = (ctx.get("gex_regime") or "").upper()
         expl_score = ctx.get("explosion_score") or 0
+        expl_dir = (ctx.get("explosion_direction") or "").upper()
         if "SHORT" in gex and expl_score >= 50:
-            expl_dir = (ctx.get("explosion_direction") or "").upper()
             v = 0.5 if expl_dir == "UPSIDE" else -0.5 if expl_dir == "DOWNSIDE" else 0
             votes.append(v)
             details.append(f"GEX: {gex}, explosion {expl_score}/100 → {expl_dir}")
@@ -266,7 +310,6 @@ class SignalMemory:
             play = "Wait for clearer signal alignment or sell premium (iron condor)"
 
         # Risk
-        clashes = self.detect_clashes()
         if clashes:
             risk = f"⚠ {len(clashes)} signal clash(es) — reduce size"
         elif confidence == "HIGH":

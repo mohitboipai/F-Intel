@@ -61,6 +61,7 @@ class StrategyManager:
             ('stop_loss_level', 'REAL'),
             ('target_level',    'REAL'),
             ('notes',           'TEXT'),
+            ('source',          'TEXT DEFAULT "MANUAL"'),
         ]
         for col, col_type in _new_cols:
             try:

@@ -8,10 +8,12 @@ import urllib.parse
 
 # Ensure stdout can print Unicode (like ✓) on Windows consoles
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except AttributeError:
-        pass
+    reconfig = getattr(sys.stdout, 'reconfigure', None)
+    if callable(reconfig):
+        try:
+            reconfig(encoding='utf-8')
+        except Exception:
+            pass
 
 class FyersAuthenticator:
     def __init__(self, client_id, secret_id, redirect_uri, token_file="access_token.txt"):
@@ -168,11 +170,18 @@ class FyersAuthenticator:
             return fyers
 
 if __name__ == "__main__":
-    # Test Authentication
-    APP_ID = "QUTT4YYMIG-100"
-    SECRET_ID = "ZG0WN2NL1B"
-    REDIRECT_URI = "http://127.0.0.1:3000/callback"
-    
+    # Test Authentication — credentials loaded from .env
+    from dotenv import load_dotenv
+    load_dotenv()
+    import os
+    APP_ID = os.getenv("FYERS_APP_ID")
+    SECRET_ID = os.getenv("FYERS_SECRET_ID")
+    REDIRECT_URI = os.getenv("FYERS_REDIRECT_URI", "http://127.0.0.1:3000/callback")
+
+    if not APP_ID or not SECRET_ID:
+        print("Error: Set FYERS_APP_ID and FYERS_SECRET_ID in .env file.")
+        sys.exit(1)
+
     auth = FyersAuthenticator(APP_ID, SECRET_ID, REDIRECT_URI)
     fyers = auth.get_fyers_instance()
     

@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 import logging
@@ -16,7 +17,7 @@ class SignalBroadcaster:
     Dispatches asynchronously in a background daemon thread to avoid blocking the main analyzer loop.
     Gracefully handles offline minion endpoints with throttled warnings.
     """
-    SECRET_TOKEN = "fintel_master_secret_2026"
+    SECRET_TOKEN = os.environ.get("FINTEL_MINION_TOKEN", "change_me_in_env")
     
     # Use 127.0.0.1 to avoid Windows IPv6 (::1) DNS resolution delays
     DEFAULT_CLIENT_ENDPOINTS = [
@@ -37,18 +38,17 @@ class SignalBroadcaster:
 
     @classmethod
     def is_enabled(cls) -> bool:
+        # Minion mode disabled/removed per user request
         if config:
-            return bool(config.get("enable_trade_broadcast", True))
-        return True
+            return bool(config.get("enable_trade_broadcast", False))
+        return False
 
     @classmethod
     def broadcast_trade(cls, setup_data: dict) -> None:
         """
-        Broadcasts the trade setup to all connected Minion nodes asynchronously.
-        Never blocks the caller.
+        Broadcasts trade setup. Disabled as minion mode is removed.
         """
-        if not cls.is_enabled():
-            return
+        return
 
         # Run dispatch in a background thread to guarantee 0 ms blocking on main loop
         threading.Thread(

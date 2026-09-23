@@ -394,101 +394,54 @@
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 5. DOM CLEANUP & DEALER POSITIONING GLOWS (No Candlesticks / Reels)
+    // 5. DOM CLEANUP & DEALER POSITIONING GLOWS
     // ─────────────────────────────────────────────────────────────────────────
     function cleanupMMDOM() {
-        // Strip live nifty candlesticks, Reel 1, and Reel 2 spotlights
-        document.querySelectorAll('.ge-chart-card, .ge-grid, #ge-interactive-chart, #ge-reel1-spotlight, #ge-reel2-spotlight').forEach(el => {
-            el.remove();
-        });
+        // No-op: Obsolete elements removed from template
     }
 
     function enhanceDealerInventoryGlows(payload, spot) {
-        const mmTab = document.getElementById('tab-mm');
-        if (!mmTab) return;
-        cleanupMMDOM();
-
-        // Highlight Per-Strike Institutional Inventory Table rows
-        const rows = mmTab.querySelectorAll('table tbody tr');
-        rows.forEach(tr => {
-            const tds = tr.querySelectorAll('td');
-            if (tds.length < 5) return;
-
-            const strikeText = tds[0].textContent.trim();
-            const strikeVal = parseFloat(strikeText);
-
-            if (payload && payload.call_wall && payload.call_wall.strike === strikeVal) {
-                tr.classList.add('glow-call-wall');
-                if (!tds[0].querySelector('.wall-badge-cw1')) {
-                    tds[0].innerHTML += ' <span class="wall-badge-cw1">CW ①</span>';
-                }
-            } else if (payload && payload.put_wall && payload.put_wall.strike === strikeVal) {
-                tr.classList.add('glow-put-wall');
-                if (!tds[0].querySelector('.wall-badge-pw1')) {
-                    tds[0].innerHTML += ' <span class="wall-badge-pw1">PW ①</span>';
-                }
-            } else if (Math.abs(strikeVal - spot) <= 25) {
-                tr.classList.add('glow-atm');
-                if (!tds[0].querySelector('.wall-badge-atm')) {
-                    tds[0].innerHTML += ' <span class="wall-badge-atm">ATM</span>';
-                }
-            }
-
-            // Dealer Gamma column (td 4)
-            const gammaTd = tds[4];
-            if (gammaTd) {
-                const gt = gammaTd.textContent.trim();
-                if (gt.startsWith('+')) gammaTd.classList.add('dealer-glow-green');
-                else if (gt.startsWith('-')) gammaTd.classList.add('dealer-glow-red');
-            }
-
-            // Dealer Delta column (td 5)
-            if (tds.length > 5) {
-                const deltaTd = tds[5];
-                const dt = deltaTd.textContent.trim();
-                if (dt.startsWith('+')) deltaTd.classList.add('dealer-glow-cyan');
-                else if (dt.startsWith('-')) deltaTd.classList.add('dealer-glow-red');
-            }
-        });
+        // Server-side VolatilityAnalyzer already injects optimized badges and classes
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 6. MASTER UPDATE LOOP
     // ─────────────────────────────────────────────────────────────────────────
+    let _isUpdating = false;
     async function updateTerminal() {
-        // Enforce cleanup immediately
-        cleanupMMDOM();
-
-        const payload = await fetchExplosionData();
-        if (!payload || !payload.ok) return;
-
-        _lastPayload = payload;
-        const spot = payload.spot || 23290;
-
-        // Fetch strike GEX from /api/gex
-        let gexData = null;
+        if (_isUpdating) return;
+        _isUpdating = true;
         try {
-            const gexRes = await fetch('/api/gex?t=' + Date.now());
-            if (gexRes.ok) gexData = await gexRes.json();
-        } catch (e) {
-            // ignore
-        }
+            const payload = await fetchExplosionData();
+            if (!payload || !payload.ok) return;
 
-        // Render Strike Ladder
-        renderStrikeLadder(gexData, payload.active_pins, spot);
+            _lastPayload = payload;
+            const spot = payload.spot || 23290;
 
-        // Apply institutional dealer positioning glows
-        enhanceDealerInventoryGlows(payload, spot);
-
-        // Update home quick-launch banner if present
-        const bannerPin = document.getElementById('ge-banner-pin');
-        if (bannerPin) {
-            if (payload.active_pins && payload.active_pins.length > 0) {
-                const topPin = payload.active_pins[0];
-                bannerPin.innerHTML = `<span style="color:#ffd54f;">${topPin.strike} PIN</span> (${topPin.duration_str} | +₹${Math.abs(topPin.gex_cr)} Cr)`;
-            } else {
-                bannerPin.textContent = 'None Active (Dispersed)';
+            // Fetch strike GEX from /api/gex
+            let gexData = null;
+            try {
+                const gexRes = await fetch('/api/gex?t=' + Date.now());
+                if (gexRes.ok) gexData = await gexRes.json();
+            } catch (e) {
+                // ignore
             }
+
+            // Render Strike Ladder
+            renderStrikeLadder(gexData, payload.active_pins, spot);
+
+            // Update home quick-launch banner if present
+            const bannerPin = document.getElementById('ge-banner-pin');
+            if (bannerPin) {
+                if (payload.active_pins && payload.active_pins.length > 0) {
+                    const topPin = payload.active_pins[0];
+                    bannerPin.innerHTML = `<span style="color:#ffd54f;">${topPin.strike} PIN</span> (${topPin.duration_str} | +₹${Math.abs(topPin.gex_cr)} Cr)`;
+                } else {
+                    bannerPin.textContent = 'None Active (Dispersed)';
+                }
+            }
+        } finally {
+            _isUpdating = false;
         }
     }
 
@@ -496,9 +449,6 @@
     window.GammaExplosionTerminal = {
         init: function () {
             updateTerminal();
-            if (!_pollTimer) {
-                _pollTimer = setInterval(updateTerminal, 1500);
-            }
         },
         refresh: updateTerminal,
         handleWsMessage: function (msg) {

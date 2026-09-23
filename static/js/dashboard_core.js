@@ -30,6 +30,26 @@
         }
     });
 
+    // ── Table Auto-Centering on ATM Strike ──
+    function centerTableOnATM(containerOrId, atmRowOrId) {
+        var container = typeof containerOrId === 'string' ? document.getElementById(containerOrId) : containerOrId;
+        if (!container) return;
+        var atmRow = typeof atmRowOrId === 'string' ? (document.getElementById(atmRowOrId.replace(/^#/, '')) || container.querySelector(atmRowOrId)) : atmRowOrId;
+        if (!atmRow) atmRow = container.querySelector('tr[data-is-atm="true"]') || container.querySelector('.glow-atm');
+        if (atmRow) {
+            var cRect = container.getBoundingClientRect();
+            var rRect = atmRow.getBoundingClientRect();
+            if (cRect.height > 0) {
+                var currentScroll = container.scrollTop;
+                var relativeTop = rRect.top - cRect.top + currentScroll;
+                var targetScroll = Math.max(0, relativeTop - (cRect.height / 2) + (rRect.height / 2));
+                container.scrollTop = targetScroll;
+                container.setAttribute('data-has-scrolled', 'true');
+            }
+        }
+    }
+    window.centerTableOnATM = centerTableOnATM;
+
     var activeTab = 'regime';
     var ws = null;
     var wsReconnectTimer = null;
@@ -39,6 +59,7 @@
         if (name === 'vol') {
             name = 'regime';
         }
+        if (!name) return;
         activeTab = name;
 
         // Update Tab Buttons
@@ -71,29 +92,96 @@
             }
         } catch (e) {}
 
-        // Trigger Plotly chart resize for visible layout
+        // First time tab is activated, ensure its initial Plotly scripts run in visible context
+        initInitialTabPlotly(name);
+
+        // Execute any pending Plotly updates for this tab
+        executePendingPlotlyForTab(name);
+
+        // Trigger Plotly chart resize for visible layout & center tables
         setTimeout(function () {
             window.dispatchEvent(new Event('resize'));
-            if (name === 'theta' && typeof window.updateThetaSim === 'function') {
-                window.updateThetaSim();
+            if (name === 'theta') {
+                var thCont = document.getElementById('theta-table-container');
+                if (thCont && thCont.getAttribute('data-has-scrolled') !== 'true') {
+                    centerTableOnATM(thCont, '#th-row-atm');
+                }
+                var pBleed = document.getElementById('theta-plotly-bleed');
+                if (pBleed && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(pBleed);
+                }
+                var pGamma = document.getElementById('theta-plotly-gamma');
+                if (pGamma && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(pGamma);
+                }
             }
             if (name === 'mm') {
-                cleanupMMTab();
+                var mmCont = document.getElementById('dealer-inventory-container');
+                if (mmCont && mmCont.getAttribute('data-has-scrolled') !== 'true') {
+                    centerTableOnATM(mmCont, '#mm-row-atm');
+                }
                 if (window.GammaExplosionTerminal && typeof window.GammaExplosionTerminal.refresh === 'function') {
                     window.GammaExplosionTerminal.refresh();
                 }
             }
             if (name === 'chain') {
+                var chainCont = document.getElementById('master-chain-container') ||
+                    (document.getElementById('master-chain-table') ? document.getElementById('master-chain-table').parentElement : null);
+                if (chainCont && chainCont.getAttribute('data-has-scrolled') !== 'true') {
+                    centerTableOnATM(chainCont, '#row-atm');
+                }
                 optimizeOptionChainAndWalls();
                 var gexChart = document.getElementById('gex-distribution-chart');
                 if (gexChart && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
                     window.Plotly.Plots.resize(gexChart);
                 }
+                var oiChart = document.getElementById('oi-velocity-chart');
+                if (oiChart && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(oiChart);
+                }
+                if (window.OiVelocityRadar && typeof window.OiVelocityRadar.refresh === 'function') {
+                    window.OiVelocityRadar.refresh();
+                }
                 if (window.GexRebalanceRadar && typeof window.GexRebalanceRadar.refresh === 'function') {
                     window.GexRebalanceRadar.refresh();
                 }
+                if (window.IgnitionScanner && typeof window.IgnitionScanner.refresh === 'function') {
+                    window.IgnitionScanner.refresh();
+                }
+            }
+            if (name === 'iv') {
+                if (window.IvSurfaceTerminal && typeof window.IvSurfaceTerminal.onTabActivated === 'function') {
+                    window.IvSurfaceTerminal.onTabActivated();
+                } else if (window.IvSurfaceTerminal && typeof window.IvSurfaceTerminal.returnToLive === 'function') {
+                    window.IvSurfaceTerminal.returnToLive();
+                }
+                var smileChart = document.getElementById('iv-smile-plot');
+                if (smileChart && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(smileChart);
+                }
+                var surfChart = document.getElementById('iv-surface-3d-plot');
+                if (surfChart && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(surfChart);
+                }
+            }
+            if (name === 'regime') {
+                var volPlot = document.getElementById('vol-history-evolution-plot');
+                if (volPlot && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(volPlot);
+                }
+            }
+            if (name === 'builder') {
+                if (window.StrategyBuilder && typeof window.StrategyBuilder.onTabActivated === 'function') {
+                    window.StrategyBuilder.onTabActivated();
+                }
+                var payoffDiv = document.getElementById('sb-payoff-chart') || document.getElementById('payoff-chart');
+                if (payoffDiv && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                    window.Plotly.Plots.resize(payoffDiv);
+                }
             }
             scrubInstitutionalAndNseText();
+            // Fast-sync active tab immediately on switch
+            refreshContent(true);
         }, 50);
     }
 
@@ -116,150 +204,450 @@
         });
     }
 
-    // ── Option Chain & GEX Wall Enhancements ──
+    // ── Option Chain & GEX Wall Enhancements (Throttled & Non-Destructive) ──
+    var _optChainAnimFrame = null;
     function optimizeOptionChainAndWalls() {
-        var chainTab = document.getElementById('tab-chain');
-        if (!chainTab) return;
-
-        // 1. Move #gex-rebalance-card to the very bottom so chain is immediately visible
-        var rebCard = chainTab.querySelector('#gex-rebalance-card');
-        if (rebCard) {
-            chainTab.appendChild(rebCard);
-        }
-
-        // 2. Extract Key Metrics for Corridor Runway
-        var putWall1 = 0, callWall1 = 0, putWall2 = 0, callWall2 = 0, maxPain = 0, pcr = '--', flow = '--';
-        var mBoxes = chainTab.querySelectorAll('.metric-box');
-        mBoxes.forEach(function (mb) {
-            var lbl = (mb.querySelector('.metric-label') || {}).textContent || '';
-            var valEl = mb.querySelector('div:not(.metric-label):not(.metric-sub)');
-            var val = valEl ? valEl.textContent.trim() : '';
-            var sub = (mb.querySelector('.metric-sub') || {}).textContent || '';
-
-            if (lbl.includes('Put Wall ①')) {
-                putWall1 = parseFloat(val.replace(/,/g, '')) || 0;
-                var m = sub.match(/②\s*(\d+)/);
-                if (m) putWall2 = parseFloat(m[1]) || 0;
-            } else if (lbl.includes('Call Wall ①')) {
-                callWall1 = parseFloat(val.replace(/,/g, '')) || 0;
-                var m = sub.match(/②\s*(\d+)/);
-                if (m) callWall2 = parseFloat(m[1]) || 0;
-            } else if (lbl.includes('Max Pain')) {
-                maxPain = parseFloat(val.replace(/,/g, '')) || 0;
-            } else if (lbl.includes('PCR')) {
-                pcr = val;
-            } else if (lbl.includes('15m OI VELOCITY')) {
-                flow = val;
-            }
-        });
-
-        // Get live spot
-        var spotEl = document.getElementById('spot-display');
-        var spot = 0;
-        if (spotEl) {
-            var sv = spotEl.querySelector('.spot-val');
-            if (sv) spot = parseFloat(sv.textContent.replace(/,/g, '')) || 0;
-        }
-        if (!spot && putWall1 && callWall1) spot = Math.round((putWall1 + callWall1) / 2);
-
-        // 3. Ensure removed GEX Corridor Runway Bar is stripped if present
-        var existingRunway = chainTab.querySelector('.gex-corridor-runway-bar');
-        if (existingRunway) {
-            existingRunway.remove();
-        }
-
-        // 4. Enhance Option Chain Table with Glowing Markers & OI Depth Bars
-        var tables = chainTab.querySelectorAll('table.data-table');
-        tables.forEach(function (table) {
-            var rows = table.querySelectorAll('tbody tr');
-            if (!rows || rows.length === 0) return;
-
-            // Compute Max OI for relative depth bars
-            var maxCeOi = 1, maxPeOi = 1;
-            rows.forEach(function (r) {
-                var tds = r.querySelectorAll('td');
-                if (tds.length >= 5) {
-                    var ceVal = parseFloat(tds[0].textContent.replace(/,/g, '')) || 0;
-                    var peVal = parseFloat(tds[tds.length - 1].textContent.replace(/,/g, '')) || 0;
-                    if (ceVal > maxCeOi) maxCeOi = ceVal;
-                    if (peVal > maxPeOi) maxPeOi = peVal;
-                }
-            });
-
-            rows.forEach(function (r) {
-                var tds = r.querySelectorAll('td');
-                if (tds.length < 3) return;
-
-                // Find strike cell (supports .strike-cell, data-strike, or fallback to index)
-                var strikeCell = r.querySelector('.strike-cell') || (tds.length === 5 ? tds[2] : (tds.length >= 11 ? tds[5] : null));
-                if (!strikeCell) {
-                    for (var i = 0; i < tds.length; i++) {
-                        var num = parseFloat(tds[i].textContent.replace(/,/g, ''));
-                        if (num >= 10000 && num <= 60000) { strikeCell = tds[i]; break; }
-                    }
-                }
-                if (!strikeCell) return;
-
-                var sVal = parseFloat(strikeCell.getAttribute('data-strike')) || parseFloat(strikeCell.textContent.replace(/[^0-9.]/g, '')) || 0;
-                if (!sVal) return;
-
-                // Glowing Wall Badges & Row Highlights
-                if (callWall1 && sVal === callWall1) {
-                    r.classList.add('glow-call-wall');
-                    if (!strikeCell.querySelector('.wall-badge-cw1')) {
-                        strikeCell.innerHTML += ' <span class="wall-badge-cw1">CW ①</span>';
-                    }
-                } else if (callWall2 && sVal === callWall2) {
-                    r.classList.add('glow-call-wall-2');
-                    if (!strikeCell.querySelector('.wall-badge-cw2')) {
-                        strikeCell.innerHTML += ' <span class="wall-badge-cw2">CW ②</span>';
-                    }
-                } else if (putWall1 && sVal === putWall1) {
-                    r.classList.add('glow-put-wall');
-                    if (!strikeCell.querySelector('.wall-badge-pw1')) {
-                        strikeCell.innerHTML += ' <span class="wall-badge-pw1">PW ①</span>';
-                    }
-                } else if (putWall2 && sVal === putWall2) {
-                    r.classList.add('glow-put-wall-2');
-                    if (!strikeCell.querySelector('.wall-badge-pw2')) {
-                        strikeCell.innerHTML += ' <span class="wall-badge-pw2">PW ②</span>';
-                    }
-                } else if (Math.abs(sVal - spot) <= 25) {
-                    r.classList.add('glow-atm');
-                    if (!strikeCell.querySelector('.wall-badge-atm')) {
-                        strikeCell.innerHTML += ' <span class="wall-badge-atm">ATM</span>';
-                    }
-                }
-
-                if (maxPain && sVal === maxPain && !strikeCell.querySelector('.wall-badge-pain')) {
-                    strikeCell.innerHTML += ' <span class="wall-badge-pain">PAIN</span>';
-                }
-
-                // Mini OI Depth Bars behind CE and PE OI numbers
-                var ceTd = tds[0];
-                var peTd = tds[tds.length - 1];
-                if (ceTd && maxCeOi > 0) {
-                    var ceOi = parseFloat(ceTd.textContent.replace(/,/g, '')) || 0;
-                    var cePct = Math.min(100, Math.round((ceOi / maxCeOi) * 100));
-                    ceTd.style.background = 'linear-gradient(270deg, rgba(255, 51, 102, 0.22) ' + cePct + '%, transparent ' + cePct + '%)';
-                }
-                if (peTd && maxPeOi > 0) {
-                    var peOi = parseFloat(peTd.textContent.replace(/,/g, '')) || 0;
-                    var pePct = Math.min(100, Math.round((peOi / maxPeOi) * 100));
-                    peTd.style.background = 'linear-gradient(90deg, rgba(0, 230, 118, 0.22) ' + pePct + '%, transparent ' + pePct + '%)';
-                }
-            });
+        if (_optChainAnimFrame) cancelAnimationFrame(_optChainAnimFrame);
+        _optChainAnimFrame = requestAnimationFrame(function () {
+            _optimizeOptionChainAndWallsCore();
         });
     }
 
-    // ── Live Fragment Polling (HTTP Hot-Reload) ──
+    function _optimizeOptionChainAndWallsCore() {
+        var chainTab = document.getElementById('tab-chain');
+        if (!chainTab) return;
+
+        // Move #gex-rebalance-card to bottom only if not already last
+        var rebCard = chainTab.querySelector('#gex-rebalance-card');
+        if (rebCard && rebCard !== chainTab.lastElementChild) {
+            chainTab.appendChild(rebCard);
+        }
+
+        // Clean up legacy runway if present
+        var existingRunway = chainTab.querySelector('.gex-corridor-runway-bar');
+        if (existingRunway) existingRunway.remove();
+
+        var table = chainTab.querySelector('#master-chain-table') || chainTab.querySelector('table.data-table');
+        if (!table) return;
+        var rows = table.querySelectorAll('tbody tr');
+        if (!rows || rows.length === 0) return;
+
+        // Compute Max OI for depth bars
+        var maxCeOi = 1, maxPeOi = 1;
+        for (var i = 0; i < rows.length; i++) {
+            var tds = rows[i].children;
+            if (tds.length >= 5) {
+                var ceVal = parseFloat(tds[0].textContent.replace(/,/g, '')) || 0;
+                var peVal = parseFloat(tds[tds.length - 1].textContent.replace(/,/g, '')) || 0;
+                if (ceVal > maxCeOi) maxCeOi = ceVal;
+                if (peVal > maxPeOi) maxPeOi = peVal;
+            }
+        }
+
+        for (var j = 0; j < rows.length; j++) {
+            var r = rows[j];
+            var tds = r.children;
+            if (tds.length < 5) continue;
+            var ceTd = tds[0];
+            var peTd = tds[tds.length - 1];
+            if (ceTd && maxCeOi > 0) {
+                var ceOi = parseFloat(ceTd.textContent.replace(/,/g, '')) || 0;
+                var cePct = Math.min(100, Math.round((ceOi / maxCeOi) * 100));
+                ceTd.style.background = 'linear-gradient(270deg, rgba(255, 51, 102, 0.22) ' + cePct + '%, transparent ' + cePct + '%)';
+            }
+            if (peTd && maxPeOi > 0) {
+                var peOi = parseFloat(peTd.textContent.replace(/,/g, '')) || 0;
+                var pePct = Math.min(100, Math.round((peOi / maxPeOi) * 100));
+                peTd.style.background = 'linear-gradient(90deg, rgba(0, 230, 118, 0.22) ' + pePct + '%, transparent ' + pePct + '%)';
+            }
+        }
+    }
+
+    // ── Row-Level DOM Diffing (Zero Layout Collapse, Zero Scroll Reset) ──
+    function diffRowsInPlace(srcTbody, dstTbody) {
+        if (!srcTbody || !dstTbody) return;
+        var srcRows = srcTbody.children;
+        var dstRows = dstTbody.children;
+        if (srcRows.length === dstRows.length && srcRows.length > 0) {
+            for (var i = 0; i < srcRows.length; i++) {
+                var s = srcRows[i];
+                var d = dstRows[i];
+                if (s.className !== d.className) d.className = s.className;
+                if (s.getAttribute('style') !== d.getAttribute('style')) {
+                    d.setAttribute('style', s.getAttribute('style'));
+                }
+                if (s.getAttribute('data-strike') !== d.getAttribute('data-strike')) {
+                    d.setAttribute('data-strike', s.getAttribute('data-strike'));
+                }
+                if (s.id !== d.id) d.id = s.id;
+                if (s.innerHTML !== d.innerHTML) {
+                    d.innerHTML = s.innerHTML;
+                }
+            }
+        } else {
+            dstTbody.innerHTML = srcTbody.innerHTML;
+        }
+    }
+
+    // ── Resilient Plotly Engine (Zero Layout Collapse, Zero DOM Destruction) ──
+    window._pendingPlotlyScripts = window._pendingPlotlyScripts || {};
+    window._tabPlotlyInitialized = window._tabPlotlyInitialized || {};
+
+    function updatePlotlyScriptFromFrag(frag, tabName) {
+        if (!frag) return;
+        var scripts = frag.querySelectorAll('script');
+        var isTabVisible = (activeTab === tabName);
+
+        scripts.forEach(function (s) {
+            var text = s.textContent || s.innerText || '';
+            if (text.indexOf('Plotly.newPlot') === -1 && text.indexOf('Plotly.react') === -1) return;
+
+            var m = text.match(/document\.getElementById\(["']([^"']+)["']\)/);
+            var divId = m ? m[1] : null;
+            if (!divId) {
+                var m2 = text.match(/Plotly\.(?:newPlot|react)\(\s*["']([^"']+)["']/);
+                if (m2) divId = m2[1];
+            }
+            if (!divId) return;
+
+            if (isTabVisible && document.getElementById(divId) && typeof window.Plotly !== 'undefined') {
+                try {
+                    (new Function(text))();
+                    var el = document.getElementById(divId);
+                    if (el && typeof window.Plotly.Plots.resize === 'function') {
+                        try { window.Plotly.Plots.resize(el); } catch (e) {}
+                    }
+                } catch (err) {
+                    console.warn('Plotly render error for ' + divId + ':', err);
+                }
+            } else {
+                window._pendingPlotlyScripts[divId] = text;
+            }
+        });
+    }
+
+    function executePendingPlotlyForTab(tabName) {
+        if (typeof window.Plotly === 'undefined') {
+            setTimeout(function () { executePendingPlotlyForTab(tabName); }, 150);
+            return;
+        }
+
+        var targets = [];
+        if (tabName === 'chain') targets = ['gex-distribution-chart', 'oi-velocity-chart'];
+        else if (tabName === 'regime') targets = ['vol-history-evolution-plot'];
+        else if (tabName === 'theta') targets = ['theta-plotly-bleed', 'theta-plotly-gamma'];
+        else if (tabName === 'iv') targets = ['iv-smile-plot', 'iv-surface-3d-plot'];
+        else if (tabName === 'builder') targets = ['sb-payoff-chart', 'payoff-chart'];
+
+        targets.forEach(function (id) {
+            var script = window._pendingPlotlyScripts[id];
+            if (script && document.getElementById(id)) {
+                try {
+                    (new Function(script))();
+                    delete window._pendingPlotlyScripts[id];
+                } catch (e) {
+                    console.warn('Pending Plotly render error for ' + id + ':', e);
+                }
+            }
+            var el = document.getElementById(id);
+            if (el && window.Plotly && typeof window.Plotly.Plots.resize === 'function') {
+                try { window.Plotly.Plots.resize(el); } catch (e) {}
+            }
+        });
+    }
+
+    function initInitialTabPlotly(tabName) {
+        if (window._tabPlotlyInitialized[tabName]) return;
+        var tab = document.getElementById('tab-' + tabName);
+        if (!tab) return;
+        if (typeof window.Plotly === 'undefined') {
+            setTimeout(function () { initInitialTabPlotly(tabName); }, 100);
+            return;
+        }
+        window._tabPlotlyInitialized[tabName] = true;
+        var scripts = tab.querySelectorAll('script');
+        scripts.forEach(function (s) {
+            var text = s.textContent || s.innerText || '';
+            if (text.indexOf('Plotly.newPlot') !== -1) {
+                try {
+                    (new Function(text))();
+                } catch (e) {
+                    console.warn('Initial Plotly run error for tab ' + tabName + ':', e);
+                }
+            }
+        });
+    }
+
+    // ── Surgical In-Place Tab Updaters (Zero Jitter / Zero Height Collapse) ──
+    function updateMMTabInPlace(dest, frag) {
+        var existingContainer = dest.querySelector('#dealer-inventory-container');
+        if (!existingContainer) {
+            dest.innerHTML = frag.innerHTML;
+            executeScripts(dest);
+            var cont = dest.querySelector('#dealer-inventory-container');
+            if (cont) {
+                centerTableOnATM(cont, '#mm-row-atm');
+                cont.addEventListener('scroll', function () {
+                    cont.setAttribute('data-has-scrolled', 'true');
+                }, { passive: true });
+            }
+            return;
+        }
+
+        // 1. Metric text & badge in-place updates
+        var mmMetricIds = [
+            'dealer-regime-badge', 'dealer-gex-val', 'dealer-regime-desc',
+            'dealer-dex-badge', 'dealer-dex-val', 'dealer-dex-desc',
+            'dealer-hedge-badge', 'dealer-hedge-val', 'dealer-hedge-desc',
+            'dealer-pain-val', 'dealer-pain-dist',
+            'dealer-upper-barrier', 'dealer-lower-barrier', 'dealer-tactical-text'
+        ];
+        mmMetricIds.forEach(function (id) {
+            var src = frag.querySelector('#' + id);
+            var dst = dest.querySelector('#' + id);
+            if (src && dst) {
+                if (src.innerHTML !== dst.innerHTML) dst.innerHTML = src.innerHTML;
+                if (src.style && src.style.cssText && src.style.cssText !== dst.style.cssText) {
+                    dst.style.cssText = src.style.cssText;
+                }
+            }
+        });
+
+        // 2. Card border accents
+        ['dealer-regime-card', 'dealer-dex-card', 'dealer-hedge-card', 'dealer-pain-card'].forEach(function (id) {
+            var src = frag.querySelector('#' + id);
+            var dst = dest.querySelector('#' + id);
+            if (src && dst && src.style && src.style.borderTop && dst.style.borderTop !== src.style.borderTop) {
+                dst.style.borderTop = src.style.borderTop;
+            }
+        });
+
+        // 3. Update table body in-place (ZERO DOM destruction, ZERO scroll bounce)
+        var srcTbody = frag.querySelector('#dealer-inventory-tbody');
+        var dstTbody = dest.querySelector('#dealer-inventory-tbody');
+        if (srcTbody && dstTbody && existingContainer) {
+            var curScroll = existingContainer.scrollTop;
+            var hasScrolled = existingContainer.getAttribute('data-has-scrolled') === 'true';
+            diffRowsInPlace(srcTbody, dstTbody);
+            if (hasScrolled) {
+                existingContainer.scrollTop = curScroll;
+            } else {
+                centerTableOnATM(existingContainer, '#mm-row-atm');
+            }
+        }
+    }
+
+    function updateThetaTabInPlace(dest, frag) {
+        var existingContainer = dest.querySelector('#theta-table-container');
+        if (!existingContainer) {
+            dest.innerHTML = frag.innerHTML;
+            executeScripts(dest);
+            var cont = dest.querySelector('#theta-table-container');
+            if (cont) {
+                centerTableOnATM(cont, '#th-row-atm');
+                cont.addEventListener('scroll', function () {
+                    cont.setAttribute('data-has-scrolled', 'true');
+                }, { passive: true });
+            }
+            return;
+        }
+
+        // 1. Cockpit cards update (Layer 1)
+        var thetaCardIds = [
+            'card-strad-day', 'card-strad-hour', 'card-strad-pts',
+            'card-asym-verdict', 'card-asym-diff', 'card-cushion-pts'
+        ];
+        thetaCardIds.forEach(function (id) {
+            var src = frag.querySelector('#' + id);
+            var dst = dest.querySelector('#' + id);
+            if (src && dst) {
+                if (src.innerHTML !== dst.innerHTML) dst.innerHTML = src.innerHTML;
+                if (src.style && src.style.cssText && src.style.cssText !== dst.style.cssText) {
+                    dst.style.cssText = src.style.cssText;
+                }
+            }
+        });
+
+        var srcCardsGrid = frag.querySelector('div[style*="grid-template-columns: repeat(3, 1fr)"]');
+        var dstCardsGrid = dest.querySelector('div[style*="grid-template-columns: repeat(3, 1fr)"]');
+        if (srcCardsGrid && dstCardsGrid && srcCardsGrid.innerHTML !== dstCardsGrid.innerHTML) {
+            dstCardsGrid.innerHTML = srcCardsGrid.innerHTML;
+        }
+
+        // 2. Plotly charts update in-place (ZERO DOM destruction, ZERO flashing)
+        updatePlotlyScriptFromFrag(frag, 'theta');
+
+        // 3. Update table header & body in-place (Layer 3) (ZERO DOM destruction, ZERO scroll bounce)
+        var srcThead = frag.querySelector('#theta-decay-table thead');
+        var dstThead = dest.querySelector('#theta-decay-table thead');
+        if (srcThead && dstThead && srcThead.innerHTML !== dstThead.innerHTML) {
+            dstThead.innerHTML = srcThead.innerHTML;
+        }
+
+        var srcTbody = frag.querySelector('#theta-decay-tbody');
+        var dstTbody = dest.querySelector('#theta-decay-tbody');
+        if (srcTbody && dstTbody && existingContainer) {
+            var curScroll = existingContainer.scrollTop;
+            var hasScrolled = existingContainer.getAttribute('data-has-scrolled') === 'true';
+            diffRowsInPlace(srcTbody, dstTbody);
+            if (hasScrolled) {
+                existingContainer.scrollTop = curScroll;
+            } else {
+                centerTableOnATM(existingContainer, '#th-row-atm');
+            }
+        }
+    }
+
+    // ── Option Chain In-Place Updater (ZERO DOM Destruction, Zero Jump) ──
+    function updateChainTabInPlace(dest, frag) {
+        var existingContainer = dest.querySelector('#master-chain-container') ||
+            (dest.querySelector('#master-chain-table') ? dest.querySelector('#master-chain-table').parentElement : null);
+
+        if (!existingContainer) {
+            dest.innerHTML = frag.innerHTML;
+            executeScripts(dest);
+            var cont = dest.querySelector('#master-chain-container') ||
+                (dest.querySelector('#master-chain-table') ? dest.querySelector('#master-chain-table').parentElement : null);
+            if (cont) {
+                if (!cont.id) cont.id = 'master-chain-container';
+                centerTableOnATM(cont, '#row-atm');
+                cont.addEventListener('scroll', function () {
+                    cont.setAttribute('data-has-scrolled', 'true');
+                }, { passive: true });
+            }
+            return;
+        }
+
+        if (!existingContainer.id) existingContainer.id = 'master-chain-container';
+        if (!existingContainer.getAttribute('data-scroll-listener')) {
+            existingContainer.setAttribute('data-scroll-listener', 'true');
+            existingContainer.addEventListener('scroll', function () {
+                existingContainer.setAttribute('data-has-scrolled', 'true');
+            }, { passive: true });
+        }
+
+        // 1. Lock and record exact scroll position
+        var curScroll = existingContainer.scrollTop;
+        var hasScrolled = existingContainer.getAttribute('data-has-scrolled') === 'true';
+
+        // 2. Update Key Metrics & Sell Zones Card (First card in tab)
+        var srcMetrics = frag.querySelector('.card');
+        var dstMetrics = dest.querySelector('.card');
+        if (srcMetrics && dstMetrics) {
+            if (srcMetrics.innerHTML !== dstMetrics.innerHTML) {
+                dstMetrics.innerHTML = srcMetrics.innerHTML;
+            }
+        }
+
+        // 3. Update Master Option Chain Rows In-Place
+        var srcTbody = frag.querySelector('#master-chain-tbody') || frag.querySelector('#master-chain-table tbody');
+        var dstTbody = dest.querySelector('#master-chain-tbody') || dest.querySelector('#master-chain-table tbody');
+        if (srcTbody && dstTbody) {
+            if (!dstTbody.id) dstTbody.id = 'master-chain-tbody';
+            diffRowsInPlace(srcTbody, dstTbody);
+            if (hasScrolled) {
+                existingContainer.scrollTop = curScroll;
+            } else {
+                centerTableOnATM(existingContainer, '#row-atm');
+            }
+        }
+
+        // 4. Update GEX Dynamic text if present without touching chart or radars
+        var srcGexDyn = frag.querySelector('div[style*="font-size:13px;font-weight:900;letter-spacing:1.5px;color:#00e5ff;"]');
+        if (srcGexDyn && srcGexDyn.parentElement) {
+            var srcParentCard = srcGexDyn.closest('.card');
+            var dstGexDyn = dest.querySelector('div[style*="font-size:13px;font-weight:900;letter-spacing:1.5px;color:#00e5ff;"]');
+            var dstParentCard = dstGexDyn ? dstGexDyn.closest('.card') : null;
+            if (srcParentCard && dstParentCard) {
+                var srcPanels = srcParentCard.querySelectorAll('.metric-box, .metric-val');
+                var dstPanels = dstParentCard.querySelectorAll('.metric-box, .metric-val');
+                if (srcPanels.length === dstPanels.length) {
+                    for (var p = 0; p < srcPanels.length; p++) {
+                        if (srcPanels[p].innerHTML !== dstPanels[p].innerHTML) {
+                            dstPanels[p].innerHTML = srcPanels[p].innerHTML;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Update GEX Distribution Bar Chart in-place
+        updatePlotlyScriptFromFrag(frag, 'chain');
+
+        // 6. Ensure scroll listener
+        if (!existingContainer.hasAttribute('data-bound')) {
+            existingContainer.setAttribute('data-bound', 'true');
+            existingContainer.addEventListener('scroll', function () {
+                existingContainer.setAttribute('data-has-scrolled', 'true');
+            }, { passive: true });
+        }
+    }
+
+    // ── Regime Tab In-Place Updater (Zero Layout Shift) ──
+    function updateRegimeTabInPlace(dest, frag) {
+        if (!dest || !frag) return;
+        if (!dest.firstElementChild) {
+            dest.innerHTML = frag.innerHTML;
+            executeScripts(dest);
+            return;
+        }
+        var srcCards = frag.querySelectorAll('.card');
+        var dstCards = dest.querySelectorAll('.card');
+        if (srcCards.length === dstCards.length && srcCards.length > 0) {
+            for (var i = 0; i < srcCards.length; i++) {
+                // Card containing Plotly chart: update header/text only, do not wipe out canvas!
+                if (dstCards[i].querySelector('#vol-history-evolution-plot')) {
+                    var srcHeader = srcCards[i].firstElementChild;
+                    var dstHeader = dstCards[i].firstElementChild;
+                    if (srcHeader && dstHeader && srcHeader.innerHTML !== dstHeader.innerHTML) {
+                        dstHeader.innerHTML = srcHeader.innerHTML;
+                    }
+                    continue;
+                }
+                if (srcCards[i].innerHTML !== dstCards[i].innerHTML) {
+                    dstCards[i].innerHTML = srcCards[i].innerHTML;
+                }
+            }
+        } else {
+            dest.innerHTML = frag.innerHTML;
+            executeScripts(dest);
+        }
+
+        // Update Plotly historical chart in-place
+        updatePlotlyScriptFromFrag(frag, 'regime');
+    }
+
+    // ── Live Fragment Polling (High-Speed Tab Targeted & Gzip Accelerated) ──
     var _refreshInFlight = false;
-    function refreshContent() {
+    var _lastEtag = '';
+    var _refreshTick = 0;
+
+    function refreshContent(forceActiveOnly) {
         if (_refreshInFlight) return;
         _refreshInFlight = true;
-        fetch('/fragment?t=' + Date.now())
+
+        _refreshTick++;
+        // Request activeTab for 95%+ payload reduction;
+        // every 10th refresh sync full fragment across all background tabs.
+        var targetTab = (forceActiveOnly || _refreshTick % 10 !== 0) ? (activeTab || 'chain') : '';
+        var url = '/fragment?t=' + Date.now();
+        if (targetTab) {
+            url += '&tab=' + encodeURIComponent(targetTab);
+        }
+
+        var headers = {};
+        if (_lastEtag) {
+            headers['If-None-Match'] = _lastEtag;
+        }
+
+        fetch(url, { headers: headers })
             .then(function (res) {
+                if (res.status === 304) {
+                    return null; // Zero changes, skip DOM work
+                }
                 if (!res.ok) throw new Error('Fragment fetch failed with status ' + res.status);
+                var etag = res.headers.get('ETag');
+                if (etag) _lastEtag = etag;
                 return res.text();
             })
             .then(function (html) {
@@ -267,86 +655,55 @@
                 var parser = new DOMParser();
                 var doc = parser.parseFromString(html, 'text/html');
 
-                var tabNames = ['regime', 'iv', 'vol', 'chain', 'theta', 'prob', 'mm'];
+                var tabNames = ['chain', 'regime', 'mm', 'theta', 'iv', 'builder'];
                 tabNames.forEach(function (t) {
                     try {
                         var frag = doc.getElementById('frag-' + t);
                         var dest = document.getElementById('tab-' + t);
-                        if (frag && dest) {
-                            // 1. Interactive Card Preservation for chain tab
-                            var liveOiCard = null;
-                            var liveGexCard = null;
-                            if (t === 'chain') {
-                                liveOiCard = dest.querySelector('#oi-velocity-card');
-                                liveGexCard = dest.querySelector('#gex-rebalance-card');
-                                // Remove static templates from incoming frag
-                                var fragOi = frag.querySelector('#oi-velocity-card');
-                                if (fragOi) fragOi.remove();
-                                var fragGex = frag.querySelector('#gex-rebalance-card');
-                                if (fragGex) fragGex.remove();
-                                // Detach live elements so they aren't destroyed
-                                if (liveOiCard && liveOiCard.parentNode) liveOiCard.parentNode.removeChild(liveOiCard);
-                                if (liveGexCard && liveGexCard.parentNode) liveGexCard.parentNode.removeChild(liveGexCard);
-                            }
+                        if (!frag || !dest) return;
 
-                            // 2. Interactive Card Preservation for mm tab
-                            var liveGeCard = null;
-                            if (t === 'mm') {
-                                liveGeCard = dest.querySelector('#ge-terminal-card');
-                                var fragGe = frag.querySelector('#ge-terminal-card');
-                                if (fragGe) fragGe.remove();
-                                if (liveGeCard && liveGeCard.parentNode) liveGeCard.parentNode.removeChild(liveGeCard);
-                            }
-
-                            // 3. Interactive Card Preservation for iv tab
-                            var liveIvCard = null;
-                            if (t === 'iv') {
-                                liveIvCard = dest.querySelector('#iv-surface-card');
-                                var fragIv = frag.querySelector('#iv-surface-card');
-                                if (fragIv) fragIv.remove();
-                                if (liveIvCard && liveIvCard.parentNode) liveIvCard.parentNode.removeChild(liveIvCard);
-                            }
-
-                            // 4. Preserve active capital and strike inputs
-                            var oldCap = dest.querySelector('#sz-capital-input');
-                            var activeCapVal = (oldCap && document.activeElement === oldCap) ? oldCap.value : null;
-                            var oldThStrike = (dest.querySelector('#sel-th-strike') || {}).value;
-
-                            dest.innerHTML = frag.innerHTML;
-
-                            // Re-append live interactive cards (charts & listeners intact!)
-                            if (liveOiCard) dest.appendChild(liveOiCard);
-                            if (liveGexCard) dest.appendChild(liveGexCard);
-                            if (liveGeCard) dest.appendChild(liveGeCard);
-                            if (liveIvCard) dest.appendChild(liveIvCard);
-
-                            if (activeCapVal !== null) {
-                                var newCap = dest.querySelector('#sz-capital-input');
-                                if (newCap) {
-                                    newCap.value = activeCapVal;
-                                    newCap.focus();
-                                }
-                            }
-                            if (oldThStrike) {
-                                var newThStrike = dest.querySelector('#sel-th-strike');
-                                if (newThStrike) newThStrike.value = oldThStrike;
-                            }
-
-                            executeScripts(dest);
+                        // Surgical in-place tab updates
+                        if (t === 'chain') {
+                            updateChainTabInPlace(dest, frag);
+                            return;
                         }
+                        if (t === 'regime') {
+                            updateRegimeTabInPlace(dest, frag);
+                            return;
+                        }
+                        if (t === 'mm') {
+                            updateMMTabInPlace(dest, frag);
+                            return;
+                        }
+                        if (t === 'theta') {
+                            updateThetaTabInPlace(dest, frag);
+                            return;
+                        }
+
+                        // Preserved fallback for other tabs
+                        if (t === 'iv' || t === 'builder') {
+                            // Client-side terminals: do NOT overwrite mounted interactive DOM with static shell
+                            if (!dest.firstElementChild || dest.children.length === 0) {
+                                dest.innerHTML = frag.innerHTML;
+                                executeScripts(dest);
+                            }
+                            return;
+                        }
+
+                        dest.innerHTML = frag.innerHTML;
+                        executeScripts(dest);
                     } catch (tabErr) {
                         console.warn('Error updating tab ' + t + ':', tabErr);
                     }
                 });
 
-                // Re-apply preserved chain mode (All / Seller / GEX)
+                // Re-apply preserved chain mode
                 if (typeof window.setChainMode === 'function' && window._currentChainMode) {
                     window.setChainMode(window._currentChainMode);
                 }
 
-                // Enforce instant visual optimizations on chain and mm tabs
+                // Visual optimizations
                 optimizeOptionChainAndWalls();
-                cleanupMMTab();
 
                 // Update Spot Pill & Verdict
                 var spotFrag = doc.getElementById('frag-spot');
@@ -360,34 +717,31 @@
                         updateGexChartSpot(spotVal);
                     }
 
-                    // Always update time display with latest refresh timestamp
                     var timeEl = document.getElementById('time-display');
                     if (timeEl && timeVal) {
                         var isWs = (ws && ws.readyState === WebSocket.OPEN);
-                        timeEl.innerHTML = '&#128339; ' + timeVal + (isWs ? ' &nbsp;|&nbsp; Live' : ' &nbsp;|&nbsp; Auto-Refreshed');
+                        timeEl.innerHTML = '&#128339; ' + timeVal + (isWs ? ' &nbsp;|&nbsp; Live WS' : ' &nbsp;|&nbsp; Polled');
                     }
-
-                    // Verdict pill removed
                 }
 
-                // Visual flash on status badge to confirm live update
                 var badge = document.getElementById('ws-status-badge');
                 if (badge) {
                     badge.style.opacity = '0.35';
                     setTimeout(function () { badge.style.opacity = '1'; }, 300);
                 }
 
-                // Re-apply filters and simulation after DOM injection
                 try {
                     if (typeof window.applyThetaFilters === 'function') window.applyThetaFilters();
                     if (typeof window.updateThetaSim === 'function') window.updateThetaSim();
-                    if (window.GammaExplosionTerminal && typeof window.GammaExplosionTerminal.refresh === 'function') {
+                    if (activeTab === 'mm' && window.GammaExplosionTerminal && typeof window.GammaExplosionTerminal.refresh === 'function') {
                         window.GammaExplosionTerminal.refresh();
                     }
                     if (window.GexRebalanceRadar && typeof window.GexRebalanceRadar.refresh === 'function') {
                         window.GexRebalanceRadar.refresh();
                     }
-                    // Scrub any lingering institutional/NSE text and re-apply live GEX state
+                    if (window.IgnitionScanner && typeof window.IgnitionScanner.refresh === 'function') {
+                        window.IgnitionScanner.refresh();
+                    }
                     scrubInstitutionalAndNseText();
                     if (window._lastGexData) updateGexUI(window._lastGexData);
                     if (window._lastDealerData) updateDealerUI(window._lastDealerData);
@@ -396,7 +750,7 @@
                 }
             })
             .catch(function (err) {
-                console.warn('Fragment refresh error (retrying):', err);
+                console.warn('Fragment refresh error:', err);
             })
             .finally(function () {
                 _refreshInFlight = false;
@@ -495,6 +849,10 @@
 
                     if (msg.type === 'gex_rebalance_update' && window.GexRebalanceRadar) {
                         window.GexRebalanceRadar.handleWsMessage(msg);
+                    }
+
+                    if (msg.type === 'ignition_update' && window.IgnitionScanner) {
+                        window.IgnitionScanner.handleWsMessage(msg);
                     }
 
                     if (msg.type === 'oi_velocity_update' && window.OiVelocityRadar) {
@@ -823,6 +1181,10 @@
     }
 
     function pollGexAndDealer() {
+        // If WebSocket is active and has populated data, skip HTTP poll to save bandwidth
+        if (ws && ws.readyState === WebSocket.OPEN && window._lastGexData && window._lastDealerData) {
+            return;
+        }
         Promise.all([
             fetch('/api/gex?t=' + Date.now()).then(function (r) { return r.ok ? r.json() : null; }),
             fetch('/api/dealer?t=' + Date.now()).then(function (r) { return r.ok ? r.json() : null; })
@@ -851,6 +1213,10 @@
             } catch (e) {}
         }
         switchTab(initialTab);
+        setTimeout(function () {
+            centerTableOnATM('dealer-inventory-container', '#mm-row-atm');
+            centerTableOnATM('theta-table-container', '#th-row-atm');
+        }, 300);
         optimizeOptionChainAndWalls();
         cleanupMMTab();
         scrubInstitutionalAndNseText();
@@ -883,8 +1249,8 @@
         // Start WebSocket and Periodic Pollers (High-Speed Low-Latency Mode)
         initWebSocket();
         refreshContent();
-        setInterval(refreshContent, 1500);
-        setInterval(pollGexAndDealer, 1500);
+        setInterval(refreshContent, 2500);
+        setInterval(pollGexAndDealer, 5000);
         pollGexAndDealer();
     });
 

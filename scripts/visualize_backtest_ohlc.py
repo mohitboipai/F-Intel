@@ -52,7 +52,7 @@ try:
     from FyersAuth import FyersAuthenticator
     
     from fyers_auth_manager import get_fyers_instance
-        fyers = get_fyers_instance()
+    fyers = get_fyers_instance()
     
     hist_data = {
         "symbol": "NSE:NIFTY50-INDEX",

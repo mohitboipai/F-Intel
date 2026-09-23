@@ -42,11 +42,12 @@ class DealerHedgingSimulator:
         # Spot Shift
         sim_spot = base_spot * (1.0 + (spot_shift_pct / 100.0))
         
-        # IV Shift (Absolute, floored at 1% to prevent negative/zero IV crashes)
+        # IV Shift (supports both decimal 0.15 and percentage 15.0 dataframes)
         if 'iv' in sim_df.columns:
-            # Assume base IV was provided in decimals, e.g., 0.15
-            # We add absolute points. +0.02 means 15% -> 17%
-            sim_df['iv'] = np.maximum(sim_df['iv'] + iv_shift_abs, 0.01)
+            is_pct = (sim_df['iv'].dropna().median() > 2.0) if not sim_df['iv'].dropna().empty else False
+            effective_shift = iv_shift_abs * 100.0 if (is_pct and abs(iv_shift_abs) < 1.0) else iv_shift_abs
+            min_floor = 1.0 if is_pct else 0.01
+            sim_df['iv'] = np.maximum(sim_df['iv'] + effective_shift, min_floor)
             
         # DTE Decay (floored strictly above 0)
         if 'dte' in sim_df.columns:

@@ -20,10 +20,16 @@ from plotly.subplots import make_subplots
 
 
 # ──────────────────────────────────────────────────────────────
-# Constants
+# Constants — sourced from config.py (single source of truth)
 # ──────────────────────────────────────────────────────────────
-NIFTY_LOT = 75          # NIFTY lot size
-RISK_FREE  = 0.07       # 7% risk-free rate (India)
+try:
+    import config as _cfg
+    NIFTY_LOT  = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE  = float(_cfg.get("risk_free_rate", 0.051274))
+except Exception:
+    NIFTY_LOT  = 65           # NSE revised Aug 2024
+    RISK_FREE  = 0.051274     # ln(1.0526) — RBI 91-day T-bill Sep 2026
+
 
 DARK_BG  = '#0f0f19'
 CARD_BG  = '#1a1a2e'
@@ -467,8 +473,17 @@ class SmartStrategyGenerator:
     def _find_atm(self) -> float:
         if self.chain is None or self.chain.empty:
             return StrategyBuilder._round50(self.spot)
-        strikes = self.chain['strike'].unique()
-        return float(min(strikes, key=lambda x: abs(x - self.spot)))
+        strikes: list[float] = [float(s) for s in self.chain['strike'].tolist()]
+        if not strikes:
+            return StrategyBuilder._round50(self.spot)
+        best_strike = strikes[0]
+        min_diff = abs(best_strike - float(self.spot))
+        for s in strikes[1:]:
+            diff = abs(s - float(self.spot))
+            if diff < min_diff:
+                min_diff = diff
+                best_strike = s
+        return float(best_strike)
 
     def generate(self) -> List[Strategy]:
         strats = []

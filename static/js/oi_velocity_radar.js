@@ -324,6 +324,12 @@
     }
 
     async function refreshLive() {
+        if (_pendingChartData) {
+            var chartDiv = document.getElementById('oi-velocity-chart');
+            if (chartDiv && chartDiv.offsetParent !== null) {
+                renderPlotlyChart(_pendingChartData);
+            }
+        }
         var data = await fetchVelocityData(_currentTimeframe, _rewindTs, _currentStrikeRange);
         if (data && data.ok) {
             renderAll(data);
@@ -588,20 +594,29 @@
         }
     }
 
+    var _pendingChartData = null;
+
     // ── Bidirectional Plotly Tornado Chart ──────────────────────────────────
     function renderPlotlyChart(data) {
         var chartDiv = document.getElementById('oi-velocity-chart');
         if (!chartDiv || !window.Plotly) return;
 
-        var strikesData = data.strikes || [];
-        var liveStrikesData = data.comparison_live_strikes || null;
-        var spot = parseFloat(data.spot || 0);
+        var strikesData = (data && data.strikes) ? data.strikes : [];
+        var liveStrikesData = (data && data.comparison_live_strikes) ? data.comparison_live_strikes : null;
+        var spot = parseFloat((data && data.spot) || 0);
 
         if (!strikesData.length) {
             Plotly.purge(chartDiv);
             chartDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;min-height:300px;color:#64748b;font-size:13px;">Accumulating OI ticks for rate of change calculation...</div>';
             return;
         }
+
+        // Defer rendering if container is hidden to prevent 0x0 collapsed layout
+        if (chartDiv.offsetParent === null) {
+            _pendingChartData = data;
+            return;
+        }
+        _pendingChartData = null;
 
         // Sort strikes ascending
         strikesData.sort(function (a, b) { return a.strike - b.strike; });

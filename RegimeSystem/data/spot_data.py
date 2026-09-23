@@ -2,7 +2,9 @@ import os
 import sys
 import datetime
 import pandas as pd
+import numpy as np
 import time
+from typing import Any
 
 # Add root directory to path to find FyersAuth
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -16,13 +18,13 @@ class SpotDataManager:
     def __init__(self, symbol="NSE:NIFTY50-INDEX", timeframe="D"):
         self.symbol = symbol
         self.timeframe = timeframe # "D" for Daily, "1" for 1-minute
-        self.fyers = None
+        self.fyers: Any = None
         self.authenticate()
 
     def authenticate(self):
         try:
             from fyers_auth_manager import get_fyers_instance
-        self.fyers = get_fyers_instance()
+            self.fyers = get_fyers_instance()
             print("[SpotData] Authentication Successful.")
         except Exception as e:
             print(f"[SpotData] Auth Failed: {e}")
@@ -51,12 +53,16 @@ class SpotDataManager:
                 "range_to": current_end.strftime("%Y-%m-%d"), 
                 "cont_flag": "1"
             }
+            if not self.fyers:
+                print("  > Fyers client not initialized, skipping fetch")
+                break
+
             try:
                 r = self.fyers.history(data=p)
-                if r.get('s') == 'ok':
-                    candles = r['candles']
+                if r and r.get('s') == 'ok':
+                    candles = r.get('candles', [])
                     # Check if date is strictly greater to avoid duplicates at boundary
-                    if all_candles:
+                    if all_candles and candles:
                         last_ts = all_candles[-1][0]
                         candles = [c for c in candles if c[0] > last_ts]
                     
@@ -65,7 +71,7 @@ class SpotDataManager:
                 else:
                     print(f"  > Error fetching {current_start.date()}: {r}")
             except Exception as e:
-                 print(f"  > Exception: {e}")
+                print(f"  > Exception: {e}")
             
             current_start = current_end
             time.sleep(0.1)
@@ -79,11 +85,11 @@ class SpotDataManager:
         # Convert Timestamp
         # Fyers Daily timestamp usually 00:00 UTC or IST?
         # Usually it's epoch.
-        df['datetime'] = pd.to_datetime(df['ts'], unit='s').dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+        df['datetime'] = pd.DatetimeIndex(pd.to_datetime(df['ts'], unit='s')).tz_localize('UTC').tz_convert('Asia/Kolkata')
         df = df.set_index('datetime').sort_index()
         
         # Clean
-        df = df[~df.index.duplicated(keep='first')]
+        df = df.loc[np.logical_not(df.index.duplicated(keep='first'))]
         print(f"[SpotData] Loaded {len(df)} candles.")
         return df[['open', 'high', 'low', 'close', 'volume']]
 

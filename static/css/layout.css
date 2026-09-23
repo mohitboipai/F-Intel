@@ -131,7 +131,7 @@
     color: #00e5ff;
     border-bottom-color: #00e5ff;
     background: transparent;
-    text-shadow: 0 0 10px rgba(0, 229, 255, 0.35);
+    text-shadow: none;
 }
 
 /* ── Main Workspace ── */
@@ -143,16 +143,10 @@
 
 .tab-content {
     display: none;
-    animation: fadeInTab 150ms ease-out;
 }
 
 .tab-content.active {
     display: block;
-}
-
-@keyframes fadeInTab {
-    from { opacity: 0; transform: translateY(3px); }
-    to   { opacity: 1; transform: translateY(0); }
 }
 
 /* ── Metric Cards Grid ── */
@@ -476,3 +470,20 @@ select option {
     border-top: 1px solid var(--border-subtle);
     margin: 12px 0;
 }
+
+/* ── Table Containers: Zero-Jitter Scroll Stabilization ── */
+#master-chain-container,
+#dealer-inventory-container,
+#theta-table-container {
+    scrollbar-gutter: stable;
+    contain: layout paint;
+    overscroll-behavior: contain;
+    will-change: scroll-position;
+}
+
+#master-chain-table,
+#dealer-inventory-table,
+#theta-table {
+    border-collapse: collapse;
+}
+

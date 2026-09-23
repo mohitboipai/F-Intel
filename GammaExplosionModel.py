@@ -32,7 +32,11 @@ from OptionAnalytics import OptionAnalytics
 
 class GammaExplosionModel:
 
-    LOT_SIZE = 75  # NIFTY lot size
+    try:
+        import config as _cfg
+        LOT_SIZE = int(_cfg.get("nifty_lot_size", 65))
+    except Exception:
+        LOT_SIZE = 65  # NSE revised Aug 2024
 
     def __init__(self, fyers_instance=None):
         if fyers_instance:

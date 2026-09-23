@@ -15,6 +15,8 @@
     'use strict';
 
     let _lastData = null;
+    let _lastPOpt = null;
+    let _lastOOpt = null;
     let _pollTimer = null;
 
     async function fetchRadarData() {
@@ -37,42 +39,86 @@
         const statusEl = document.getElementById('gr-status-badge');
         const dirEl = document.getElementById('gr-direction-badge');
         const tierEl = document.getElementById('gr-tier-badge');
+        const archEl = document.getElementById('gr-archetype-badge');
         const descEl = document.getElementById('gr-desc');
         const actionEl = document.getElementById('gr-action-text');
         const tsEl = document.getElementById('gr-update-ts');
+
+        // Expected Move Range Badge (Big vs Small move forecast)
+        const moveEl = document.getElementById('gr-expected-move-badge');
+        if (moveEl) {
+            const expMove = data.expected_move;
+            if (expMove && expMove.tier_name) {
+                const minP = Math.round(expMove.expected_move_min_pts || 0);
+                const maxP = Math.round(expMove.expected_move_max_pts || 0);
+                const isBig = expMove.tier === 'TIER_3_BIG_MOVE';
+                const isSmall = expMove.tier === 'TIER_1_SMALL_MOVE';
+                if (isBig) {
+                    moveEl.textContent = `⚡ BIG MOVE (${minP} – ${maxP} pts)`;
+                    moveEl.style.color = '#f87171';
+                    moveEl.style.background = 'rgba(239, 68, 68, 0.15)';
+                    moveEl.style.borderColor = 'rgba(239, 68, 68, 0.35)';
+                } else if (isSmall) {
+                    moveEl.textContent = `🛡️ PIN / CHOP (${minP} – ${maxP} pts)`;
+                    moveEl.style.color = '#34d399';
+                    moveEl.style.background = 'rgba(16, 185, 129, 0.15)';
+                    moveEl.style.borderColor = 'rgba(16, 185, 129, 0.35)';
+                } else {
+                    moveEl.textContent = `EXP MOVE: ${minP} – ${maxP} pts`;
+                    moveEl.style.color = '#38bdf8';
+                    moveEl.style.background = '#171d30';
+                    moveEl.style.borderColor = '#232b45';
+                }
+                moveEl.style.display = 'inline-block';
+            } else {
+                moveEl.textContent = 'EXPECTED MOVE: 60 – 160 pts';
+                moveEl.style.color = '#94a3b8';
+                moveEl.style.display = 'inline-block';
+            }
+        }
+
+        // Setup Archetype Badge (0DTE Gamma Rocket vs Weekly Breakout vs Macro Expansion)
+        if (archEl) {
+            const arch = data.setup_archetype || '0DTE_GAMMA_ROCKET';
+            const archName = data.archetype_name || (arch === '0DTE_GAMMA_ROCKET' ? '0DTE Breakout' : arch === 'WEEKLY_MOMENTUM_BREAKOUT' ? 'Weekly Breakout' : 'Vol Expansion');
+            archEl.textContent = archName;
+            archEl.style.color = '#cbd5e1';
+            archEl.style.borderColor = '#232b45';
+            archEl.style.background = '#171d30';
+        }
 
         const status = data.status || 'MONITORING';
         if (statusEl) {
             statusEl.textContent = status.replace(/_/g, ' ');
             if (status === 'IGNITED') {
-                statusEl.style.background = 'rgba(0, 230, 118, 0.2)';
-                statusEl.style.color = '#00e676';
-                statusEl.style.borderColor = '#00e676';
-                statusEl.style.boxShadow = '0 0 12px rgba(0, 230, 118, 0.4)';
+                statusEl.style.background = 'rgba(16, 185, 129, 0.15)';
+                statusEl.style.color = '#10b981';
+                statusEl.style.borderColor = 'rgba(16, 185, 129, 0.35)';
+                statusEl.style.boxShadow = 'none';
             } else if (status === 'STAND_ASIDE') {
-                statusEl.style.background = 'rgba(255, 82, 82, 0.2)';
-                statusEl.style.color = '#ff5252';
-                statusEl.style.borderColor = '#ff5252';
-                statusEl.style.boxShadow = '0 0 10px rgba(255, 82, 82, 0.3)';
+                statusEl.style.background = 'rgba(239, 68, 68, 0.12)';
+                statusEl.style.color = '#ef4444';
+                statusEl.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+                statusEl.style.boxShadow = 'none';
             } else if (status === 'COILING' || status === 'ARMED') {
-                statusEl.style.background = 'rgba(255, 213, 79, 0.2)';
-                statusEl.style.color = '#ffd54f';
-                statusEl.style.borderColor = '#ffd54f';
+                statusEl.style.background = 'rgba(245, 158, 11, 0.12)';
+                statusEl.style.color = '#f59e0b';
+                statusEl.style.borderColor = 'rgba(245, 158, 11, 0.3)';
                 statusEl.style.boxShadow = 'none';
             } else if (status === 'REBALANCING') {
-                statusEl.style.background = 'rgba(0, 240, 255, 0.2)';
-                statusEl.style.color = '#00f0ff';
-                statusEl.style.borderColor = '#00f0ff';
-                statusEl.style.boxShadow = '0 0 10px rgba(0, 240, 255, 0.3)';
+                statusEl.style.background = 'rgba(56, 189, 248, 0.15)';
+                statusEl.style.color = '#38bdf8';
+                statusEl.style.borderColor = 'rgba(56, 189, 248, 0.35)';
+                statusEl.style.boxShadow = 'none';
             } else if (status === 'TARGET_REACHED') {
-                statusEl.style.background = 'rgba(16, 185, 129, 0.25)';
+                statusEl.style.background = 'rgba(16, 185, 129, 0.2)';
                 statusEl.style.color = '#10b981';
-                statusEl.style.borderColor = '#10b981';
-                statusEl.style.boxShadow = '0 0 15px rgba(16, 185, 129, 0.5)';
+                statusEl.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+                statusEl.style.boxShadow = 'none';
             } else {
-                statusEl.style.background = 'rgba(255, 255, 255, 0.08)';
+                statusEl.style.background = '#171d30';
                 statusEl.style.color = '#94a3b8';
-                statusEl.style.borderColor = '#334155';
+                statusEl.style.borderColor = '#232b45';
                 statusEl.style.boxShadow = 'none';
             }
         }
@@ -228,6 +274,29 @@
         if (tgtEl && data.rebalance_target) tgtEl.textContent = Number(data.rebalance_target).toLocaleString('en-IN', { maximumFractionDigits: 0 });
         if (fortEl && data.terminal_fortress) fortEl.textContent = Number(data.terminal_fortress).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
+        // 4b. Time Horizon, Holding Duration & Theta Decay Strip
+        const horizonEl = document.getElementById('gr-horizon-val');
+        const maxHoldEl = document.getElementById('gr-max-hold-val');
+        const timeStopEl = document.getElementById('gr-time-stop-val');
+        const thetaBurnEl = document.getElementById('gr-theta-burn-val');
+
+        if (horizonEl) {
+            horizonEl.textContent = data.recommended_horizon || '15 – 35 Mins';
+        }
+        if (maxHoldEl) {
+            if (data.max_hold_mins) {
+                maxHoldEl.textContent = `${data.max_hold_mins} Mins Max (Auto-Veto)`;
+            } else if (data.recommended_horizon) {
+                maxHoldEl.textContent = data.recommended_horizon;
+            }
+        }
+        if (timeStopEl) {
+            timeStopEl.textContent = data.hard_time_stop || 'Exit by 14:45 or 35m inactivity';
+        }
+        if (thetaBurnEl) {
+            thetaBurnEl.textContent = data.theta_decay_burn_15m || (data.primary_option && data.primary_option.theta_burn_15m_str) || '--';
+        }
+
         // 5. Runway Progress Bar
         const barStart = document.getElementById('gr-bar-start');
         const barRunway = document.getElementById('gr-bar-runway');
@@ -279,11 +348,13 @@
             if (pSl) pSl.textContent = '₹' + Number(slVal).toFixed(1);
             if (pSlPct) pSlPct.textContent = Number(slPctVal).toFixed(0) + '%';
             if (pRr) pRr.textContent = `R:R ${(pOpt.rr_ratio || 1.8).toFixed(1)} : 1`;
+            _lastPOpt = pOpt;
         }
 
         // 7. 0DTE OTM Gamma Rocket Option Card
         const oOpt = data.otm_gamma_rocket;
         if (oOpt) {
+            _lastOOpt = oOpt;
             const oStrike = document.getElementById('gr-o-strike-name');
             const oLtp = document.getElementById('gr-o-ltp');
             const oBuy = document.getElementById('gr-o-buy');
@@ -314,7 +385,8 @@
             if (oSlPct) oSlPct.textContent = Number(slPctVal).toFixed(0) + '%';
             if (oStatus) {
                 if (oOpt.is_active) {
-                    oStatus.textContent = '🔥 0DTE Convexity Hero Active';
+                    const thetaStr = oOpt.theta_burn_15m_str ? ` · Burn: ${oOpt.theta_burn_15m_str}` : '';
+                    oStatus.textContent = `🔥 0DTE Convexity Hero Active${thetaStr}`;
                     oStatus.style.color = '#00e676';
                 } else {
                     oStatus.textContent = 'Outside Runway / High DTE';
@@ -484,13 +556,66 @@
     function startPolling() {
         if (_pollTimer) clearInterval(_pollTimer);
         poll();
-        _pollTimer = setInterval(poll, 1500);
+        _pollTimer = setInterval(function () {
+            // Only poll if tab-chain is visible
+            var chainTab = document.getElementById('tab-chain');
+            if (chainTab && !chainTab.classList.contains('active')) return;
+            poll();
+        }, 4000);
+    }
+
+    async function trackPrimary() {
+        if (!_lastPOpt || !_lastPOpt.strike) {
+            alert("No active primary strike recommendation.");
+            return;
+        }
+        const select = document.getElementById('gr-p-lots');
+        const lots = select ? parseInt(select.value, 10) : 1;
+        const ltp = _lastPOpt.current_price ?? _lastPOpt.ltp ?? 0;
+        if (window.IgnitionScanner && typeof window.IgnitionScanner.trackGenericStrike === 'function') {
+            await window.IgnitionScanner.trackGenericStrike(
+                `Radar Primary: ${_lastPOpt.strike} ${_lastPOpt.type}`,
+                _lastPOpt.type,
+                _lastPOpt.strike,
+                ltp,
+                _lastPOpt.stop_loss,
+                _lastPOpt.target_1,
+                _lastPOpt.runner_target ?? _lastPOpt.target_2,
+                lots,
+                'RADAR'
+            );
+        }
+    }
+
+    async function trackRocket() {
+        if (!_lastOOpt || !_lastOOpt.strike) {
+            alert("No active 0DTE rocket recommendation.");
+            return;
+        }
+        const select = document.getElementById('gr-o-lots');
+        const lots = select ? parseInt(select.value, 10) : 1;
+        const ltp = _lastOOpt.current_price ?? _lastOOpt.ltp ?? 0;
+        if (window.IgnitionScanner && typeof window.IgnitionScanner.trackGenericStrike === 'function') {
+            await window.IgnitionScanner.trackGenericStrike(
+                `0DTE Rocket: ${_lastOOpt.strike} ${_lastOOpt.type}`,
+                _lastOOpt.type,
+                _lastOOpt.strike,
+                ltp,
+                _lastOOpt.stop_loss,
+                _lastOOpt.target_1,
+                _lastOOpt.runner_target ?? _lastOOpt.target_2,
+                lots,
+                'RADAR'
+            );
+        }
     }
 
     // Export to window
     window.GexRebalanceRadar = {
         refresh: poll,
         updateUI: updateRadarUI,
+        trackPrimary: trackPrimary,
+        trackRocket: trackRocket,
         handleWsMessage: function (msg) {
             if (!msg) return;
             if (msg.type === 'gex_rebalance_update') {

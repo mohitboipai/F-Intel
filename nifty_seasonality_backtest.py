@@ -34,7 +34,7 @@ import argparse
 import calendar
 import warnings
 from datetime import date, datetime, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -74,9 +74,14 @@ BACKTEST_END   = date(2026, 1, 31)   # from 2022 to now
 SEASON_MONTHS = {9, 10, 11, 12, 1}   # Sept, Oct, Nov, Dec, Jan
 
 # Strategy params
-NIFTY_LOT_SIZE  = 75     # units per lot (current: 75; adjust if needed)
+try:
+    import config as _cfg
+    NIFTY_LOT_SIZE  = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE_RATE  = float(_cfg.get("risk_free_rate", 0.051274))
+except Exception:
+    NIFTY_LOT_SIZE  = 65     # NSE revised Aug 2024
+    RISK_FREE_RATE  = 0.051274
 STOP_MULTIPLIER = 2.0    # stop at 2x credit received
-RISK_FREE_RATE  = 0.07   # 7% proxy for Indian risk-free rate
 
 # API retry config
 MAX_RETRIES    = 3
@@ -417,11 +422,11 @@ def run_backtest(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_stats(records: List[dict]) -> Dict:
-    df   = pd.DataFrame(records)
-    inw  = df[df["in_window"]].copy()
-    outw = df[~df["in_window"]].copy()
+    df: Any   = pd.DataFrame(records)
+    inw: Any  = df[df["in_window"]].copy()
+    outw: Any = df[~df["in_window"]].copy()
 
-    def _s(sub: pd.DataFrame) -> dict:
+    def _s(sub: Any) -> dict:
         if sub.empty:
             return {}
         p = sub["pnl_rs"]
@@ -447,8 +452,8 @@ def compute_stats(records: List[dict]) -> Dict:
         stats["t_stat"] = float("nan"); stats["p_value"] = float("nan")
 
     # Correlation: avg VIX vs year window PnL
-    yr_vix = inw.groupby("year")["iv_at_open"].mean()
-    yr_pnl = inw.groupby("year")["pnl_rs"].sum()
+    yr_vix: Any = inw.groupby("year")["iv_at_open"].mean()
+    yr_pnl: Any = inw.groupby("year")["pnl_rs"].sum()
     c = yr_vix.index.intersection(yr_pnl.index)
     if len(c) >= 3:
         rv, pv = scipy_stats.pearsonr(yr_vix[c], yr_pnl[c])
@@ -461,7 +466,7 @@ def compute_stats(records: List[dict]) -> Dict:
     for yr, g in inw.groupby("year"):
         spot_rets[yr] = (g["spot_close"].iloc[-1] - g["spot_open"].iloc[0]) \
                         / g["spot_open"].iloc[0] * 100
-    sr = pd.Series(spot_rets)
+    sr: Any = pd.Series(spot_rets)
     c2 = sr.index.intersection(yr_pnl.index)
     if len(c2) >= 3:
         rs, ps = scipy_stats.pearsonr(sr[c2], yr_pnl[c2])

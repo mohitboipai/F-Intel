@@ -27,6 +27,12 @@ from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    import config as _cfg
+    _DEFAULT_FALLBACK_IV = float(_cfg.get("iv_fallback_flat", 0.15)) * 100.0
+except Exception:
+    _DEFAULT_FALLBACK_IV = 15.0
+
 
 class IvSurfaceEngine:
     def __init__(self, max_history: int = 1500):
@@ -98,7 +104,7 @@ class IvSurfaceEngine:
         # Compute ATM IV
         atm_strike, atm_iv = self._find_atm_iv(strikes_map, spot)
         if atm_iv <= 0:
-            atm_iv = 12.5  # fallback reasonable default
+            atm_iv = _DEFAULT_FALLBACK_IV
 
         # Expected 1-Day Move from ATM IV (scaled by 252 trading days)
         daily_vol = (atm_iv / 100.0) * math.sqrt(1.0 / 252.0)
@@ -425,7 +431,8 @@ class IvSurfaceEngine:
             if strike <= 0:
                 continue
             iv = float(row.get('iv', 0) or 0)
-            o_type = str(row.get('type', 'CE')).upper()
+            raw_type = str(row.get('type') or row.get('option_type') or 'CE').upper()
+            o_type = 'CE' if raw_type in ('CE', 'CALL') else 'PE'
             price = float(row.get('price', 0) or 0)
 
             if iv <= 1.0 or iv > 150.0:

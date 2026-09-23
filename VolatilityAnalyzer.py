@@ -12,8 +12,11 @@ from scipy.stats import norm
 # Add current directory to path to find local modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-if sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8') # type: ignore
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8') # type: ignore
+    except AttributeError:
+        pass
 
 from FyersAuth import FyersAuthenticator
 from OptionAnalytics import OptionAnalytics
@@ -235,6 +238,8 @@ class VolatilityAnalyzer:
         self.regime_engine = RealizedVolEngine()
         self.master_engine = MasterSignalEngine()
         self.buyer_engine = OptionBuyerEngine()
+        self._last_net_gex = 0.0
+        self._last_dte = 99.0
 
     def _authenticate(self):
         from fyers_auth_manager import get_fyers_instance
@@ -740,7 +745,17 @@ class VolatilityAnalyzer:
         normalized = {k: v / weight_sum for k, v in active_weights.items()}
         composite = sum(scores[k] * normalized[k] for k in scores)
 
-        if composite > 65:
+        # ── 0DTE Short-Gamma Cascade Guard ───────────────────────────────────────
+        # When DTE <= 1.2 and net dealer GEX is negative, dealer delta-hedging accelerates
+        # directional moves into cascades (e.g. 70-80 pt drops where OTM puts double).
+        # Selling vol (Iron Condors / Credit Spreads) into an active short-gamma cascade is catastrophic.
+        _chk_net_gex = metrics.get('net_gex', getattr(self, '_last_net_gex', 0.0))
+        _chk_dte = metrics.get('dte', getattr(self, '_last_dte', 99.0))
+        if _chk_dte <= 1.2 and _chk_net_gex < -1e5:
+            action = "BUY VOL (0DTE SQUEEZE)"
+            strategy = "0DTE Short Gamma Cascade — Long Convexity / Momentum Puts/Calls"
+            composite = min(composite, 25.0)
+        elif composite > 65:
             action = "SELL VOL"
             strategy = "Iron Condors / Credit Spreads / Short Straddles"
         elif composite > 55:
@@ -1977,7 +1992,9 @@ class VolatilityAnalyzer:
                 intra_vrp = atm_iv - rv_intra
                 
                 sig = "WAIT"
-                if daily_vrp > 5.0:
+                if getattr(self, '_last_dte', 99.0) <= 1.2 and getattr(self, '_last_net_gex', 0.0) < -1e5:
+                    sig = "0DTE GAMMA SQUEEZE (BUY VOL)"
+                elif daily_vrp > 5.0:
                     sig = "SELL VOL (High Prem)"
                     if intra_vrp > 5.0: sig = "STRONG SELL (Crash?)"
                 elif daily_vrp < -2.0:
@@ -2377,9 +2394,221 @@ class VolatilityAnalyzer:
                 
         except KeyboardInterrupt:
             print("\nExiting Option Seller Advisor...")
-            return
+    _BUILDER_TERMINAL_SHELL = '''
+<div class="sb-workspace">
+    <!-- Left Sidebar: Presets, Live Positions, AI Wizard -->
+    <aside class="sb-sidebar">
+        <div class="sb-nav-tabs">
+            <button class="sb-subtab-btn active" data-subtab="sb-subtab-ready" onclick="StrategyBuilder.switchSubTab('sb-subtab-ready')">Presets</button>
+            <button class="sb-subtab-btn" data-subtab="sb-subtab-portfolio" onclick="StrategyBuilder.switchSubTab('sb-subtab-portfolio')">Positions <span id="sb-pos-badge" style="background:#00e5ff; color:#131722; border-radius:8px; padding:1px 5px; font-size:9px; margin-left:3px; display:none;">0</span></button>
+            <button class="sb-subtab-btn" data-subtab="sb-subtab-ai" onclick="StrategyBuilder.switchSubTab('sb-subtab-ai')">AI Wizard</button>
+            <button class="sb-subtab-btn" onclick="window.open('/builder', '_blank')" style="color:#00e5ff; font-weight:700;">Backtest Studio ↗</button>
+        </div>
 
+        <!-- Presets SubTab -->
+        <div id="sb-subtab-ready" class="sb-subtab-content active">
+            <div class="sb-category">
+                <div class="sb-category-title" style="color:#00e676;">Bullish</div>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Bull Call Spread')">Bull Call Spread <span>↗</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Bull Put Spread')">Bull Put Spread <span>↗</span></button>
+            </div>
+            <div class="sb-category">
+                <div class="sb-category-title" style="color:#ff3366;">Bearish</div>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Bear Put Spread')">Bear Put Spread <span>↘</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Bear Call Spread')">Bear Call Spread <span>↘</span></button>
+            </div>
+            <div class="sb-category">
+                <div class="sb-category-title" style="color:#00e5ff;">Neutral / Vol Selling</div>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Short Straddle')">Short Straddle <span>🎯</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Short Strangle')">Short Strangle <span>🎯</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Iron Condor')">Iron Condor <span>🛡</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Iron Butterfly')">Iron Butterfly <span>🛡</span></button>
+            </div>
+            <div class="sb-category">
+                <div class="sb-category-title" style="color:#ffd54f;">Ratio Backspreads</div>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Call Ratio Backspread')">Call Ratio Backspread <span>🚀</span></button>
+                <button class="sb-preset-btn" onclick="StrategyBuilder.buildStrategy('Put Ratio Backspread')">Put Ratio Backspread <span>⚡</span></button>
+            </div>
+        </div>
 
+        <!-- Portfolio SubTab -->
+        <div id="sb-subtab-portfolio" class="sb-subtab-content">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                <span style="font-size:11px; font-weight:700; color:#fff;">Live Paper Trades</span>
+                <button onclick="StrategyBuilder.openOrderbook()" style="background:transparent; border:1px solid #2a2e39; color:#868993; border-radius:4px; padding:2px 6px; font-size:10px; cursor:pointer;">P&L History</button>
+            </div>
+            <div id="sb-active-positions-container">
+                <div style="color:#868993; font-size:12px; text-align:center; padding: 24px 0;">Loading paper positions...</div>
+            </div>
+        </div>
+
+        <!-- AI Wizard SubTab -->
+        <div id="sb-subtab-ai" class="sb-subtab-content">
+            <button id="sb-btn-fetch-wizard" onclick="StrategyBuilder.fetchWizardRecommendation()" style="width:100%; padding:8px 12px; background:linear-gradient(135deg, #00e5ff, #00b0ff); color:#000; border:none; border-radius:6px; font-size:11px; font-weight:800; cursor:pointer; margin-bottom:8px;">⚡ Suggest AI Strategy</button>
+            <div style="font-size:10px; font-weight:800; color:#868993; text-transform:uppercase; margin-bottom:6px;">Today's Live Recommendations</div>
+            <div id="sb-ai-presets-container" style="display:flex; flex-direction:column; gap:8px;">
+                <div style="color:#868993; font-size:11px; text-align:center; padding: 18px 0;">No AI recommendations yet today.</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Strategy Builder Panel -->
+    <div class="sb-dashboard">
+        <!-- Top Row: Payoff Chart + Strategy Summary & Greeks -->
+        <div class="sb-top-grid">
+            <!-- Chart Card -->
+            <div class="sb-card" style="display:flex; flex-direction:column;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <span style="font-size:12px; font-weight:800; color:#00e5ff; letter-spacing:0.8px;">INTERACTIVE PAYOFF PROFILE</span>
+                    <span style="font-size:11px; color:#868993;">NIFTY Spot: <strong id="sb-spot-display" style="color:#fff; font-family:var(--font-mono);">--</strong></span>
+                </div>
+                <div class="sb-controls-row">
+                    <div class="sb-slider-group">
+                        <label><span>Spot Shift</span> <span id="sb-val-target-spot" style="font-family:var(--font-mono); color:#00e676;">+0.0%</span></label>
+                        <input type="range" id="sb-slide-spot" min="-15" max="15" value="0" step="0.5">
+                    </div>
+                    <div class="sb-slider-group">
+                        <label><span>Target Date</span> <span id="sb-val-target-date" style="font-family:var(--font-mono);">T+0D</span></label>
+                        <input type="range" id="sb-slide-date" min="0" max="30" value="0" step="1">
+                    </div>
+                    <div class="sb-slider-group">
+                        <label><span>Target Time</span> <span id="sb-val-target-time" style="font-family:var(--font-mono);">15:30</span></label>
+                        <input type="range" id="sb-slide-time" min="0" max="25" value="25" step="1">
+                    </div>
+                </div>
+                <div id="sb-payoff-chart" style="height:320px; width:100%;"></div>
+                <div style="text-align:center; font-size:13px; font-weight:700; color:#868993; margin-top:4px;">
+                    Projected P&L: <span id="sb-projected-profit" style="font-family:var(--font-mono); font-size:15px; color:#00e676;">₹0</span>
+                </div>
+            </div>
+
+            <!-- Summary Card -->
+            <div class="sb-card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                <div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                        <h3 id="sb-summary-strategy-name" style="font-size:14px; font-weight:800; color:#fff; margin:0;">Custom Strategy</h3>
+                        <span class="sb-badge sb-badge-cyan">BSM MODEL</span>
+                    </div>
+                    <div class="sb-summary-grid">
+                        <div class="sb-stat-box">
+                            <div class="sb-stat-label">Max Profit</div>
+                            <div class="sb-stat-value" id="sb-stat-max-profit" style="color:#00e676;">₹0</div>
+                        </div>
+                        <div class="sb-stat-box">
+                            <div class="sb-stat-label">Max Loss</div>
+                            <div class="sb-stat-value" id="sb-stat-max-loss" style="color:#ff3366;">₹0</div>
+                        </div>
+                        <div class="sb-stat-box">
+                            <div class="sb-stat-label">Prob of Profit</div>
+                            <div class="sb-stat-value" id="sb-stat-pop" style="color:#00e5ff;">0.0%</div>
+                        </div>
+                        <div class="sb-stat-box">
+                            <div class="sb-stat-label">Net Premium</div>
+                            <div class="sb-stat-value" id="sb-stat-premium" style="color:#ffd54f;">₹0</div>
+                        </div>
+                    </div>
+                    <div style="background:var(--bg-canvas,#131722); padding:10px 12px; border-radius:6px; border:1px solid var(--border-subtle,#2a2e39); margin-bottom:12px;">
+                        <div style="display:flex; justify-content:space-between; font-size:11px;">
+                            <span style="color:#868993;">Expiry Breakevens:</span>
+                            <span id="sb-stat-breakevens" style="font-family:var(--font-mono); font-weight:700; color:#fff;">-</span>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:10px; font-weight:800; color:#868993; text-transform:uppercase; margin-bottom:6px;">Net Strategy Greeks</div>
+                    <div class="sb-greeks-row">
+                        <div class="sb-greek-box"><div class="sb-greek-label">Delta (Δ)</div><div class="sb-greek-value" id="sb-greek-delta">0.00</div></div>
+                        <div class="sb-greek-box"><div class="sb-greek-label">Theta (θ)</div><div class="sb-greek-value" id="sb-greek-theta">0.00</div></div>
+                        <div class="sb-greek-box"><div class="sb-greek-label">Gamma (Γ)</div><div class="sb-greek-value" id="sb-greek-gamma">0.0000</div></div>
+                        <div class="sb-greek-box"><div class="sb-greek-label">Vega (ν)</div><div class="sb-greek-value" id="sb-greek-vega">0.00</div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Middle Row: Leg Builder Basket -->
+        <div class="sb-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <div style="font-size:12px; font-weight:800; color:#00e5ff; letter-spacing:0.8px;">ACTIVE STRATEGY LEGS</div>
+                <div style="display:flex; gap:8px;">
+                    <button onclick="StrategyBuilder.clearBasket()" style="padding:4px 10px; background:transparent; border:1px solid #2a2e39; color:#868993; border-radius:4px; font-size:11px; cursor:pointer;">Clear All</button>
+                    <button onclick="StrategyBuilder.deployStrategy()" style="padding:4px 12px; background:#00e676; color:#131722; font-weight:800; border:none; border-radius:4px; font-size:11px; cursor:pointer;">Deploy Paper Trade 🚀</button>
+                </div>
+            </div>
+            <table class="sb-table">
+                <thead>
+                    <tr>
+                        <th>Side</th>
+                        <th>Lots (x65)</th>
+                        <th>Expiry</th>
+                        <th>Strike</th>
+                        <th>Type</th>
+                        <th>Entry Price</th>
+                        <th>IV</th>
+                        <th>Del</th>
+                    </tr>
+                </thead>
+                <tbody id="sb-basket-body">
+                    <tr><td colspan="8" style="text-align:center; color:#868993; padding: 24px 0;">No active legs. Click preset on left or +B / +S from option chain below.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Bottom Row: Option Chain with Quick Add Buttons -->
+        <div class="sb-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <div style="font-size:12px; font-weight:800; color:#00e5ff; letter-spacing:0.8px;">OPTION CHAIN & QUICK LEG SELECTOR</div>
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <select id="sb-expiry-select" style="padding:4px 8px; border-radius:4px; background:#131722; color:#fff; border:1px solid #2a2e39; font-size:11px;"></select>
+                    <div class="sb-action-btn-group">
+                        <button id="sb-view-ltp" class="active" onclick="StrategyBuilder.setChainView('LTP')">LTP & OI</button>
+                        <button id="sb-view-greeks" onclick="StrategyBuilder.setChainView('GREEKS')">GREEKS</button>
+                    </div>
+                </div>
+            </div>
+            <div class="sb-chain-wrapper">
+                <table class="sb-chain-table">
+                    <thead>
+                        <tr>
+                            <th>Call OI</th>
+                            <th>Call Δ</th>
+                            <th>Call LTP</th>
+                            <th class="sb-strike-col">Strike</th>
+                            <th>Put LTP</th>
+                            <th>Put Δ</th>
+                            <th>Put OI</th>
+                        </tr>
+                    </thead>
+                    <tbody id="sb-chain-body">
+                        <tr><td colspan="7" style="padding: 24px 0; color:#868993;">Loading chain data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Orderbook Modal -->
+<div id="sb-orderbook-modal" class="sb-modal-overlay">
+    <div class="sb-modal-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+            <h3 style="font-size:14px; font-weight:800; color:#fff; margin:0;">Exited Paper Positions Directory</h3>
+            <button onclick="StrategyBuilder.closeOrderbook()" style="background:transparent; border:none; color:#868993; font-size:18px; cursor:pointer;">✕</button>
+        </div>
+        <table class="sb-table">
+            <thead>
+                <tr>
+                    <th>Exit Time</th>
+                    <th>Strategy</th>
+                    <th>Req. Margin</th>
+                    <th>Realized P&L</th>
+                </tr>
+            </thead>
+            <tbody id="sb-history-body"></tbody>
+        </table>
+    </div>
+</div>
+'''
 
     def _create_unified_dashboard(self, expiries, single_run=False):
         """Create and launch unified tabbed dashboard with all analysis modules."""
@@ -2552,10 +2781,12 @@ class VolatilityAnalyzer:
                 if r.get('s') == 'ok':
                     candles = r['candles']
                     hist_cache = {
-                        'closes': [c[4] for c in candles],
-                        'highs': [c[2] for c in candles],
-                        'lows': [c[3] for c in candles],
-                        'opens': [c[1] for c in candles]
+                        'date': [datetime.fromtimestamp(c[0]).strftime('%Y-%m-%d') for c in candles],
+                        'timestamp': [c[0] for c in candles],
+                        'closes': [float(c[4]) for c in candles],
+                        'highs': [float(c[2]) for c in candles],
+                        'lows': [float(c[3]) for c in candles],
+                        'opens': [float(c[1]) for c in candles]
                     }
                 else:
                     hist_cache = None
@@ -2888,7 +3119,9 @@ class VolatilityAnalyzer:
             intra_vrp = atm_iv - rv_intra
 
             sig = "WAIT"
-            if daily_vrp > 5.0:
+            if getattr(self, '_last_dte', 99.0) <= 1.2 and getattr(self, '_last_net_gex', 0.0) < -1e5:
+                sig = "0DTE GAMMA SQUEEZE (BUY VOL)"
+            elif daily_vrp > 5.0:
                 sig = "SELL VOL (High Prem)"
                 if intra_vrp > 5.0: sig = "STRONG SELL"
             elif daily_vrp < -2.0:
@@ -3126,6 +3359,7 @@ class VolatilityAnalyzer:
             }
 
         # ── Intraday baseline will be fetched inside the loop ──
+        _gc_counter = 0
 
         try:
             while True:
@@ -3235,9 +3469,7 @@ class VolatilityAnalyzer:
                             intraday_regime=regime_snapshot.get('regime', {}).get('name', '')
                         )
                         
-                        if buyer_setup:
-                            from signal_broadcaster import SignalBroadcaster
-                            SignalBroadcaster.broadcast_trade(buyer_setup)
+                        # Minion mode removed per user request
 
                     # ══════════════════════════════════════════
                     #  BUILD HTML
@@ -3611,6 +3843,8 @@ class VolatilityAnalyzer:
                                 gex_res = gex_eng.calculate_gex(_df_chain_input, spot)
 
                                 _net_gex = float(gex_res.get('net_gex', 0.0))
+                                self._last_net_gex = _net_gex
+                                self._last_dte = max(_T_gex * 365.0, 0.0)
                                 _net_gex_crores = _net_gex / 1e7
                                 _flip_strike = round(float(gex_res.get('zero_gamma_level', 0.0)))
 
@@ -3939,9 +4173,10 @@ class VolatilityAnalyzer:
 
                             strike_badges_html = " ".join(strike_badges)
                             strike_main_col = "#00e5ff" if is_atm else RED if (is_cw1 or is_cw2) else GREEN if (is_pw1 or is_pw2) else YELLOW if is_mp else WHITE
+                            atm_attr = ' id="row-atm" class="glow-atm" data-is-atm="true"' if is_atm else ''
 
                             oi_rows_html += (
-                                f'<tr style="{row_style}">'
+                                f'<tr data-strike="{r["strike"]}"{atm_attr} style="{row_style}">'
                                 f'<td class="col-seller" style="text-align:center;padding:7px 6px;background:{ce_cell_bg};">{ce_sig_badge}</td>'
                                 f'<td class="col-seller" style="text-align:right;padding:7px 6px;font-family:monospace;color:#ffab91;background:{ce_cell_bg};font-size:11px;">{ce_th_txt}</td>'
                                 f'<td class="col-gex" data-call-gex="{r["strike"]}" style="text-align:right;padding:7px 8px;font-family:monospace;color:{ce_gex_col};background:{ce_cell_bg};font-weight:700;">{ce_gex_txt}</td>'
@@ -4038,7 +4273,7 @@ class VolatilityAnalyzer:
                                     <span style="color:#ffd54f;">🟡 MAX PAIN PIN</span>
                                 </div>
                             </div>
-                            <div style="max-height:560px;overflow-y:auto;">
+                            <div id="master-chain-container" style="max-height:560px;overflow-y:auto;">
                                 <table id="master-chain-table" class="data-table" style="width:100%;margin:0;border-collapse:collapse;font-size:12px;">
                                     <thead style="position:sticky;top:0;z-index:10;background:#0d1124;box-shadow:0 2px 8px rgba(0,0,0,0.7);">
                                         <tr style="border-bottom:1px solid #222744;">
@@ -4064,7 +4299,7 @@ class VolatilityAnalyzer:
                                             <th class="col-seller" style="text-align:center;padding:7px 6px;">Signal</th>
                                         </tr>
                                     </thead>
-                                    <tbody>
+                                    <tbody id="master-chain-tbody">
                                         {oi_rows_html}
                                     </tbody>
                                 </table>
@@ -4092,176 +4327,181 @@ class VolatilityAnalyzer:
                             </div>
                         </div>
 
-                        <!-- 5. OPTION BUYER RADAR: GEX SPOT REBALANCE & VACUUM RUNWAY ENGINE -->
-                        <div id="gex-rebalance-card" class="card" style="margin-bottom:14px;border:1px solid rgba(0,240,255,0.3);background:linear-gradient(135deg, rgba(13,17,38,0.95), rgba(18,24,54,0.95));box-shadow:0 4px 24px rgba(0,0,0,0.4);border-radius:10px;padding:16px;">
-                            <!-- Top Header: Title, Status Badge, State Description -->
-                            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:12px;">
-                                <div style="display:flex;align-items:center;gap:10px;">
-                                    <div style="width:10px;height:10px;border-radius:50%;background:#00f0ff;box-shadow:0 0 10px #00f0ff;animation:pulseBadgeCyan 1.5s infinite;"></div>
+                        <!-- 5. OPTION BUYER RADAR -->
+                        <div id="gex-rebalance-card" class="card" style="margin-bottom:20px;border:1px solid #1e2438;background:#0d111e;border-radius:12px;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.25);">
+                            <!-- Top Header: Title, Subtitle, Badges -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:20px;border-bottom:1px solid #1e2438;padding-bottom:16px;">
+                                <div style="display:flex;align-items:center;gap:12px;">
+                                    <div style="width:8px;height:8px;border-radius:50%;background:#38bdf8;"></div>
                                     <div>
-                                        <div style="font-size:14px;font-weight:900;color:#00f0ff;letter-spacing:1.5px;display:flex;align-items:center;gap:8px;">
-                                            <span>⚡ OPTION BUYER RADAR</span>
-                                            <span style="font-size:10px;color:#cbd5e1;background:rgba(255,255,255,0.08);padding:2px 8px;border-radius:4px;font-weight:600;">GEX VACUUM REBALANCE</span>
+                                        <div style="font-size:15px;font-weight:800;color:#f8fafc;letter-spacing:0.5px;display:flex;align-items:center;gap:10px;">
+                                            <span>Option Buyer Radar</span>
+                                            <span style="font-size:11px;color:#94a3b8;background:#171d30;border:1px solid #232b45;padding:2px 8px;border-radius:4px;font-weight:600;">Breakout Engine</span>
                                         </div>
-                                        <div id="gr-desc" style="font-size:12px;color:#94a3b8;margin-top:2px;">
-                                            Monitoring Wall ② vs Wall ① distance and dealer delta-hedging vacuum runway...
+                                        <div id="gr-desc" style="font-size:12px;color:#94a3b8;margin-top:4px;">
+                                            Live momentum breakout detector tracking dealer hedging pressure.
                                         </div>
                                     </div>
                                 </div>
-                                <div style="display:flex;align-items:center;gap:8px;">
-                                    <span id="gr-status-badge" style="font-size:12px;font-weight:900;padding:5px 14px;border-radius:6px;background:rgba(255,213,79,0.15);color:#ffd54f;border:1px solid #ffd54f;letter-spacing:0.5px;text-transform:uppercase;">
-                                        COILING AT WALL ②
+                                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                                    <span id="gr-expected-move-badge" style="font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;background:#171d30;color:#38bdf8;border:1px solid #232b45;letter-spacing:0.3px;">
+                                        EXPECTED MOVE: --
                                     </span>
-                                    <span id="gr-direction-badge" style="font-size:11px;font-weight:800;padding:5px 12px;border-radius:6px;background:rgba(0,230,118,0.15);color:#00e676;border:1px solid rgba(0,230,118,0.3);">
-                                        CALL BUY
+                                    <span id="gr-archetype-badge" style="font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;background:#171d30;color:#cbd5e1;border:1px solid #232b45;letter-spacing:0.3px;">
+                                        0DTE Breakout
                                     </span>
+                                    <span id="gr-status-badge" style="font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;background:#171d30;color:#f59e0b;border:1px solid #232b45;letter-spacing:0.3px;">
+                                        COILING
+                                    </span>
+                                    <span id="gr-direction-badge" style="font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;background:#171d30;color:#10b981;border:1px solid #232b45;">
+                                        CALL BUY (CE)
+                                    </span>
+                                    <span id="gr-tier-badge" style="display:none;font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;background:#171d30;color:#cbd5e1;border:1px solid #232b45;"></span>
                                 </div>
                             </div>
 
-                            <!-- The 4 Core Levels Grid (Zero Math - Direct Clean Numbers) -->
-                            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:10px;margin-bottom:16px;">
+                            <!-- 4 Key Reference Levels Grid (Clean, Spacious, Plain English) -->
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:14px;margin-bottom:20px;">
                                 <!-- Level 1: Current Spot -->
-                                <div class="metric-box" style="padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid #222744;border-radius:8px;">
-                                    <div class="metric-label" style="font-size:10px;color:#94a3b8;">CURRENT SPOT</div>
-                                    <div id="gr-spot-val" style="font-size:22px;font-weight:900;color:#ffffff;font-family:'JetBrains Mono',monospace;">--</div>
-                                    <div id="gr-spot-sub" class="metric-sub" style="color:#64748b;">Live NIFTY Index</div>
+                                <div class="metric-box" style="padding:14px 16px;background:#13182b;border:1px solid #1e2438;border-radius:8px;">
+                                    <div class="metric-label" style="font-size:11px;font-weight:700;color:#94a3b8;letter-spacing:0.5px;">SPOT PRICE</div>
+                                    <div id="gr-spot-val" style="font-size:24px;font-weight:800;color:#ffffff;font-family:'JetBrains Mono',monospace;margin:4px 0;">--</div>
+                                    <div id="gr-spot-sub" class="metric-sub" style="font-size:11px;color:#64748b;">Live NIFTY Index</div>
                                 </div>
 
-                                <!-- Level 2: Ignition Toll Gate (Wall 2) -->
-                                <div class="metric-box" style="padding:10px 12px;background:rgba(255,213,79,0.06);border:1px solid rgba(255,213,79,0.3);border-radius:8px;">
-                                    <div class="metric-label" style="font-size:10px;color:#ffd54f;">IGNITION TRIGGER (WALL ②)</div>
-                                    <div id="gr-trigger-val" style="font-size:22px;font-weight:900;color:#ffd54f;font-family:'JetBrains Mono',monospace;">--</div>
-                                    <div id="gr-trigger-sub" class="metric-sub" style="color:#ffd54f;">Breakout Toll Gate</div>
+                                <!-- Level 2: Breakout Trigger -->
+                                <div class="metric-box" style="padding:14px 16px;background:#13182b;border:1px solid #1e2438;border-radius:8px;">
+                                    <div class="metric-label" style="font-size:11px;font-weight:700;color:#f59e0b;letter-spacing:0.5px;">BREAKOUT TRIGGER</div>
+                                    <div id="gr-trigger-val" style="font-size:24px;font-weight:800;color:#f59e0b;font-family:'JetBrains Mono',monospace;margin:4px 0;">--</div>
+                                    <div id="gr-trigger-sub" class="metric-sub" style="font-size:11px;color:#94a3b8;">Entry above this level</div>
                                 </div>
 
-                                <!-- Level 3: Rebalance Target (Zero-Gamma Fuel Apex) -->
-                                <div class="metric-box" style="padding:10px 12px;background:rgba(0,240,255,0.06);border:1px solid rgba(0,240,255,0.35);border-radius:8px;">
-                                    <div class="metric-label" style="font-size:10px;color:#00f0ff;">REBALANCE TARGET (FUEL APEX)</div>
-                                    <div id="gr-target-val" style="font-size:22px;font-weight:900;color:#00f0ff;font-family:'JetBrains Mono',monospace;">--</div>
-                                    <div id="gr-target-sub" class="metric-sub" style="color:#38bdf8;">Where Dealer Buying Peaks</div>
+                                <!-- Level 3: Projected Target -->
+                                <div class="metric-box" style="padding:14px 16px;background:#13182b;border:1px solid #1e2438;border-radius:8px;">
+                                    <div class="metric-label" style="font-size:11px;font-weight:700;color:#10b981;letter-spacing:0.5px;">PROJECTED TARGET</div>
+                                    <div id="gr-target-val" style="font-size:24px;font-weight:800;color:#10b981;font-family:'JetBrains Mono',monospace;margin:4px 0;">--</div>
+                                    <div id="gr-target-sub" class="metric-sub" style="font-size:11px;color:#94a3b8;">Dealer rebalance target</div>
                                 </div>
 
-                                <!-- Level 4: Terminal Wall 1 Pin (Fortress) -->
-                                <div class="metric-box" style="padding:10px 12px;background:rgba(255,68,68,0.06);border:1px solid rgba(255,68,68,0.3);border-radius:8px;">
-                                    <div class="metric-label" style="font-size:10px;color:#ff7043;">FORTRESS PIN (WALL ①)</div>
-                                    <div id="gr-fortress-val" style="font-size:22px;font-weight:900;color:#ff7043;font-family:'JetBrains Mono',monospace;">--</div>
-                                    <div id="gr-fortress-sub" class="metric-sub" style="color:#ff8a65;">Hard Terminal Barrier</div>
+                                <!-- Level 4: Major Resistance Ceiling -->
+                                <div class="metric-box" style="padding:14px 16px;background:#13182b;border:1px solid #1e2438;border-radius:8px;">
+                                    <div class="metric-label" style="font-size:11px;font-weight:700;color:#cbd5e1;letter-spacing:0.5px;">MAJOR RESISTANCE</div>
+                                    <div id="gr-fortress-val" style="font-size:24px;font-weight:800;color:#e2e8f0;font-family:'JetBrains Mono',monospace;margin:4px 0;">--</div>
+                                    <div id="gr-fortress-sub" class="metric-sub" style="font-size:11px;color:#64748b;">Key open interest ceiling</div>
                                 </div>
                             </div>
 
-                            <!-- Runway Progress Visual Gauge -->
-                            <div style="background:rgba(10,14,30,0.8);border:1px solid #1e2442;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
-                                <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#94a3b8;margin-bottom:8px;">
-                                    <span style="display:flex;align-items:center;gap:6px;">
-                                        <span style="color:#ffd54f;font-weight:700;">Wall ②: <span id="gr-bar-start">--</span></span>
-                                        <span>&rarr;</span>
-                                        <span style="color:#00f0ff;font-weight:700;">Runway: <span id="gr-bar-runway">-- pts</span></span>
+                            <!-- Runway Progress Bar (Clean & Quiet) -->
+                            <div style="background:#13182b;border:1px solid #1e2438;border-radius:8px;padding:14px 18px;margin-bottom:20px;">
+                                <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#94a3b8;margin-bottom:10px;">
+                                    <span style="display:flex;align-items:center;gap:8px;">
+                                        <span style="color:#f59e0b;font-weight:700;">Trigger: <span id="gr-bar-start">--</span></span>
+                                        <span style="color:#64748b;">&bull;</span>
+                                        <span style="color:#38bdf8;font-weight:700;">Runway: <span id="gr-bar-runway">-- pts</span></span>
                                     </span>
-                                    <span style="font-weight:800;color:#00e676;">
-                                        Rebalance Progress: <span id="gr-progress-pct">0%</span>
+                                    <span style="font-weight:700;color:#38bdf8;">
+                                        Progress: <span id="gr-progress-pct" style="font-family:'JetBrains Mono',monospace;">0%</span>
                                     </span>
-                                    <span style="color:#ff7043;font-weight:700;">Target: <span id="gr-bar-target">--</span></span>
+                                    <span style="color:#10b981;font-weight:700;">Target: <span id="gr-bar-target">--</span></span>
                                 </div>
-                                <div style="height:10px;background:#0d1124;border-radius:5px;overflow:hidden;position:relative;border:1px solid #222744;">
-                                    <div id="gr-progress-fill" style="width:0%;height:100%;background:linear-gradient(90deg, #ffd54f, #00f0ff, #00e676);box-shadow:0 0 10px #00f0ff;transition:width 0.5s ease-in-out;"></div>
+                                <div style="height:6px;background:#0b0e17;border-radius:3px;overflow:hidden;margin-bottom:8px;">
+                                    <div id="gr-progress-fill" style="width:0%;height:100%;background:#38bdf8;border-radius:3px;transition:width 0.4s ease;"></div>
                                 </div>
-                                <div style="display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-top:5px;">
+                                <div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;">
                                     <span>Trigger Level</span>
-                                    <span id="gr-fuel-indicator" style="color:#38bdf8;">Dealer Futures Fuel: -- Lots</span>
-                                    <span>Zero-Gamma Apex</span>
+                                    <span id="gr-fuel-indicator" style="color:#64748b;">Dealer Hedging Volume: --</span>
+                                    <span>Target Objective</span>
                                 </div>
                             </div>
 
-                            <!-- Dual Strike Recommendation Grid (Primary ATM + 0DTE OTM Gamma Rocket) -->
-                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+                            <!-- Dual Strike Recommendation Grid (Clean, Spacious Cards) -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;">
                                 <!-- Option 1: Primary ATM Strike -->
-                                <div style="background:rgba(18,22,46,0.9);border:1px solid rgba(0,240,255,0.25);border-radius:8px;padding:14px;">
-                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                                <div style="background:#13182b;border:1px solid #1e2438;border-radius:10px;padding:18px;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
                                         <div>
-                                            <span style="font-size:10px;font-weight:800;color:#38bdf8;background:rgba(0,240,255,0.12);padding:2px 6px;border-radius:4px;">OPTION ① · PRIMARY ATM</span>
-                                            <div id="gr-p-strike-name" style="font-size:18px;font-weight:900;color:#ffffff;margin-top:4px;">-- CE</div>
+                                            <span style="font-size:10px;font-weight:700;color:#38bdf8;background:#17223b;padding:3px 8px;border-radius:4px;letter-spacing:0.5px;">PRIMARY (ATM) &bull; BALANCED</span>
+                                            <div id="gr-p-strike-name" style="font-size:20px;font-weight:800;color:#ffffff;font-family:'JetBrains Mono',monospace;margin-top:6px;">-- CE</div>
                                         </div>
                                         <div style="text-align:right;">
-                                            <div style="font-size:10px;color:#94a3b8;">LTP (Current)</div>
-                                            <div id="gr-p-ltp" style="font-size:18px;font-weight:900;color:#00f0ff;">₹--</div>
+                                            <div style="font-size:10px;color:#64748b;">Current Price</div>
+                                            <div id="gr-p-ltp" style="font-size:20px;font-weight:800;color:#38bdf8;font-family:'JetBrains Mono',monospace;">₹--</div>
                                         </div>
                                     </div>
-                                    <!-- Pricing Grid -->
-                                    <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:6px;text-align:center;">
-                                        <div style="background:rgba(255,255,255,0.03);padding:6px;border-radius:4px;border:1px solid #1e2442;">
-                                            <div style="font-size:9px;color:#94a3b8;">BUY ZONE</div>
-                                            <div id="gr-p-buy" style="font-size:13px;font-weight:800;color:#ffffff;">₹--</div>
+                                    <!-- Clean Price Levels -->
+                                    <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:8px;text-align:center;">
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#94a3b8;font-weight:600;">BUY AT</div>
+                                            <div id="gr-p-buy" style="font-size:13px;font-weight:700;color:#ffffff;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
                                         </div>
-                                        <div style="background:rgba(0,230,118,0.06);padding:6px;border-radius:4px;border:1px solid rgba(0,230,118,0.2);">
-                                            <div style="font-size:9px;color:#00e676;">TARGET ①</div>
-                                            <div id="gr-p-t1" style="font-size:13px;font-weight:800;color:#00e676;">₹--</div>
-                                            <div id="gr-p-t1-pct" style="font-size:9px;color:#00e676;">+--%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#10b981;font-weight:600;">TARGET 1</div>
+                                            <div id="gr-p-t1" style="font-size:13px;font-weight:700;color:#10b981;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-p-t1-pct" style="font-size:10px;color:#10b981;">+--%</div>
                                         </div>
-                                        <div style="background:rgba(0,240,255,0.06);padding:6px;border-radius:4px;border:1px solid rgba(0,240,255,0.2);">
-                                            <div style="font-size:9px;color:#00f0ff;">RUNNER T2</div>
-                                            <div id="gr-p-t2" style="font-size:13px;font-weight:800;color:#00f0ff;">₹--</div>
-                                            <div id="gr-p-t2-pct" style="font-size:9px;color:#00f0ff;">+--%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#38bdf8;font-weight:600;">TARGET 2</div>
+                                            <div id="gr-p-t2" style="font-size:13px;font-weight:700;color:#38bdf8;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-p-t2-pct" style="font-size:10px;color:#38bdf8;">+--%</div>
                                         </div>
-                                        <div style="background:rgba(255,68,68,0.06);padding:6px;border-radius:4px;border:1px solid rgba(255,68,68,0.2);">
-                                            <div style="font-size:9px;color:#ef5350;">STOP LOSS</div>
-                                            <div id="gr-p-sl" style="font-size:13px;font-weight:800;color:#ef5350;">₹--</div>
-                                            <div id="gr-p-sl-pct" style="font-size:9px;color:#ef5350;">---%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#ef4444;font-weight:600;">STOP LOSS</div>
+                                            <div id="gr-p-sl" style="font-size:13px;font-weight:700;color:#ef4444;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-p-sl-pct" style="font-size:10px;color:#ef4444;">---%</div>
                                         </div>
                                     </div>
-                                    <div style="font-size:10px;color:#64748b;margin-top:8px;display:flex;justify-content:space-between;">
-                                        <span>Steady Delta ~0.50</span>
-                                        <span>Low Decay Risk</span>
+                                    <div style="font-size:11px;color:#64748b;margin-top:12px;">
+                                        Balanced delta (~0.50) &bull; Lower time decay risk
                                     </div>
                                 </div>
 
-                                <!-- Option 2: 0DTE OTM Gamma Rocket Strike -->
-                                <div style="background:rgba(26,18,36,0.9);border:1px solid rgba(255,112,67,0.3);border-radius:8px;padding:14px;">
-                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                                <!-- Option 2: Momentum OTM Strike -->
+                                <div style="background:#13182b;border:1px solid #1e2438;border-radius:10px;padding:18px;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
                                         <div>
-                                            <span style="font-size:10px;font-weight:800;color:#ff7043;background:rgba(255,112,67,0.15);padding:2px 6px;border-radius:4px;">OPTION ② · 0DTE GAMMA ROCKET 🔥</span>
-                                            <div id="gr-o-strike-name" style="font-size:18px;font-weight:900;color:#ffffff;margin-top:4px;">-- CE</div>
+                                            <span style="font-size:10px;font-weight:700;color:#cbd5e1;background:#17223b;padding:3px 8px;border-radius:4px;letter-spacing:0.5px;">MOMENTUM (OTM) &bull; HIGH LEVERAGE</span>
+                                            <div id="gr-o-strike-name" style="font-size:20px;font-weight:800;color:#ffffff;font-family:'JetBrains Mono',monospace;margin-top:6px;">-- CE</div>
                                         </div>
                                         <div style="text-align:right;">
-                                            <div style="font-size:10px;color:#94a3b8;">LTP (Cheap Entry)</div>
-                                            <div id="gr-o-ltp" style="font-size:18px;font-weight:900;color:#ff7043;">₹--</div>
+                                            <div style="font-size:10px;color:#64748b;">Current Price</div>
+                                            <div id="gr-o-ltp" style="font-size:20px;font-weight:800;color:#cbd5e1;font-family:'JetBrains Mono',monospace;">₹--</div>
                                         </div>
                                     </div>
-                                    <!-- Pricing Grid -->
-                                    <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:6px;text-align:center;">
-                                        <div style="background:rgba(255,255,255,0.03);padding:6px;border-radius:4px;border:1px solid #1e2442;">
-                                            <div style="font-size:9px;color:#94a3b8;">BUY ZONE</div>
-                                            <div id="gr-o-buy" style="font-size:13px;font-weight:800;color:#ffffff;">₹--</div>
+                                    <!-- Clean Price Levels -->
+                                    <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:8px;text-align:center;">
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#94a3b8;font-weight:600;">BUY AT</div>
+                                            <div id="gr-o-buy" style="font-size:13px;font-weight:700;color:#ffffff;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
                                         </div>
-                                        <div style="background:rgba(0,230,118,0.06);padding:6px;border-radius:4px;border:1px solid rgba(0,230,118,0.2);">
-                                            <div style="font-size:9px;color:#00e676;">EXPLOSION T1</div>
-                                            <div id="gr-o-t1" style="font-size:13px;font-weight:800;color:#00e676;">₹--</div>
-                                            <div id="gr-o-t1-pct" style="font-size:9px;color:#00e676;">+--%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#10b981;font-weight:600;">TARGET 1</div>
+                                            <div id="gr-o-t1" style="font-size:13px;font-weight:700;color:#10b981;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-o-t1-pct" style="font-size:10px;color:#10b981;">+--%</div>
                                         </div>
-                                        <div style="background:rgba(0,240,255,0.06);padding:6px;border-radius:4px;border:1px solid rgba(0,240,255,0.2);">
-                                            <div style="font-size:9px;color:#00f0ff;">JACKPOT T2</div>
-                                            <div id="gr-o-t2" style="font-size:13px;font-weight:800;color:#00f0ff;">₹--</div>
-                                            <div id="gr-o-t2-pct" style="font-size:9px;color:#00f0ff;">+--%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#38bdf8;font-weight:600;">TARGET 2</div>
+                                            <div id="gr-o-t2" style="font-size:13px;font-weight:700;color:#38bdf8;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-o-t2-pct" style="font-size:10px;color:#38bdf8;">+--%</div>
                                         </div>
-                                        <div style="background:rgba(255,68,68,0.06);padding:6px;border-radius:4px;border:1px solid rgba(255,68,68,0.2);">
-                                            <div style="font-size:9px;color:#ef5350;">STOP LOSS</div>
-                                            <div id="gr-o-sl" style="font-size:13px;font-weight:800;color:#ef5350;">₹--</div>
-                                            <div id="gr-o-sl-pct" style="font-size:9px;color:#ef5350;">---%</div>
+                                        <div style="background:#0e1322;padding:8px 6px;border-radius:6px;border:1px solid #1a2035;">
+                                            <div style="font-size:10px;color:#ef4444;font-weight:600;">STOP LOSS</div>
+                                            <div id="gr-o-sl" style="font-size:13px;font-weight:700;color:#ef4444;font-family:'JetBrains Mono',monospace;margin-top:2px;">₹--</div>
+                                            <div id="gr-o-sl-pct" style="font-size:10px;color:#ef4444;">---%</div>
                                         </div>
                                     </div>
-                                    <div style="font-size:10px;color:#ff8a65;margin-top:8px;display:flex;justify-content:space-between;">
-                                        <span>Convexity Hero · 3x-6x Potential</span>
-                                        <span id="gr-o-status-tag" style="color:#00e676;">Runway Inside Vacuum</span>
+                                    <div style="font-size:11px;color:#64748b;margin-top:12px;">
+                                        <span id="gr-o-status-tag" style="color:#94a3b8;">Lower premium cost &bull; Higher percentage upside on momentum</span>
                                     </div>
                                 </div>
                             </div>
 
-                            <!-- Bottom Action Summary Strip (Executive One-Sentence Instruction) -->
-                            <div style="background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                                <div style="display:flex;align-items:center;gap:8px;">
-                                    <span style="font-size:11px;font-weight:800;color:#ffd54f;">⚡ ACTION INSTRUCTION:</span>
-                                    <span id="gr-action-text" style="font-size:12px;font-weight:700;color:#ffffff;">Monitoring option chain for Wall ② proximity...</span>
+                            <!-- Bottom Action Summary (Clean & Clear) -->
+                            <div style="background:#13182b;border:1px solid #1e2438;border-radius:8px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                                <div style="display:flex;align-items:center;gap:10px;">
+                                    <span style="font-size:11px;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:0.5px;">Action Plan:</span>
+                                    <span id="gr-action-text" style="font-size:13px;font-weight:600;color:#ffffff;">Monitoring Nifty for trigger proximity...</span>
                                 </div>
-                                <div style="font-size:10px;color:#64748b;" id="gr-update-ts">
+                                <div style="font-size:11px;color:#64748b;" id="gr-update-ts">
                                     Updated: --:--:--
                                 </div>
                             </div>
@@ -4447,7 +4687,6 @@ class VolatilityAnalyzer:
                     theta_tab_html = '<div class="card"><p style="color:#888;">Waiting for option chain data to compute Theta Decay...</p></div>'
                     try:
                         if not df_chain.empty and spot > 0:
-                            _lot_th = _get_cfg("nifty_lot_size", 65)
                             _r_th = _get_cfg("risk_free_rate", 0.051274)
                             _q_th = _get_cfg("dividend_yield", 0.0122)
                             _T_th = self.analytics.get_time_to_expiry(near_exp) or (7.0 / 365.0)
@@ -4467,9 +4706,9 @@ class VolatilityAnalyzer:
                                     _th_lookup[(_row['strike'], _row['type'])] = _row
 
                                 _theta_table_rows = []
-                                _ce_thetas_inr = []
-                                _pe_thetas_inr = []
-                                _straddle_thetas_inr = []
+                                _ce_thetas_pts = []
+                                _pe_thetas_pts = []
+                                _straddle_thetas_pts = []
                                 _daily_cushions_pts = []
                                 _decay_yields_pct = []
                                 _valid_strikes = []
@@ -4477,24 +4716,9 @@ class VolatilityAnalyzer:
                                 _pe_deltas = []
                                 _net_deltas = []
                                 _gammas = []
-                                _ce_vegas_inr = []
-                                _pe_vegas_inr = []
-                                _straddle_vegas_inr = []
-
-                                _peak_theta_val = 0.0
-                                _peak_strike = _atm_strike_th
-                                _best_harvest_score = -1.0
-                                _sweet_strike = _atm_strike_th
-                                _sweet_cushion = 0.0
-                                _sweet_yield = 0.0
-                                _top_buyer_strike = _atm_strike_th
-                                _top_buyer_conv = 0.0
-                                _top_buyer_score = 0.0
-                                _top_seller_strike = _atm_strike_th
-                                _top_seller_score = 0.0
-                                _atm_strad_prem = 0.0
-                                _atm_strad_ext_pts = 0.0
-                                _atm_strad_ext_inr = 0.0
+                                _ce_vegas_pts = []
+                                _pe_vegas_pts = []
+                                _straddle_vegas_pts = []
 
                                 def _calc_merton_theta(K_val, sig_val, otype):
                                     sqT = np.sqrt(max(_T_th, 1e-6))
@@ -4542,315 +4766,103 @@ class VolatilityAnalyzer:
                                     _ce_ext_pts = max(0.0, _ce_ltp - _ce_intr)
                                     _pe_ext_pts = max(0.0, _pe_ltp - _pe_intr)
 
+                                    _ce_intr_pct = (_ce_intr / _ce_ltp * 100.0) if _ce_ltp > 0 else 0.0
+                                    _ce_ext_pct = (_ce_ext_pts / _ce_ltp * 100.0) if _ce_ltp > 0 else 100.0
+                                    _pe_intr_pct = (_pe_intr / _pe_ltp * 100.0) if _pe_ltp > 0 else 0.0
+                                    _pe_ext_pct = (_pe_ext_pts / _pe_ltp * 100.0) if _pe_ltp > 0 else 100.0
+
                                     # Extrinsic boundary clamping: Daily decay cannot exceed remaining extrinsic value
                                     _th_ce_day = min(abs(_th_ce), _ce_ext_pts) if _ce_ext_pts > 0 else abs(_th_ce)
                                     _th_pe_day = min(abs(_th_pe), _pe_ext_pts) if _pe_ext_pts > 0 else abs(_th_pe)
 
-                                    _th_ce_inr = -_th_ce_day * _lot_th
-                                    _th_pe_inr = -_th_pe_day * _lot_th
-                                    _th_strad_inr = _th_ce_inr + _th_pe_inr
-                                    _th_strad_1h = _th_strad_inr / 6.25
-
+                                    _th_strad_pts = _th_ce_day + _th_pe_day
                                     _strad_gam = _gam_ce + _gam_pe
                                     _del_net = _del_ce + _del_pe
                                     _vg_net = _vg_ce + _vg_pe
 
-                                    _th_day_pts = abs(_th_strad_inr / _lot_th)
-                                    _daily_cushion_pts = float(np.sqrt(max(2.0 * _th_day_pts / max(_strad_gam, 1e-7), 0.0)))
+                                    _daily_cushion_pts = float(np.sqrt(max(2.0 * _th_strad_pts / max(_strad_gam, 1e-7), 0.0)))
                                     _daily_cushion_pts = min(_daily_cushion_pts, 999.0)
 
                                     _strad_prem = max(_ce_ltp + _pe_ltp, 0.01)
-                                    _intrinsic = abs(spot - _K)
-                                    _strad_ext_pts = max(_strad_prem - _intrinsic, 0.0)
-                                    _strad_ext_inr = _strad_ext_pts * _lot_th
-                                    _ext_pct = (_strad_ext_pts / _strad_prem) * 100.0 if _strad_prem > 0 else 0.0
-
-                                    _yield_pct = (_th_day_pts / _strad_prem) * 100.0
+                                    _yield_pct = (_th_strad_pts / _strad_prem) * 100.0
                                     _yield_pct = min(_yield_pct, 100.0)
 
-                                    # Spot move required to break even (Breakeven Velocity)
-                                    _ce_be_pts = round(_th_ce_day / max(abs(_del_ce), 0.05), 1)
-                                    _pe_be_pts = round(_th_pe_day / max(abs(_del_pe), 0.05), 1)
-
-                                    _cushion_ratio = _daily_cushion_pts / max(spot, 1000.0)
-                                    _sell_score = min(max((_yield_pct * 0.4) + (min(_daily_cushion_pts, 250.0) / 250.0 * 30.0) + (20.0 if abs(_K - spot) <= 100 else 10.0), 0.0), 100.0)
-                                    _convexity = (_strad_gam / max(_strad_prem, 1.0)) * 10000.0
-                                    _buy_score = min(max(_convexity * 15.0 + (25.0 if abs(_K - spot) <= 75 else 10.0), 0.0), 100.0)
-
-                                    if _convexity > _top_buyer_conv:
-                                        _top_buyer_conv = _convexity
-                                        _top_buyer_strike = _K
-                                        _top_buyer_score = _buy_score
-
                                     _valid_strikes.append(_K)
-                                    _ce_thetas_inr.append(_th_ce_inr)
-                                    _pe_thetas_inr.append(_th_pe_inr)
-                                    _straddle_thetas_inr.append(_th_strad_inr)
+                                    _ce_thetas_pts.append(_th_ce_day)
+                                    _pe_thetas_pts.append(_th_pe_day)
+                                    _straddle_thetas_pts.append(_th_strad_pts)
                                     _daily_cushions_pts.append(_daily_cushion_pts)
                                     _decay_yields_pct.append(_yield_pct)
                                     _ce_deltas.append(_del_ce)
                                     _pe_deltas.append(_del_pe)
                                     _net_deltas.append(_del_net)
                                     _gammas.append(_strad_gam)
-                                    _ce_vegas_inr.append(_vg_ce * _lot_th)
-                                    _pe_vegas_inr.append(_vg_pe * _lot_th)
-                                    _straddle_vegas_inr.append(_vg_net * _lot_th)
+                                    _ce_vegas_pts.append(_vg_ce)
+                                    _pe_vegas_pts.append(_vg_pe)
+                                    _straddle_vegas_pts.append(_vg_net)
 
-                                    if abs(_th_strad_inr) > _peak_theta_val:
-                                        _peak_theta_val = abs(_th_strad_inr)
-                                        _peak_strike = _K
-
-                                    _harvest_score = abs(_th_strad_inr) * _cushion_ratio * (1.0 + (_yield_pct / 100.0))
-                                    if abs(_K - spot) <= (spot * 0.04) and _harvest_score > _best_harvest_score:
-                                        _best_harvest_score = _harvest_score
-                                        _sweet_strike = _K
-                                        _sweet_cushion = _daily_cushion_pts
-                                        _sweet_yield = _yield_pct
-                                        _top_seller_strike = _K
-                                        _top_seller_score = _sell_score
+                                    _is_atm = (_K == _atm_strike_th)
+                                    _row_id = 'id="th-row-atm"' if _is_atm else ''
+                                    _row_atm_attr = 'data-is-atm="true"' if _is_atm else ''
+                                    _row_style = 'background:rgba(79,195,247,0.12);font-weight:700;border-left:3px solid #00e5ff;' if _is_atm else ''
 
                                     _dist = _K - spot
                                     _dist_cls = GREEN if _dist > 0 else RED if _dist < 0 else ACCENT
                                     _dist_str = f"{_dist:+.0f}" if _dist != 0 else "ATM"
 
-                                    if _sell_score >= 50.0 and _daily_cushion_pts >= 60.0:
-                                        _edge_badge = f'<span class="badge-edge edge-seller" style="background:rgba(16,185,129,0.18);color:#10b981;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid rgba(16,185,129,0.35);">SELLER ADV ({_sell_score:.0f})</span>'
-                                    elif _buy_score >= 45.0:
-                                        _edge_badge = f'<span class="badge-edge edge-buyer" style="background:rgba(2,132,199,0.18);color:#38bdf8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.35);">BUY CONVEX ({_buy_score:.0f})</span>'
-                                    else:
-                                        _edge_badge = f'<span class="badge-edge edge-neutral" style="background:rgba(148,163,184,0.15);color:#94a3b8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">NEUTRAL</span>'
+                                    _ce_comp_html = (
+                                        f'<div style="display:flex;flex-direction:column;gap:1px;font-size:10.5px;font-family:var(--font-mono);">'
+                                        f'<div><span style="color:#868993;">Int:</span> <span style="color:#ffffff;">{_ce_intr:.1f} pts</span> <span style="color:#64748b;font-size:9.5px;">({_ce_intr_pct:.0f}%)</span></div>'
+                                        f'<div><span style="color:#868993;">Ext:</span> <strong style="color:#00e5ff;">{_ce_ext_pts:.1f} pts</strong> <span style="color:#00e5ff;font-size:9.5px;">({_ce_ext_pct:.0f}%)</span></div>'
+                                        f'</div>'
+                                    )
 
-                                    if abs(_K - spot) <= 50 and _curr_dte_th <= 0.5:
-                                        _ret_badge = f'<span style="background:rgba(239,68,68,0.2);color:#ef5350;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #ef5350;">EXIT / ROLL</span>'
-                                    elif _ext_pct <= 20.0 and _strad_prem > 5.0:
-                                        _ret_badge = f'<span style="background:rgba(255,213,79,0.2);color:#ffd54f;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #ffd54f;">TAKE PROFIT</span>'
-                                    elif _daily_cushion_pts < 30.0 and abs(_K - spot) <= 150:
-                                        _ret_badge = f'<span style="background:rgba(249,115,22,0.2);color:#fb923c;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #fb923c;">DEFEND</span>'
-                                    elif _sell_score >= 55.0:
-                                        _ret_badge = f'<span style="background:rgba(16,185,129,0.2);color:#10b981;font-size:10px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid #10b981;">STAY IN TRADE</span>'
-                                    else:
-                                        _ret_badge = f'<span style="background:rgba(148,163,184,0.15);color:#94a3b8;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">HOLD</span>'
+                                    _ce_greeks_html = (
+                                        f'<div style="display:flex;flex-direction:column;gap:1px;font-size:10.5px;font-family:var(--font-mono);">'
+                                        f'<div><span style="color:#868993;">Δ:</span> <strong style="color:#00e5ff;">{_del_ce:+.2f}</strong> · <span style="color:#868993;">Θ:</span> <strong style="color:#ef5350;">-{_th_ce_day:.1f}</strong> <span style="color:#64748b;font-size:9.5px;">pts/d</span></div>'
+                                        f'<div><span style="color:#868993;">Vega:</span> <strong style="color:#00e676;">+{_vg_ce:.1f}</strong> <span style="color:#64748b;font-size:9.5px;">pts/1%</span></div>'
+                                        f'</div>'
+                                    )
 
-                                    _is_atm = (_K == _atm_strike_th)
-                                    if _is_atm:
-                                        _atm_strad_prem = _strad_prem
-                                        _atm_strad_ext_pts = _strad_ext_pts
-                                        _atm_strad_ext_inr = _strad_ext_inr
+                                    _pe_comp_html = (
+                                        f'<div style="display:flex;flex-direction:column;gap:1px;font-size:10.5px;font-family:var(--font-mono);">'
+                                        f'<div><span style="color:#868993;">Int:</span> <span style="color:#ffffff;">{_pe_intr:.1f} pts</span> <span style="color:#64748b;font-size:9.5px;">({_pe_intr_pct:.0f}%)</span></div>'
+                                        f'<div><span style="color:#868993;">Ext:</span> <strong style="color:#ff7043;">{_pe_ext_pts:.1f} pts</strong> <span style="color:#ff7043;font-size:9.5px;">({_pe_ext_pct:.0f}%)</span></div>'
+                                        f'</div>'
+                                    )
 
-                                    _row_id = 'id="th-row-atm"' if _is_atm else ''
-                                    _row_atm_attr = 'data-is-atm="true"' if _is_atm else ''
-                                    _row_style = 'background:rgba(79,195,247,0.12);font-weight:700;border-left:3px solid #4fc3f7;cursor:pointer;' if _is_atm else 'cursor:pointer;'
+                                    _pe_greeks_html = (
+                                        f'<div style="display:flex;flex-direction:column;gap:1px;font-size:10.5px;font-family:var(--font-mono);">'
+                                        f'<div><span style="color:#868993;">Δ:</span> <strong style="color:#ff7043;">{_del_pe:+.2f}</strong> · <span style="color:#868993;">Θ:</span> <strong style="color:#ef5350;">-{_th_pe_day:.1f}</strong> <span style="color:#64748b;font-size:9.5px;">pts/d</span></div>'
+                                        f'<div><span style="color:#868993;">Vega:</span> <strong style="color:#00e676;">+{_vg_pe:.1f}</strong> <span style="color:#64748b;font-size:9.5px;">pts/1%</span></div>'
+                                        f'</div>'
+                                    )
 
                                     _theta_table_rows.append(
-                                        f'<tr {_row_id} {_row_atm_attr} data-strike="{_K}" data-dist="{_dist}" '
-                                        f'data-ce-ltp="{_ce_ltp:.2f}" data-pe-ltp="{_pe_ltp:.2f}" data-strad-ltp="{_strad_prem:.2f}" '
-                                        f'data-ce-intr="{_ce_intr:.2f}" data-pe-intr="{_pe_intr:.2f}" data-strad-intr="{_intrinsic:.2f}" '
-                                        f'data-ce-ext="{_ce_ext_pts:.2f}" data-pe-ext="{_pe_ext_pts:.2f}" data-strad-ext="{_strad_ext_pts:.2f}" '
-                                        f'data-ext-pts="{_strad_ext_pts:.2f}" data-ext-inr="{_strad_ext_inr:.0f}" '
-                                        f'data-ce-theta="{_th_ce_inr:.2f}" data-pe-theta="{_th_pe_inr:.2f}" data-strad-theta="{_th_strad_inr:.2f}" '
-                                        f'data-ce-delta="{_del_ce:.4f}" data-pe-delta="{_del_pe:.4f}" data-net-delta="{_del_net:.4f}" '
-                                        f'data-ce-gamma="{_strad_gam/2.0:.6f}" data-pe-gamma="{_strad_gam/2.0:.6f}" data-strad-gam="{_strad_gam:.6f}" '
-                                        f'data-ce-vega="{_vg_ce * _lot_th:.2f}" data-pe-vega="{_vg_pe * _lot_th:.2f}" data-strad-vega="{_vg_net * _lot_th:.2f}" '
-                                        f'data-ce-iv="{_ce_calc_iv:.2f}" data-pe-iv="{_pe_calc_iv:.2f}" '
-                                        f'data-cushion="{_daily_cushion_pts:.1f}" data-yield="{_yield_pct:.1f}" '
-                                        f'onclick="selectSimStrike({_K})" title="Click strike to simulate in Greek Cause & Effect engine" style="{_row_style}">'
-                                        f'<td style="text-align:left;color:{WHITE};font-weight:700;">{_K:,.0f} {"(ATM)" if _is_atm else ""}</td>'
-                                        f'<td style="color:{_dist_cls};">{_dist_str}</td>'
-                                        f'<td style="color:#ffd54f;font-weight:700;">₹{_strad_prem:.1f}</td>'
-                                        f'<td>₹{_ce_ltp:.1f} <span style="color:{MUTED};font-size:10px;">({_ce_calc_iv:.1f}%)</span></td>'
-                                        f'<td style="color:#38bdf8;">{_del_ce:+.2f}</td>'
-                                        f'<td>{_strad_gam/2.0:.5f}</td>'
-                                        f'<td style="color:{RED};">₹{_th_ce_inr:,.0f}</td>'
-                                        f'<td style="color:#c084fc;">₹{_vg_ce * _lot_th:,.0f}</td>'
-                                        f'<td>₹{_pe_ltp:.1f} <span style="color:{MUTED};font-size:10px;">({_pe_calc_iv:.1f}%)</span></td>'
-                                        f'<td style="color:#ff7043;">{_del_pe:+.2f}</td>'
-                                        f'<td>{_strad_gam/2.0:.5f}</td>'
-                                        f'<td style="color:{RED};">₹{_th_pe_inr:,.0f}</td>'
-                                        f'<td style="color:#c084fc;">₹{_vg_pe * _lot_th:,.0f}</td>'
-                                        f'<td style="color:{RED};font-weight:700;">₹{_th_strad_inr:,.0f}</td>'
-                                        f'<td style="color:{GREEN};font-weight:700;">±{_daily_cushion_pts:.0f} pts</td>'
+                                        f'<tr {_row_id} {_row_atm_attr} style="{_row_style}border-bottom:1px solid #1a1a2e;">'
+                                        f'<td style="padding:6px 8px;text-align:left;font-weight:700;color:{ACCENT if _is_atm else WHITE};">{int(_K)}{" ◄ ATM" if _is_atm else ""}</td>'
+                                        f'<td style="padding:6px 8px;text-align:right;color:{_dist_cls};font-family:var(--font-mono);">{_dist_str}</td>'
+                                        f'<td style="padding:6px 8px;text-align:right;color:#00e5ff;font-family:var(--font-mono);">{_ce_ltp:.1f} <span style="font-size:10px;color:#868993;">({_ce_calc_iv:.1f}%)</span></td>'
+                                        f'<td style="padding:6px 8px;text-align:left;">{_ce_comp_html}</td>'
+                                        f'<td style="padding:6px 8px;text-align:left;">{_ce_greeks_html}</td>'
+                                        f'<td style="padding:6px 8px;text-align:right;color:#ff7043;font-family:var(--font-mono);">{_pe_ltp:.1f} <span style="font-size:10px;color:#868993;">({_pe_calc_iv:.1f}%)</span></td>'
+                                        f'<td style="padding:6px 8px;text-align:left;">{_pe_comp_html}</td>'
+                                        f'<td style="padding:6px 8px;text-align:left;">{_pe_greeks_html}</td>'
+                                        f'<td style="padding:6px 8px;text-align:right;font-weight:800;color:#ffd54f;font-family:var(--font-mono); font-size:11px;">-{_th_strad_pts:.1f} pts/d</td>'
+                                        f'<td style="padding:6px 8px;text-align:right;font-weight:700;color:#00e676;font-family:var(--font-mono);">±{_daily_cushion_pts:.0f} pts</td>'
                                         f'</tr>'
                                     )
 
                                 _atm_idx = _valid_strikes.index(_atm_strike_th) if _atm_strike_th in _valid_strikes else 0
-                                _atm_ce_inr = _ce_thetas_inr[_atm_idx]
-                                _atm_pe_inr = _pe_thetas_inr[_atm_idx]
-                                _atm_strad_inr = _straddle_thetas_inr[_atm_idx]
-                                _atm_strad_1h = _atm_strad_inr / 6.25
+                                _atm_ce_pts_abs = _ce_thetas_pts[_atm_idx] if _atm_idx < len(_ce_thetas_pts) else 5.4
+                                _atm_pe_pts_abs = _pe_thetas_pts[_atm_idx] if _atm_idx < len(_pe_thetas_pts) else 5.6
+                                _atm_strad_day_pts = _straddle_thetas_pts[_atm_idx] if _atm_idx < len(_straddle_thetas_pts) else (_atm_ce_pts_abs + _atm_pe_pts_abs)
+                                _atm_strad_1h_pts = _atm_strad_day_pts / 6.25
+                                _atm_strad_vega = _straddle_vegas_pts[_atm_idx] if _atm_idx < len(_straddle_vegas_pts) else 19.5
 
-
-                                _fig_th_synced = make_subplots(
-                                    rows=2, cols=2,
-                                    subplot_titles=[
-                                        "1. DELTA (Δ) PROFILE — Real vs Forecast Overlay",
-                                        "2. GAMMA (Γ) RISK PROFILE — Real vs Forecast Overlay",
-                                        "3. THETA (Θ) BLEED (₹/lot/day) — Real vs Forecast Overlay",
-                                        "4. VEGA (V) SENSITIVITY (₹/lot per 1% IV) — Real vs Forecast Overlay"
-                                    ],
-                                    horizontal_spacing=0.08,
-                                    vertical_spacing=0.12
-                                )
-
-                                # Panel (1, 1): Delta (Δ)
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_ce_deltas,
-                                        mode='lines+markers', name='Call Delta (Real)',
-                                        line=dict(color='#38bdf8', width=2),
-                                        marker=dict(size=4)
-                                    ), row=1, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_pe_deltas,
-                                        mode='lines+markers', name='Put Delta (Real)',
-                                        line=dict(color='#ff7043', width=2),
-                                        marker=dict(size=4)
-                                    ), row=1, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_net_deltas,
-                                        mode='lines', name='Net Delta (Real)',
-                                        line=dict(color='#ffd54f', width=1.5, dash='dash')
-                                    ), row=1, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_ce_deltas,
-                                        mode='lines', name='Call Δ (Forecast)',
-                                        line=dict(color='#38bdf8', width=2, dash='dot'),
-                                        opacity=0.85
-                                    ), row=1, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_pe_deltas,
-                                        mode='lines', name='Put Δ (Forecast)',
-                                        line=dict(color='#ff7043', width=2, dash='dot'),
-                                        opacity=0.85
-                                    ), row=1, col=1
-                                )
-                                _fig_th_synced.add_hline(y=0.0, line_width=1, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=1, col=1)
-
-                                # Panel (1, 2): Gamma (Γ)
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_gammas,
-                                        mode='lines+markers', name='Gamma (Real)',
-                                        line=dict(color='#fbbf24', width=2.5),
-                                        marker=dict(size=4),
-                                        fill='tozeroy', fillcolor='rgba(251,191,36,0.12)'
-                                    ), row=1, col=2
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_gammas,
-                                        mode='lines', name='Gamma (Forecast)',
-                                        line=dict(color='#00f0ff', width=2, dash='dot'),
-                                        opacity=0.85
-                                    ), row=1, col=2
-                                )
-
-                                # Panel (2, 1): Theta (Θ)
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=[abs(x) for x in _ce_thetas_inr],
-                                        mode='lines+markers', name='Call θ (Real)',
-                                        line=dict(color='#38bdf8', width=2),
-                                        marker=dict(size=4)
-                                    ), row=2, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=[abs(x) for x in _pe_thetas_inr],
-                                        mode='lines+markers', name='Put θ (Real)',
-                                        line=dict(color='#ff7043', width=2),
-                                        marker=dict(size=4)
-                                    ), row=2, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=[abs(x) for x in _straddle_thetas_inr],
-                                        mode='lines', name='Straddle Bleed (Real)',
-                                        line=dict(color='#10b981', width=2, dash='dash')
-                                    ), row=2, col=1
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=[abs(x) for x in _straddle_thetas_inr],
-                                        mode='lines', name='Straddle θ (Forecast)',
-                                        line=dict(color='#00e676', width=2, dash='dot'),
-                                        opacity=0.85
-                                    ), row=2, col=1
-                                )
-
-                                # Panel (2, 2): Vega (V)
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_straddle_vegas_inr,
-                                        mode='lines+markers', name='Straddle Vega (Real)',
-                                        line=dict(color='#c084fc', width=2.5),
-                                        marker=dict(size=4),
-                                        fill='tozeroy', fillcolor='rgba(192,132,252,0.12)'
-                                    ), row=2, col=2
-                                )
-                                _fig_th_synced.add_trace(
-                                    go.Scatter(
-                                        x=_valid_strikes, y=_straddle_vegas_inr,
-                                        mode='lines', name='Straddle Vega (Forecast)',
-                                        line=dict(color='#e879f9', width=2, dash='dot'),
-                                        opacity=0.85
-                                    ), row=2, col=2
-                                )
-
-                                # Spot Reference Lines for all 4 quadrants
-                                for _r, _c in [(1,1), (1,2), (2,1), (2,2)]:
-                                    _fig_th_synced.add_vline(
-                                        x=spot, line_width=1.5, line_dash="dash", line_color="#ffffff",
-                                        annotation_text="SPOT" if (_r == 1 and _c == 1) else None,
-                                        annotation_position="top right",
-                                        annotation_font=dict(size=9, color="#ffffff"),
-                                        row=_r, col=_c
-                                    )
-                                    _fig_th_synced.add_vline(
-                                        x=spot, line_width=1.5, line_dash="dot", line_color="#00f0ff",
-                                        annotation_text="F-SPOT" if (_r == 1 and _c == 1) else None,
-                                        annotation_position="top left",
-                                        annotation_font=dict(size=9, color="#00f0ff"),
-                                        row=_r, col=_c
-                                    )
-
-                                _fig_th_synced.update_layout(
-                                    height=680, autosize=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                                    font=dict(color=WHITE, family='Inter, sans-serif', size=10),
-                                    legend=dict(
-                                        bgcolor='rgba(10,14,28,0.9)', bordercolor='rgba(255,255,255,0.1)',
-                                        font=dict(size=9), orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1
-                                    ),
-                                    margin=dict(l=45, r=20, t=35, b=30), hovermode='x unified'
-                                )
-                                _fig_th_synced.update_xaxes(gridcolor='rgba(255,255,255,0.05)', showgrid=True)
-                                _fig_th_synced.update_yaxes(gridcolor='rgba(255,255,255,0.05)', showgrid=True)
-                                _fig_th_synced.update_xaxes(title_text="Strike", row=2, col=1)
-                                _fig_th_synced.update_xaxes(title_text="Strike", row=2, col=2)
-                                _fig_th_synced.update_yaxes(title_text="Delta (Δ)", row=1, col=1)
-                                _fig_th_synced.update_yaxes(title_text="Gamma (Γ)", row=1, col=2)
-                                _fig_th_synced.update_yaxes(title_text="₹ / lot / day", row=2, col=1)
-                                _fig_th_synced.update_yaxes(title_text="₹ / 1% IV", row=2, col=2)
-                                _plotly_th_synced = _fig_th_synced.to_html(include_plotlyjs=False, full_html=False)
-
-                                # ── Quantitative Normalization & Granular Decay Calculations ──
-                                _atm_idx = _valid_strikes.index(_atm_strike_th) if _atm_strike_th in _valid_strikes else 0
-                                _atm_ce_inr = _ce_thetas_inr[_atm_idx] if _atm_idx < len(_ce_thetas_inr) else -1800.0
-                                _atm_pe_inr = _pe_thetas_inr[_atm_idx] if _atm_idx < len(_pe_thetas_inr) else -1950.0
-                                _atm_strad_inr = _straddle_thetas_inr[_atm_idx] if _atm_idx < len(_straddle_thetas_inr) else (_atm_ce_inr + _atm_pe_inr)
-                                _atm_ce_1h = _atm_ce_inr / 6.25
-                                _atm_pe_1h = _atm_pe_inr / 6.25
-                                _atm_strad_1h = _atm_strad_inr / 6.25
-                                _atm_ce_1m = _atm_ce_inr / 375.0
-                                _atm_pe_1m = _atm_pe_inr / 375.0
-                                _atm_strad_1m = _atm_strad_inr / 375.0
+                                _atm_del_ce = _ce_deltas[_atm_idx] if _atm_idx < len(_ce_deltas) else 0.5
+                                _atm_del_pe = _pe_deltas[_atm_idx] if _atm_idx < len(_pe_deltas) else -0.5
+                                _atm_del_net = _net_deltas[_atm_idx] if _atm_idx < len(_net_deltas) else (_atm_del_ce + _atm_del_pe)
 
                                 _atm_ce_row = _th_lookup.get((_atm_strike_th, 'CE'))
                                 _atm_pe_row = _th_lookup.get((_atm_strike_th, 'PE'))
@@ -4858,493 +4870,309 @@ class VolatilityAnalyzer:
                                 _atm_pe_ltp = float(_atm_pe_row['price']) if _atm_pe_row is not None else 0.0
                                 _atm_strad_prem = max(_atm_ce_ltp + _atm_pe_ltp, 0.01)
 
-                                _atm_ce_ext_pts = max(0.0, _atm_ce_ltp - max(0.0, spot - _atm_strike_th))
-                                _atm_ce_ext_inr = _atm_ce_ext_pts * _lot_th
-                                _atm_pe_ext_pts = max(0.0, _atm_pe_ltp - max(0.0, _atm_strike_th - spot))
-                                _atm_pe_ext_inr = _atm_pe_ext_pts * _lot_th
-                                _atm_strad_ext_pts = _atm_ce_ext_pts + _atm_pe_ext_pts
-                                _atm_strad_ext_inr = _atm_strad_ext_pts * _lot_th
-
-                                _atm_ce_yield = (abs(_atm_ce_inr / _lot_th) / max(_atm_ce_ltp, 0.1)) * 100.0
-                                _atm_pe_yield = (abs(_atm_pe_inr / _lot_th) / max(_atm_pe_ltp, 0.1)) * 100.0
-                                _atm_strad_yield = (abs(_atm_strad_inr / _lot_th) / max(_atm_strad_prem, 0.1)) * 100.0
-                                _atm_ce_be = round(abs(_atm_ce_inr / _lot_th) / 0.50, 1)
-                                _atm_pe_be = round(abs(_atm_pe_inr / _lot_th) / 0.50, 1)
+                                _atm_strad_yield = (_atm_strad_day_pts / max(_atm_strad_prem, 0.1)) * 100.0
                                 _atm_strad_cushion = _daily_cushions_pts[_atm_idx] if _atm_idx < len(_daily_cushions_pts) else 60.0
 
-                                # ── Theta Asymmetry & Bleed Dominance Comparator ──
-                                _atm_ce_inr_abs = abs(_atm_ce_inr)
-                                _atm_pe_inr_abs = abs(_atm_pe_inr)
-                                _atm_th_tot = _atm_ce_inr_abs + _atm_pe_inr_abs
-                                _atm_ce_pct = (_atm_ce_inr_abs / max(_atm_th_tot, 1e-6)) * 100.0
-                                _atm_pe_pct = (_atm_pe_inr_abs / max(_atm_th_tot, 1e-6)) * 100.0
-                                _atm_th_ratio = _atm_ce_inr_abs / max(_atm_pe_inr_abs, 1e-6)
+                                # Intraday High/Low Watermark Context Tracker (persistent)
+                                _intraday_greeks_file = os.path.join(dashboard_dir, "fintel_greeks_intraday.json")
+                                _today_str = datetime.now().strftime("%Y-%m-%d")
+                                _now_time_str = datetime.now().strftime("%H:%M:%S")
+                                _intraday_data = {}
+                                if os.path.exists(_intraday_greeks_file):
+                                    try:
+                                        with open(_intraday_greeks_file, 'r', encoding='utf-8') as _igf:
+                                            _intraday_data = json.load(_igf)
+                                    except Exception:
+                                        _intraday_data = {}
 
-                                if _atm_pe_inr_abs > _atm_ce_inr_abs * 1.02:
+                                if _intraday_data.get("date") == _today_str:
+                                    _th_intraday_min = min(float(_intraday_data.get("atm_theta_min", _atm_strad_day_pts)), _atm_strad_day_pts)
+                                    _th_intraday_max = max(float(_intraday_data.get("atm_theta_max", _atm_strad_day_pts)), _atm_strad_day_pts)
+                                    _vg_intraday_min = min(float(_intraday_data.get("atm_vega_min", _atm_strad_vega)), _atm_strad_vega)
+                                    _vg_intraday_max = max(float(_intraday_data.get("atm_vega_max", _atm_strad_vega)), _atm_strad_vega)
+                                else:
+                                    _th_intraday_min = _atm_strad_day_pts
+                                    _th_intraday_max = _atm_strad_day_pts
+                                    _vg_intraday_min = _atm_strad_vega
+                                    _vg_intraday_max = _atm_strad_vega
+
+                                _intraday_to_save = {
+                                    "date": _today_str,
+                                    "atm_theta_min": round(_th_intraday_min, 2),
+                                    "atm_theta_max": round(_th_intraday_max, 2),
+                                    "atm_vega_min": round(_vg_intraday_min, 2),
+                                    "atm_vega_max": round(_vg_intraday_max, 2),
+                                    "last_updated": _now_time_str
+                                }
+                                try:
+                                    with open(_intraday_greeks_file, 'w', encoding='utf-8') as _igf:
+                                        json.dump(_intraday_to_save, _igf, indent=2)
+                                except Exception:
+                                    pass
+
+                                _th_range = max(_th_intraday_max - _th_intraday_min, 0.1)
+                                _th_pctile_day = min(max((_atm_strad_day_pts - _th_intraday_min) / _th_range * 100.0, 0.0), 100.0)
+
+                                # Theoretical baseline ATM straddle decay pace for this DTE:
+                                # Black-Scholes ATM Straddle Theta ~ (2 * S * sigma) / sqrt(2 * pi * 365 * DTE)
+                                _theo_atm_theta = (2.0 * spot * (_atm_iv_th / 100.0)) / np.sqrt(2.0 * np.pi * 365.0 * max(_curr_dte_th, 0.05))
+
+                                # ── TWO CLEAN DUAL-AXIS GREEKS VISUALIZERS ──
+                                # Plot 1: Theta Bleed Curve & Vega Sensitivity across Strikes
+                                _fig_th_bleed = make_subplots(specs=[[{"secondary_y": True}]])
+                                _fig_th_bleed.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_ce_thetas_pts,
+                                    mode='lines+markers', name='Call Decay (pts/d)',
+                                    line=dict(color='#00e5ff', width=2),
+                                    marker=dict(size=4),
+                                    hovertemplate="<b>%{x:,.0f}</b> Call Bleed: <b>-%{y:.1f} pts/d</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_bleed.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_pe_thetas_pts,
+                                    mode='lines+markers', name='Put Decay (pts/d)',
+                                    line=dict(color='#ff7043', width=2),
+                                    marker=dict(size=4),
+                                    hovertemplate="<b>%{x:,.0f}</b> Put Bleed: <b>-%{y:.1f} pts/d</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_bleed.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_straddle_thetas_pts,
+                                    mode='lines', name='Straddle Bleed (pts/d)',
+                                    line=dict(color='#ffd54f', width=2.5),
+                                    hovertemplate="<b>%{x:,.0f}</b> Straddle Bleed: <b>-%{y:.1f} pts/d</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_bleed.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_straddle_vegas_pts,
+                                    mode='lines+markers', name='Straddle Vega (pts/1% IV)',
+                                    line=dict(color='#00e676', width=2, dash='dot'),
+                                    marker=dict(size=4),
+                                    hovertemplate="<b>%{x:,.0f}</b> Vega: <b>±%{y:.1f} pts/1%</b><extra></extra>"
+                                ), secondary_y=True)
+
+                                # Intraday ATM Bleed Corridor Watermark
+                                _fig_th_bleed.add_hrect(
+                                    y0=_th_intraday_min, y1=_th_intraday_max,
+                                    fillcolor="rgba(255, 213, 79, 0.08)", line_width=1, line_dash="dot", line_color="rgba(255, 213, 79, 0.3)",
+                                    annotation_text=f"Day ATM Range ({_th_intraday_min:.1f} - {_th_intraday_max:.1f} pts/d)",
+                                    annotation_position="top left", annotation_font=dict(size=8, color="#ffd54f"),
+                                    secondary_y=False
+                                )
+                                _fig_th_bleed.add_vline(x=spot, line_width=1.5, line_dash="dash", line_color="#00e5ff", annotation_text=f"SPOT {spot:,.0f}", annotation_position="top right", annotation_font=dict(size=9, color="#00e5ff", family="JetBrains Mono, monospace"))
+                                _fig_th_bleed.update_layout(
+                                    title=dict(text="THETA BLEED (PTS/DAY) & VEGA SENSITIVITY (PTS/1% IV)", font=dict(color="#00e5ff", size=11, family="Inter, sans-serif")),
+                                    height=310, autosize=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                                    font=dict(color=WHITE, family='Inter, sans-serif', size=10),
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, bgcolor='rgba(0,0,0,0)', font=dict(size=9, color='#94a3b8')),
+                                    margin=dict(l=45, r=45, t=35, b=25), hovermode='x unified'
+                                )
+                                _fig_th_bleed.update_xaxes(gridcolor='rgba(255,255,255,0.05)', showgrid=True, tickfont=dict(color='#cbd5e1', size=9, family='JetBrains Mono, monospace'))
+                                _fig_th_bleed.update_yaxes(title=dict(text="Decay (pts/day)", font=dict(color="#868993", size=10)), gridcolor='rgba(255,255,255,0.05)', showgrid=True, tickfont=dict(color='#cbd5e1', size=9, family='JetBrains Mono, monospace'), secondary_y=False)
+                                _fig_th_bleed.update_yaxes(title=dict(text="Vega (pts/1% IV)", font=dict(color="#00e676", size=10)), showgrid=False, tickfont=dict(color='#00e676', size=9, family='JetBrains Mono, monospace'), secondary_y=True)
+                                _plotly_th_bleed = _fig_th_bleed.to_html(include_plotlyjs=False, full_html=False, div_id='theta-plotly-bleed')
+
+                                # Plot 2: Directional Delta Slope & Gamma Convexity Curve
+                                _fig_th_delta = make_subplots(specs=[[{"secondary_y": True}]])
+                                _fig_th_delta.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_ce_deltas,
+                                    mode='lines+markers', name='Call Delta (Δ)',
+                                    line=dict(color='#00e5ff', width=2),
+                                    marker=dict(size=4),
+                                    hovertemplate="<b>%{x:,.0f}</b> Call Δ: <b>%{y:+.2f}</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_delta.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_pe_deltas,
+                                    mode='lines+markers', name='Put Delta (Δ)',
+                                    line=dict(color='#ff7043', width=2),
+                                    marker=dict(size=4),
+                                    hovertemplate="<b>%{x:,.0f}</b> Put Δ: <b>%{y:+.2f}</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_delta.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_net_deltas,
+                                    mode='lines', name='Net Delta (Δ)',
+                                    line=dict(color='#ffffff', width=1.5, dash='dash'),
+                                    hovertemplate="<b>%{x:,.0f}</b> Net Δ: <b>%{y:+.2f}</b><extra></extra>"
+                                ), secondary_y=False)
+                                _fig_th_delta.add_trace(go.Scatter(
+                                    x=_valid_strikes, y=_gammas,
+                                    mode='lines', name='Gamma Convexity (Γ)',
+                                    line=dict(color='#c084fc', width=2.5),
+                                    fill='tozeroy', fillcolor='rgba(192,132,252,0.10)',
+                                    hovertemplate="<b>%{x:,.0f}</b> Gamma: <b>%{y:.5f}</b><extra></extra>"
+                                ), secondary_y=True)
+
+                                _fig_th_delta.add_hline(y=0, line_width=1, line_dash="solid", line_color="rgba(255,255,255,0.2)", secondary_y=False)
+                                _fig_th_delta.add_vline(x=spot, line_width=1.5, line_dash="dash", line_color="#00e5ff", annotation_text=f"SPOT {spot:,.0f}", annotation_position="top right", annotation_font=dict(size=9, color="#00e5ff", family="JetBrains Mono, monospace"))
+                                _fig_th_delta.update_layout(
+                                    title=dict(text="DIRECTIONAL DELTA (Δ) & GAMMA (Γ) CONVEXITY", font=dict(color="#c084fc", size=11, family="Inter, sans-serif")),
+                                    height=310, autosize=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                                    font=dict(color=WHITE, family='Inter, sans-serif', size=10),
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, bgcolor='rgba(0,0,0,0)', font=dict(size=9, color='#94a3b8')),
+                                    margin=dict(l=45, r=45, t=35, b=25), hovermode='x unified'
+                                )
+                                _fig_th_delta.update_xaxes(gridcolor='rgba(255,255,255,0.05)', showgrid=True, tickfont=dict(color='#cbd5e1', size=9, family='JetBrains Mono, monospace'))
+                                _fig_th_delta.update_yaxes(title=dict(text="Delta (Δ)", font=dict(color="#868993", size=10)), range=[-1.05, 1.05], gridcolor='rgba(255,255,255,0.05)', showgrid=True, tickfont=dict(color='#cbd5e1', size=9, family='JetBrains Mono, monospace'), secondary_y=False)
+                                _fig_th_delta.update_yaxes(title=dict(text="Gamma (Γ)", font=dict(color="#c084fc", size=10)), showgrid=False, tickfont=dict(color='#c084fc', size=9, family='JetBrains Mono, monospace'), secondary_y=True)
+                                _plotly_th_gamma = _fig_th_delta.to_html(include_plotlyjs=False, full_html=False, div_id='theta-plotly-gamma')
+
+                                # Asymmetry calculation (Points)
+                                _th_diff_pts = _atm_pe_pts_abs - _atm_ce_pts_abs
+                                if _atm_pe_pts_abs > _atm_ce_pts_abs * 1.02:
                                     _th_leader = "PUTS"
-                                    _th_diff_inr = _atm_pe_inr_abs - _atm_ce_inr_abs
-                                    _th_diff_pts = _th_diff_inr / _lot_th
-                                    _th_diff_pct = (_th_diff_inr / max(_atm_ce_inr_abs, 1.0)) * 100.0
+                                    _th_diff_pct = (_th_diff_pts / max(_atm_ce_pts_abs, 0.1)) * 100.0
                                     _th_verdict_col = "#ff7043"
-                                    _th_verdict_text = f"PUT THETA IS HIGHER (+{_th_diff_pct:.1f}% vs Calls)"
-                                    _th_insight = f"Put buyers bleeding faster (-₹{_th_diff_inr:,.0f}/d more). Put writing offers higher time-decay harvest than Call writing."
-                                elif _atm_ce_inr_abs > _atm_pe_inr_abs * 1.02:
+                                    _th_verdict_text = f"PUTS BLEEDING FASTER (+{_th_diff_pct:.1f}% vs Calls)"
+                                    _th_insight = f"Put buyers bleed faster (-{_th_diff_pts:.1f} pts/d more). Put writing offers higher time-decay harvest."
+                                elif _atm_ce_pts_abs > _atm_pe_pts_abs * 1.02:
                                     _th_leader = "CALLS"
-                                    _th_diff_inr = _atm_ce_inr_abs - _atm_pe_inr_abs
-                                    _th_diff_pts = _th_diff_inr / _lot_th
-                                    _th_diff_pct = (_th_diff_inr / max(_atm_pe_inr_abs, 1.0)) * 100.0
-                                    _th_verdict_col = "#38bdf8"
-                                    _th_verdict_text = f"CALL THETA IS HIGHER (+{_th_diff_pct:.1f}% vs Puts)"
-                                    _th_insight = f"Call buyers bleeding faster (-₹{_th_diff_inr:,.0f}/d more). Call writing offers higher time-decay harvest than Put writing."
+                                    _th_diff_pts = _atm_ce_pts_abs - _atm_pe_pts_abs
+                                    _th_diff_pct = (_th_diff_pts / max(_atm_pe_pts_abs, 0.1)) * 100.0
+                                    _th_verdict_col = "#00e5ff"
+                                    _th_verdict_text = f"CALLS BLEEDING FASTER (+{_th_diff_pct:.1f}% vs Puts)"
+                                    _th_insight = f"Call buyers bleed faster (-{_th_diff_pts:.1f} pts/d more). Call writing offers higher time-decay harvest."
                                 else:
                                     _th_leader = "BALANCED"
-                                    _th_diff_inr = 0.0
                                     _th_diff_pts = 0.0
-                                    _th_diff_pct = 0.0
                                     _th_verdict_col = "#ffd54f"
                                     _th_verdict_text = "THETA DECAY IS SYMMETRICAL"
-                                    _th_insight = "Time bleed is evenly matched between Calls and Puts (neutral decay bias)."
+                                    _th_insight = "Time bleed is evenly matched between Calls and Puts."
 
-                                # Chain-wide total decay (sum across all valid strikes)
-                                _chain_ce_th_tot = sum([abs(x) for x in _ce_thetas_inr])
-                                _chain_pe_th_tot = sum([abs(x) for x in _pe_thetas_inr])
-                                _chain_tot_th = _chain_ce_th_tot + _chain_pe_th_tot
-                                _chain_ce_pct = (_chain_ce_th_tot / max(_chain_tot_th, 1e-6)) * 100.0
-                                _chain_pe_pct = (_chain_pe_th_tot / max(_chain_tot_th, 1e-6)) * 100.0
+                                # 25Δ Skew calculation
+                                _idx_25c = min(range(len(_ce_deltas)), key=lambda i: abs(_ce_deltas[i] - 0.25)) if _ce_deltas else 0
+                                _idx_25p = min(range(len(_pe_deltas)), key=lambda i: abs(_pe_deltas[i] - (-0.25))) if _pe_deltas else 0
+                                _strike_25c = _valid_strikes[_idx_25c] if _idx_25c < len(_valid_strikes) else _atm_strike_th
+                                _strike_25p = _valid_strikes[_idx_25p] if _idx_25p < len(_valid_strikes) else _atm_strike_th
+                                _row_25c = _th_lookup.get((_strike_25c, 'CE'))
+                                _row_25p = _th_lookup.get((_strike_25p, 'PE'))
+                                _iv_25c = float(_row_25c['iv']) if _row_25c is not None and float(_row_25c.get('iv', 0)) > 0 else _atm_iv_th
+                                _iv_25p = float(_row_25p['iv']) if _row_25p is not None and float(_row_25p.get('iv', 0)) > 0 else _atm_iv_th
+                                _skew_25d = _iv_25p - _iv_25c
 
-                                # Expected Move (1-sigma, Gatheral 2006 / Merton 1973)
-                                _em_pts = spot * (_atm_iv_th / 100.0) * np.sqrt(max(_curr_dte_th / 365.0, 1e-4))
-                                if _em_pts < 10.0: _em_pts = spot * 0.008
-
-                                # Renormalized Alpha Metric (Bouchaud & Sornette 1994/2000)
                                 _atm_sig = max(_atm_iv_th / 100.0, 0.02)
-                                _atm_gam_ce = _calc_merton_theta(_atm_strike_th, _atm_sig, 'CE')[1]
-                                _atm_gam_pe = _calc_merton_theta(_atm_strike_th, _atm_sig, 'PE')[1]
-                                _atm_gam = _atm_gam_ce + _atm_gam_pe
-                                _gamma_hazard_inr = 0.5 * _atm_gam * (_em_pts ** 2) * _lot_th
-                                _renorm_alpha = abs(_atm_strad_inr) / max(_gamma_hazard_inr, 1.0)
+                                _atm_gam_ce_val = _calc_merton_theta(_atm_strike_th, _atm_sig, 'CE')[1]
+                                _atm_gam_pe_val = _calc_merton_theta(_atm_strike_th, _atm_sig, 'PE')[1]
+                                _atm_gam_val_exact = _atm_gam_ce_val + _atm_gam_pe_val
+
+                                # 50pt move alpha test (in points)
+                                _em_pts = 50.0
+                                _gamma_hazard_pts = 0.5 * _atm_gam_val_exact * (_em_pts ** 2)
+                                _renorm_alpha = _atm_strad_day_pts / max(_gamma_hazard_pts, 0.01)
                                 _alpha_color = GREEN if _renorm_alpha >= 1.0 else YELLOW if _renorm_alpha >= 0.7 else RED
-                                _alpha_label = "Alpha Edge Zone" if _renorm_alpha >= 1.0 else "Neutral Buffer" if _renorm_alpha >= 0.7 else "Gamma Hazard Zone"
-
-                                # Initial ATM Greek Value Decomposition (Baseline for initial render)
-                                _atm_intr = abs(spot - _atm_strike_th)
-                                _atm_ext = max(0.0, _atm_strad_prem - _atm_intr)
-                                _atm_th_val = min(_atm_ext, abs(_atm_strad_inr / _lot_th) * max(_curr_dte_th, 0.25))
-                                _atm_vg_val = min(max(0.0, _atm_ext - _atm_th_val), 15.0 * max(0.0, (_atm_sig * 100.0 - 12.0) / 10.0))
-                                _atm_gam_val = max(0.0, _atm_ext - _atm_th_val - _atm_vg_val)
-                                _tot_d_val = max(_atm_strad_prem, 0.01)
-                                _intr_pct = (_atm_intr / _tot_d_val) * 100.0
-                                _th_pct = (_atm_th_val / _tot_d_val) * 100.0
-                                _vg_pct = (_atm_vg_val / _tot_d_val) * 100.0
-                                _gam_pct = (_atm_gam_val / _tot_d_val) * 100.0
-
-                                _strike_options = []
-                                for _s_opt in _valid_strikes:
-                                    _sel = 'selected' if _s_opt == _atm_strike_th else ''
-                                    _atm_tag = ' (ATM)' if _s_opt == _atm_strike_th else ''
-                                    _strike_options.append(f'<option value="{_s_opt}" {_sel}>{_s_opt:,.0f}{_atm_tag}</option>')
+                                _alpha_label = "Positive Theta Edge" if _renorm_alpha >= 1.0 else "Neutral Buffer" if _renorm_alpha >= 0.7 else "Gamma Hazard Zone"
 
                                 theta_tab_html = f'''
-                                <div style="display:flex; flex-direction:column; gap:12px;">
-                                    <!-- 1. TOP CONTROLS BAR: Model, Range, Unit, Recalc only (No view mode, no focus mode, target strike moved to bottom dock) -->
-                                    <div class="action-bar" style="justify-content:space-between; flex-wrap:wrap; gap:8px;">
-                                        <div style="display:flex; align-items:center; gap:8px;">
-                                            <span style="font-size:12px; font-weight:900; color:{WHITE}; letter-spacing:1px; display:inline-flex; align-items:center; gap:6px;">
-                                                <span style="color:#00f0ff;">⚡</span> GREEKS ANALYTICS & CAUSE-EFFECT ENGINE
-                                            </span>
-                                            <span style="font-size:10px; color:{MUTED}; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);">
-                                                SPOT: <strong style="color:{WHITE};">{spot:,.0f}</strong>
-                                            </span>
-                                        </div>
-                                        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-                                            <div style="display:flex; align-items:center; gap:6px;">
-                                                <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px;">Unit:</span>
-                                                <div style="display:flex; background:#0c0c1e; padding:2px; border-radius:6px; border:1px solid #2a2a4a;">
-                                                    <button class="th-unit-btn active" id="btn-unit-inr" onclick="setThetaUnit('INR')" style="padding:3px 8px; font-size:10px; font-weight:700; border-radius:4px; border:none; cursor:pointer; background:#0284c7; color:#ffffff;">₹ / Lot ({_lot_th})</button>
-                                                    <button class="th-unit-btn" id="btn-unit-pts" onclick="setThetaUnit('PTS')" style="padding:3px 8px; font-size:10px; font-weight:700; border-radius:4px; border:none; cursor:pointer; background:transparent; color:#94a3b8;">Pts / Share</button>
+                                <div style="display:flex; flex-direction:column; gap:14px;">
+
+                                    <!-- 1. EXECUTIVE REAL-TIME DECAY & DIRECTION COCKPIT (3 CARDS IN POINTS) -->
+                                    <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px;">
+                                        <!-- Card 1: Net ATM Straddle Bleed -->
+                                        <div class="card" style="border-top:3px solid #00e676; padding:14px; background:rgba(30,34,45,0.7);">
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <span style="font-size:10px; font-weight:800; color:#00e676; text-transform:uppercase; letter-spacing:1px;">ATM STRADDLE BLEED (POINTS)</span>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:rgba(0,230,118,0.15); color:#00e676; font-family:var(--font-mono);">{_curr_dte_th:.1f} DTE</span>
+                                            </div>
+                                            <div id="card-strad-day" style="font-size:26px; font-weight:900; color:#00e676; margin:6px 0 2px 0; font-family:var(--font-mono);">
+                                                -{_atm_strad_day_pts:.1f} pts <span style="font-size:13px; font-weight:700; color:#ffffff;">/ day</span>
+                                            </div>
+                                            <div style="font-size:12px; font-weight:700; color:#ffd54f; margin-bottom:10px; font-family:var(--font-mono);">
+                                                <span id="card-strad-hour">-{_atm_strad_1h_pts:.2f} pts / trading hr</span> · <span id="card-strad-prem">Prem: {_atm_strad_prem:.1f} pts</span>
+                                            </div>
+                                            <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                                <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                    <span style="color:#868993;">Today's Intraday Range:</span>
+                                                    <strong style="color:#ffffff; font-family:var(--font-mono);">{_th_intraday_min:.1f} — {_th_intraday_max:.1f} pts/d <span style="color:#ffd54f; font-size:10px;">({_th_pctile_day:.0f}% of range)</span></strong>
+                                                </div>
+                                                <div style="display:flex; justify-content:space-between;">
+                                                    <span style="color:#868993;">Expiry Decay Pace:</span>
+                                                    <strong style="color:#00e676; font-family:var(--font-mono);">{_atm_strad_yield:.1f}% / day <span style="color:#868993; font-size:10px;">(Theo: ~{_theo_atm_theta:.1f} pts/d)</span></strong>
                                                 </div>
                                             </div>
-                                            <div style="display:flex; align-items:center; gap:6px;">
-                                                <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase;">Model:</span>
-                                                <button class="theta-model-btn active" id="btn-th-bsm" onclick="toggleThetaModel('bsm')">BSM</button>
-                                                <button class="theta-model-btn" id="btn-th-heston" onclick="toggleThetaModel('heston')">Heston</button>
-                                                <button class="theta-model-btn" id="btn-th-both" onclick="toggleThetaModel('both')">Both</button>
-                                                <select id="sel-th-range" onchange="changeThetaRange(this.value)" style="background:#12122a; color:{WHITE}; border:1px solid #2a2a4a; padding:3px 6px; border-radius:6px; font-size:10px;">
-                                                    <option value="5">±5%</option>
-                                                    <option value="10" selected>±10%</option>
-                                                    <option value="15">±15%</option>
-                                                </select>
-                                                <button class="btn" id="btn-th-recalc" onclick="refreshThetaDecay(this)" title="Recalculate model" style="padding:4px 8px; font-size:10px; font-weight:700; background:#0284c7; color:#ffffff; border:none; border-radius:6px; cursor:pointer;">
-                                                    &#8635; Recalc
-                                                </button>
+                                        </div>
+
+                                        <!-- Card 2: Put vs Call Decay Asymmetry -->
+                                        <div class="card" style="border-top:3px solid {_th_verdict_col}; padding:14px; background:rgba(30,34,45,0.7);">
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <span style="font-size:10px; font-weight:800; color:{_th_verdict_col}; text-transform:uppercase; letter-spacing:1px;">PUT-CALL DECAY ASYMMETRY</span>
+                                                <span id="card-asym-verdict" style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:{_th_verdict_col}22; color:{_th_verdict_col}; font-family:var(--font-mono);">{_th_leader} BLEEDING FASTER</span>
+                                            </div>
+                                            <div id="card-asym-diff" style="font-size:26px; font-weight:900; color:{_th_verdict_col}; margin:6px 0 2px 0; font-family:var(--font-mono);">
+                                                {'+' if _th_diff_pts > 0 else ''}{_th_diff_pts:.1f} pts <span style="font-size:13px; font-weight:700; color:#ffffff;">/ day edge</span>
+                                            </div>
+                                            <div style="font-size:12px; font-weight:700; color:#868993; margin-bottom:10px;">
+                                                Call: <strong style="color:#00e5ff;">-{_atm_ce_pts_abs:.1f} pts/d</strong> · Put: <strong style="color:#ff7043;">-{_atm_pe_pts_abs:.1f} pts/d</strong>
+                                            </div>
+                                            <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                                <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                    <span style="color:#868993;">ATM Net Delta (Δ):</span>
+                                                    <strong style="color:{WHITE}; font-family:var(--font-mono);">{_atm_del_net:+.2f} <span style="color:#868993; font-size:10px;">(C: {_atm_del_ce:+.2f} | P: {_atm_del_pe:+.2f})</span></strong>
+                                                </div>
+                                                <div style="display:flex; justify-content:space-between;">
+                                                    <span style="color:#868993;">25Δ Skew (Put - Call IV):</span>
+                                                    <strong style="color:{WHITE}; font-family:var(--font-mono);">{_skew_25d:+.1f}% <span style="color:{_th_verdict_col}; font-size:10px;">({_iv_25p:.1f}% vs {_iv_25c:.1f}%)</span></strong>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Card 3: Break-Even Cushion & Greeks Sensitivity -->
+                                        <div class="card" style="border-top:3px solid #00e5ff; padding:14px; background:rgba(30,34,45,0.7);">
+                                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                                <span style="font-size:10px; font-weight:800; color:#00e5ff; text-transform:uppercase; letter-spacing:1px;">DAILY BREAK-EVEN CUSHION</span>
+                                                <span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:4px; background:rgba(0,229,255,0.15); color:#00e5ff; font-family:var(--font-mono);">THETA vs GAMMA &amp; VEGA</span>
+                                            </div>
+                                            <div id="card-cushion-pts" style="font-size:26px; font-weight:900; color:#ffffff; margin:6px 0 2px 0; font-family:var(--font-mono);">
+                                                ±{_atm_strad_cushion:.1f} PTS
+                                            </div>
+                                            <div style="font-size:12px; font-weight:700; color:#00e5ff; margin-bottom:10px; font-family:var(--font-mono);">
+                                                Safe Zone: <strong style="color:#ffffff;">{spot - _atm_strad_cushion:,.0f} – {spot + _atm_strad_cushion:,.0f}</strong>
+                                            </div>
+                                            <div style="background:#131722; border-radius:6px; padding:8px 10px; border:1px solid var(--border-subtle, #2a2e39); font-size:11px;">
+                                                <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                                                    <span style="color:#868993;">Straddle Vega (ν):</span>
+                                                    <strong style="color:#00e676; font-family:var(--font-mono);">±{_atm_strad_vega:.1f} pts <span style="color:#868993; font-size:10px;">per 1% IV shift</span></strong>
+                                                </div>
+                                                <div style="display:flex; justify-content:space-between;">
+                                                    <span style="color:#868993;">ATM Gamma (Γ):</span>
+                                                    <strong style="color:#c084fc; font-family:var(--font-mono);">{_atm_gam_val_exact:.5f} Γ <span style="color:{_alpha_color}; font-size:10px;">({_alpha_label})</span></strong>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
 
-                                    <!-- 2. DYNAMIC GREEK CAUSE & EFFECT ENGINE: Shocks + Real vs Forecast Side-by-Side Comparison -->
-                                    <div class="card" id="card-greek-cause-effect" style="padding:14px; background:linear-gradient(135deg, rgba(18,18,42,0.95), rgba(10,14,28,0.95)); border-left:4px solid #10b981;">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
-                                            <div>
-                                                <div style="font-size:12px; font-weight:900; color:#10b981; text-transform:uppercase; letter-spacing:1.5px; display:flex; align-items:center; gap:8px;">
-                                                    <span>⚡ DYNAMIC GREEK CAUSE & EFFECT ENGINE</span>
-                                                    <span style="font-size:10px; font-weight:700; color:#94a3b8; font-family:monospace; background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">ΔP = Δ·ΔS + ½Γ·(ΔS)² + Θ·Δt + V·Δσ</span>
-                                                </div>
-                                                <div style="font-size:11px; color:#94a3b8; margin-top:2px;">
-                                                    Simulate market shocks (spot shift, time elapsed from minutes to days, and IV changes) to observe how other Greeks shift relative to live real Greeks.
-                                                </div>
+                                    <!-- 2. TWO CLEAN DUAL-AXIS GREEKS VISUALIZERS -->
+                                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+                                        <div class="card" style="padding:12px; background:rgba(30,34,45,0.7); border:1px solid var(--border-card, #363c4e);">
+                                            {_plotly_th_bleed}
+                                        </div>
+                                        <div class="card" style="padding:12px; background:rgba(30,34,45,0.7); border:1px solid var(--border-card, #363c4e);">
+                                            {_plotly_th_gamma}
+                                        </div>
+                                    </div>
+
+                                    <!-- 3. STREAMLINED 10-COLUMN PER-STRIKE OPTION PRICE COMPOSITION & GREEKS MATRIX -->
+                                    <div class="card" style="padding:14px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+                                            <div style="font-size:12px; font-weight:800; color:#00e5ff; text-transform:uppercase; letter-spacing:1px;">
+                                                PER-STRIKE OPTION PRICE COMPOSITION &amp; GREEKS DYNAMICS
                                             </div>
-                                            <div style="display:flex; align-items:center; gap:8px;">
-                                                <button type="button" onclick="resetGreekShocks()" style="padding:4px 10px; font-size:10px; font-weight:700; border-radius:6px; background:rgba(255,255,255,0.06); border:1px solid #2a2a4a; color:#94a3b8; cursor:pointer;">
-                                                    &#8635; Reset Shocks
-                                                </button>
+                                            <div style="font-size:11px; color:#868993;">
+                                                Real-Time Decomposition into Intrinsic (Moneyness) &amp; Extrinsic (Time/Vol) premium in <strong style="color:#00e5ff;">Pure Points</strong>
                                             </div>
                                         </div>
-
-                                        <!-- Shock Input Strip: Spot Shift, Time Elapsed (Minutes to Days), IV Shock -->
-                                        <div style="display:grid; grid-template-columns: 1fr 1.2fr 1fr; gap:10px; margin-bottom:14px; background:rgba(10,14,28,0.7); padding:10px 12px; border-radius:8px; border:1px solid #222744;">
-                                            <!-- SPOT SHIFT (ΔS) -->
-                                            <div>
-                                                <div style="display:flex; justify-content:space-between; font-size:10px; font-weight:800; color:#38bdf8; margin-bottom:5px;">
-                                                    <span>UNDERLYING SPOT SHIFT (ΔS)</span>
-                                                    <span id="val-shock-spot" style="font-family:monospace; font-weight:900;">0 pts</span>
-                                                </div>
-                                                <div style="display:flex; gap:3px; margin-bottom:6px; flex-wrap:wrap;">
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(-200)">-200</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(-100)">-100</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(-50)">-50</button>
-                                                    <button type="button" class="th-quick-btn active" onclick="applySpotShock(0)">0</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(50)">+50</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(100)">+100</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applySpotShock(200)">+200</button>
-                                                </div>
-                                                <div style="display:flex; align-items:center; gap:6px;">
-                                                    <input type="range" id="slider-shock-spot" min="-500" max="500" step="5" value="0" oninput="applySpotShock(this.value)" style="flex:1; height:4px; accent-color:#38bdf8; cursor:pointer;">
-                                                </div>
-                                            </div>
-
-                                            <!-- TIME ELAPSED (Δt) — Minutes to Days -->
-                                            <div>
-                                                <div style="display:flex; justify-content:space-between; font-size:10px; font-weight:800; color:#10b981; margin-bottom:5px;">
-                                                    <span>TIME ELAPSED (Δt) — MINUTES TO DAYS</span>
-                                                    <span id="val-shock-time" style="font-family:monospace; font-weight:900;">+0.0 d (0m)</span>
-                                                </div>
-                                                <div style="display:flex; gap:3px; margin-bottom:6px; flex-wrap:wrap;">
-                                                    <button type="button" class="th-quick-btn active-time" onclick="applyTimeShock(0, 0)">0m</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.04, 15)">+15m</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.08, 30)">+30m</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.16, 60)">+1h</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.32, 120)">+2h</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.64, 240)">+4h</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(0.5, 0)">+0.5d</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(1.0, 0)">+1d</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock(2.0, 0)">+2d</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyTimeShock({_curr_dte_th:.2f}, 0)">Exp</button>
-                                                </div>
-                                                <div style="display:flex; align-items:center; gap:6px;">
-                                                    <input type="range" id="slider-shock-time" min="0" max="{max(_curr_dte_th, 5.0):.1f}" step="0.04" value="0" oninput="applyTimeShock(this.value, 0)" style="flex:1; height:4px; accent-color:#10b981; cursor:pointer;">
-                                                </div>
-                                            </div>
-
-                                            <!-- IV SHOCK (Δσ) -->
-                                            <div>
-                                                <div style="display:flex; justify-content:space-between; font-size:10px; font-weight:800; color:#c084fc; margin-bottom:5px;">
-                                                    <span>IMPLIED VOL SHOCK (Δσ)</span>
-                                                    <span id="val-shock-iv" style="font-family:monospace; font-weight:900;">0.0%</span>
-                                                </div>
-                                                <div style="display:flex; gap:3px; margin-bottom:6px; flex-wrap:wrap;">
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(-5.0)">-5%</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(-3.0)">-3%</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(-1.0)">-1%</button>
-                                                    <button type="button" class="th-quick-btn active-iv" onclick="applyIvShock(0)">0%</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(1.0)">+1%</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(3.0)">+3%</button>
-                                                    <button type="button" class="th-quick-btn" onclick="applyIvShock(5.0)">+5%</button>
-                                                </div>
-                                                <div style="display:flex; align-items:center; gap:6px;">
-                                                    <input type="range" id="slider-shock-iv" min="-10" max="10" step="0.5" value="0" oninput="applyIvShock(this.value)" style="flex:1; height:4px; accent-color:#c084fc; cursor:pointer;">
-                                                </div>
-                                            </div>
-                                        </div>
-
-                                        <!-- REAL GREEKS vs FORECAST GREEKS SIDE-BY-SIDE MATRIX -->
-                                        <div style="overflow-x:auto; margin-bottom:12px;">
-                                            <table class="data-table" id="table-real-vs-sim" style="width:100%; border-collapse:collapse; font-size:11px;">
+                                        <div id="theta-table-container" style="max-height:420px; overflow-y:auto; scroll-behavior:smooth;">
+                                            <table class="data-table" id="theta-decay-table" style="width:100%; border-collapse:collapse; font-size:11px;">
                                                 <thead>
-                                                    <tr style="background:#0c0f20; border-bottom:1px solid #2a2a4a;">
-                                                        <th style="text-align:left; color:#94a3b8; font-weight:800; padding:6px 10px;">GREEK METRIC</th>
-                                                        <th style="color:#38bdf8; font-weight:800; padding:6px 10px; text-align:center;">CALL (CE) REAL</th>
-                                                        <th style="color:#38bdf8; font-weight:800; padding:6px 10px; text-align:center;">CALL (CE) FORECAST</th>
-                                                        <th style="color:#38bdf8; font-weight:800; padding:6px 10px; text-align:center;">CE SHIFT (Δ / %)</th>
-                                                        <th style="color:#ffd54f; font-weight:800; padding:6px 10px; text-align:center;">STRADDLE REAL</th>
-                                                        <th style="color:#ffd54f; font-weight:800; padding:6px 10px; text-align:center;">STRADDLE FORECAST</th>
-                                                        <th style="color:#ffd54f; font-weight:800; padding:6px 10px; text-align:center;">STRADDLE SHIFT</th>
-                                                        <th style="color:#ff7043; font-weight:800; padding:6px 10px; text-align:center;">PUT (PE) REAL</th>
-                                                        <th style="color:#ff7043; font-weight:800; padding:6px 10px; text-align:center;">PUT (PE) FORECAST</th>
-                                                        <th style="color:#ff7043; font-weight:800; padding:6px 10px; text-align:center;">PE SHIFT (Δ / %)</th>
+                                                    <tr style="position:sticky; top:0; background:#1e222d; z-index:2; border-bottom:1px solid #2a2a4a; color:#868993;">
+                                                        <th style="padding:7px 8px; text-align:left;">Strike</th>
+                                                        <th style="padding:7px 8px; text-align:right;">Dist</th>
+                                                        <th style="padding:7px 8px; text-align:right; color:#00e5ff;">Call LTP (IV)</th>
+                                                        <th style="padding:7px 8px; text-align:left; color:#00e5ff;">Call Composition</th>
+                                                        <th style="padding:7px 8px; text-align:left; color:#00e5ff;">Call Greeks (Δ, Θ, ν)</th>
+                                                        <th style="padding:7px 8px; text-align:right; color:#ff7043;">Put LTP (IV)</th>
+                                                        <th style="padding:7px 8px; text-align:left; color:#ff7043;">Put Composition</th>
+                                                        <th style="padding:7px 8px; text-align:left; color:#ff7043;">Put Greeks (Δ, Θ, ν)</th>
+                                                        <th style="padding:7px 8px; text-align:right; color:#ffd54f;">Straddle Bleed</th>
+                                                        <th style="padding:7px 8px; text-align:right; color:#00e676;">BE Cushion</th>
                                                     </tr>
                                                 </thead>
-                                                <tbody style="font-family:'JetBrains Mono', monospace; font-size:11px;">
-                                                    <!-- Row 1: Premium / Price -->
-                                                    <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-                                                        <td style="text-align:left; font-weight:800; color:{WHITE}; font-family:'Inter', sans-serif;">Premium / LTP</td>
-                                                        <td id="sim-ce-price-real" style="text-align:center;">₹{_atm_ce_ltp:.1f}</td>
-                                                        <td id="sim-ce-price-fc" style="text-align:center; font-weight:700; color:#38bdf8;">₹{_atm_ce_ltp:.1f}</td>
-                                                        <td id="sim-ce-price-diff" style="text-align:center; font-weight:700;">+₹0.0 (0%)</td>
-                                                        <td id="sim-strad-price-real" style="text-align:center; font-weight:800; color:#ffd54f;">₹{_atm_strad_prem:.1f}</td>
-                                                        <td id="sim-strad-price-fc" style="text-align:center; font-weight:800; color:#ffd54f;">₹{_atm_strad_prem:.1f}</td>
-                                                        <td id="sim-strad-price-diff" style="text-align:center; font-weight:800;">+₹0.0 (0%)</td>
-                                                        <td id="sim-pe-price-real" style="text-align:center;">₹{_atm_pe_ltp:.1f}</td>
-                                                        <td id="sim-pe-price-fc" style="text-align:center; font-weight:700; color:#ff7043;">₹{_atm_pe_ltp:.1f}</td>
-                                                        <td id="sim-pe-price-diff" style="text-align:center; font-weight:700;">+₹0.0 (0%)</td>
-                                                    </tr>
-                                                    <!-- Row 2: Delta (Δ) -->
-                                                    <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-                                                        <td style="text-align:left; font-weight:800; color:{WHITE}; font-family:'Inter', sans-serif;">Delta (Δ)</td>
-                                                        <td id="sim-ce-del-real" style="text-align:center;">+0.50</td>
-                                                        <td id="sim-ce-del-fc" style="text-align:center; font-weight:700; color:#38bdf8;">+0.50</td>
-                                                        <td id="sim-ce-del-diff" style="text-align:center;">+0.00</td>
-                                                        <td id="sim-strad-del-real" style="text-align:center; color:#ffd54f;">0.00</td>
-                                                        <td id="sim-strad-del-fc" style="text-align:center; font-weight:700; color:#ffd54f;">0.00</td>
-                                                        <td id="sim-strad-del-diff" style="text-align:center;">+0.00</td>
-                                                        <td id="sim-pe-del-real" style="text-align:center;">-0.50</td>
-                                                        <td id="sim-pe-del-fc" style="text-align:center; font-weight:700; color:#ff7043;">-0.50</td>
-                                                        <td id="sim-pe-del-diff" style="text-align:center;">+0.00</td>
-                                                    </tr>
-                                                    <!-- Row 3: Gamma (Γ) -->
-                                                    <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-                                                        <td style="text-align:left; font-weight:800; color:{WHITE}; font-family:'Inter', sans-serif;">Gamma (Γ)</td>
-                                                        <td id="sim-ce-gam-real" style="text-align:center;">0.00150</td>
-                                                        <td id="sim-ce-gam-fc" style="text-align:center; font-weight:700; color:#fbbf24;">0.00150</td>
-                                                        <td id="sim-ce-gam-diff" style="text-align:center;">+0.00000</td>
-                                                        <td id="sim-strad-gam-real" style="text-align:center; color:#ffd54f;">0.00300</td>
-                                                        <td id="sim-strad-gam-fc" style="text-align:center; font-weight:700; color:#ffd54f;">0.00300</td>
-                                                        <td id="sim-strad-gam-diff" style="text-align:center;">+0.00000</td>
-                                                        <td id="sim-pe-gam-real" style="text-align:center;">0.00150</td>
-                                                        <td id="sim-pe-gam-fc" style="text-align:center; font-weight:700; color:#fbbf24;">0.00150</td>
-                                                        <td id="sim-pe-gam-diff" style="text-align:center;">+0.00000</td>
-                                                    </tr>
-                                                    <!-- Row 4: Theta (Θ/d) -->
-                                                    <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-                                                        <td style="text-align:left; font-weight:800; color:{WHITE}; font-family:'Inter', sans-serif;">Theta (Θ / day)</td>
-                                                        <td id="sim-ce-th-real" style="text-align:center;">-₹{abs(_atm_ce_inr):,.0f}</td>
-                                                        <td id="sim-ce-th-fc" style="text-align:center; font-weight:700; color:#10b981;">-₹{abs(_atm_ce_inr):,.0f}</td>
-                                                        <td id="sim-ce-th-diff" style="text-align:center;">₹0</td>
-                                                        <td id="sim-strad-th-real" style="text-align:center; color:#ffd54f;">-₹{abs(_atm_strad_inr):,.0f}</td>
-                                                        <td id="sim-strad-th-fc" style="text-align:center; font-weight:700; color:#ffd54f;">-₹{abs(_atm_strad_inr):,.0f}</td>
-                                                        <td id="sim-strad-th-diff" style="text-align:center;">₹0</td>
-                                                        <td id="sim-pe-th-real" style="text-align:center;">-₹{abs(_atm_pe_inr):,.0f}</td>
-                                                        <td id="sim-pe-th-fc" style="text-align:center; font-weight:700; color:#10b981;">-₹{abs(_atm_pe_inr):,.0f}</td>
-                                                        <td id="sim-pe-th-diff" style="text-align:center;">₹0</td>
-                                                    </tr>
-                                                    <!-- Row 5: Vega (V) -->
-                                                    <tr>
-                                                        <td style="text-align:left; font-weight:800; color:{WHITE}; font-family:'Inter', sans-serif;">Vega (V / 1% IV)</td>
-                                                        <td id="sim-ce-veg-real" style="text-align:center;">₹600</td>
-                                                        <td id="sim-ce-veg-fc" style="text-align:center; font-weight:700; color:#c084fc;">₹600</td>
-                                                        <td id="sim-ce-veg-diff" style="text-align:center;">₹0</td>
-                                                        <td id="sim-strad-veg-real" style="text-align:center; color:#ffd54f;">₹1,200</td>
-                                                        <td id="sim-strad-veg-fc" style="text-align:center; font-weight:700; color:#ffd54f;">₹1,200</td>
-                                                        <td id="sim-strad-veg-diff" style="text-align:center;">₹0</td>
-                                                        <td id="sim-pe-veg-real" style="text-align:center;">₹600</td>
-                                                        <td id="sim-pe-veg-fc" style="text-align:center; font-weight:700; color:#c084fc;">₹600</td>
-                                                        <td id="sim-pe-veg-diff" style="text-align:center;">₹0</td>
-                                                    </tr>
-                                                </tbody>
-                                            </table>
-                                        </div>
-
-                                        <!-- Waterfall Attribution Cards -->
-                                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:6px; margin-bottom:10px;">
-                                            <div class="metric-box" style="padding:6px 8px; text-align:left; background:rgba(56,189,248,0.06); border:1px solid rgba(56,189,248,0.25);">
-                                                <div style="font-size:9px; font-weight:800; color:#38bdf8;">Δ DELTA EFFECT</div>
-                                                <div id="cause-delta-val" style="font-size:13px; font-weight:800; color:{WHITE}; margin:2px 0;">₹0</div>
-                                                <div id="cause-delta-pct" style="font-size:9px; color:#94a3b8;">0% of move</div>
-                                            </div>
-                                            <div class="metric-box" style="padding:6px 8px; text-align:left; background:rgba(251,191,36,0.06); border:1px solid rgba(251,191,36,0.25);">
-                                                <div style="font-size:9px; font-weight:800; color:#fbbf24;">½Γ GAMMA ACCEL</div>
-                                                <div id="cause-gamma-val" style="font-size:13px; font-weight:800; color:{WHITE}; margin:2px 0;">₹0</div>
-                                                <div id="cause-gamma-pct" style="font-size:9px; color:#94a3b8;">0% of move</div>
-                                            </div>
-                                            <div class="metric-box" style="padding:6px 8px; text-align:left; background:rgba(16,185,129,0.06); border:1px solid rgba(16,185,129,0.25);">
-                                                <div style="font-size:9px; font-weight:800; color:#10b981;">Θ THETA DECAY</div>
-                                                <div id="cause-theta-val" style="font-size:13px; font-weight:800; color:#10b981; margin:2px 0;">-₹0</div>
-                                                <div id="cause-theta-pct" style="font-size:9px; color:#94a3b8;">0% of move</div>
-                                            </div>
-                                            <div class="metric-box" style="padding:6px 8px; text-align:left; background:rgba(192,132,252,0.06); border:1px solid rgba(192,132,252,0.25);">
-                                                <div style="font-size:9px; font-weight:800; color:#c084fc;">V VEGA SHOCK</div>
-                                                <div id="cause-vega-val" style="font-size:13px; font-weight:800; color:{WHITE}; margin:2px 0;">₹0</div>
-                                                <div id="cause-vega-pct" style="font-size:9px; color:#94a3b8;">0% of move</div>
-                                            </div>
-                                        </div>
-
-                                        <!-- Root Cause Diagnosis & Net Projected Move -->
-                                        <div style="background:#0a0d1e; padding:8px 12px; border-radius:6px; border:1px solid #222744; display:flex; justify-content:space-between; align-items:center; gap:10px;">
-                                            <div style="display:flex; align-items:center; gap:8px;">
-                                                <span style="font-size:14px;">🧠</span>
-                                                <div>
-                                                    <div style="font-size:9px; font-weight:800; color:{MUTED}; text-transform:uppercase;">AUTOMATED ROOT CAUSE DIAGNOSIS</div>
-                                                    <div id="cause-diagnosis-text" style="font-size:11px; font-weight:700; color:{WHITE}; line-height:1.3;">
-                                                        Select market shocks above to diagnose price drivers and Greek shifts in real time.
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            <div style="text-align:right; min-width:120px;">
-                                                <div style="font-size:9px; color:{MUTED};">TOTAL PROJECTED ΔP</div>
-                                                <div id="cause-total-dp" style="font-size:15px; font-weight:900; color:#ffd54f; font-family:'JetBrains Mono', monospace;">₹0.0 (0.0 pts)</div>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <!-- 3. SYNCHRONIZED MULTI-GREEK DESK VISUALIZER (4 Quadrants) -->
-                                    <div class="card" style="padding:12px; background:rgba(18,18,42,0.85);">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
-                                            <div>
-                                                <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1.5px;">
-                                                    SYNCHRONIZED MULTI-GREEK DESK VISUALIZER (FOUR QUADRANTS)
-                                                </div>
-                                                <div style="font-size:10px; color:{MUTED};">
-                                                    Quadrant 1: Delta (Δ) · Quadrant 2: Gamma (Γ) · Quadrant 3: Theta (Θ) · Quadrant 4: Vega (V). Dotted curves show real-time dynamic forecast overlay.
-                                                </div>
-                                            </div>
-                                            <div style="display:flex; align-items:center; gap:10px;">
-                                                <span style="font-size:10px; color:#38bdf8; font-weight:700;">● CALL</span>
-                                                <span style="font-size:10px; color:#ff7043; font-weight:700;">● PUT</span>
-                                                <span style="font-size:10px; color:#ffd54f; font-weight:700;">● STRADDLE</span>
-                                                <span style="font-size:10px; color:#00f0ff; font-weight:700;">┄ FORECAST (OVERLAY)</span>
-                                                <span style="font-size:10px; color:#ffffff; font-weight:700; border-left:1px solid #333; padding-left:8px;">┊ SPOT: {spot:,.0f}</span>
-                                            </div>
-                                        </div>
-                                        <div style="min-height:680px; width:100%;" id="theta-chart-synced">
-                                            {_plotly_th_synced}
-                                        </div>
-                                    </div>
-
-                                    <!-- 4. DEDICATED BOTTOM TARGET STRIKE DOCK: Side-by-Side Call & Put with Straddle Price Together -->
-                                    <div class="card" style="padding:14px; background:linear-gradient(135deg, rgba(18,18,42,0.95), rgba(12,15,30,0.95)); border-top:4px solid #00f0ff;">
-                                        <!-- Cockpit Header with Target Strike Selector and ATM Lock -->
-                                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.06);">
-                                            <div style="display:flex; align-items:center; gap:10px;">
-                                                <span style="font-size:16px;">🎯</span>
-                                                <div>
-                                                    <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px;">DEDICATED STRIKE DESK</div>
-                                                    <div style="font-size:14px; font-weight:900; color:{WHITE};">
-                                                        TARGET STRIKE: <span id="deck-target-strike-lbl" style="color:#00f0ff;">{_atm_strike_th:,.0f}</span>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            <div style="display:flex; align-items:center; gap:10px;">
-                                                <span style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase;">Select Strike:</span>
-                                                <select id="sel-th-strike" onchange="selectSimStrike(parseFloat(this.value))" style="background:#12122a; color:{WHITE}; border:1px solid #00f0ff; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">
-                                                    {''.join(_strike_options)}
-                                                </select>
-                                                <button class="btn" id="btn-th-autolock" onclick="toggleAutoLockATM(this)" title="Auto-center table around ATM strike and lock selection" style="display:flex; align-items:center; gap:5px; padding:4px 10px; font-size:11px; font-weight:700; background:rgba(16,185,129,0.18); color:#10b981; border:1px solid #10b981; border-radius:6px; cursor:pointer;">
-                                                    &#128274; Lock ATM: ON
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        <!-- 3-Way Side-by-Side: CALL (Left) | COMBINED STRADDLE (Center) | PUT (Right) -->
-                                        <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px;">
-                                            <!-- CALL (CE) CARD -->
-                                            <div class="card" style="border-top:3px solid #38bdf8; background:rgba(14,18,36,0.9); padding:10px; margin:0;">
-                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                                                    <span style="font-size:12px; font-weight:900; color:#38bdf8; letter-spacing:1px;">CALL (CE)</span>
-                                                    <span style="font-size:13px; font-weight:800; color:{WHITE};" id="card-ce-price">LTP: ₹{_atm_ce_ltp:.1f}</span>
-                                                </div>
-                                                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:6px;">
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(2,132,199,0.08); border:1px solid rgba(2,132,199,0.25);">
-                                                        <div class="metric-label" style="color:#38bdf8; font-size:9px;">Decay / Day</div>
-                                                        <div id="card-ce-day" style="font-size:13px; font-weight:800; color:#ef5350;">-₹{abs(_atm_ce_inr):,.0f}</div>
-                                                    </div>
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(2,132,199,0.08); border:1px solid rgba(2,132,199,0.25);">
-                                                        <div class="metric-label" style="color:#38bdf8; font-size:9px;">Decay / Hour</div>
-                                                        <div id="card-ce-hour" style="font-size:13px; font-weight:800; color:#ffd54f;">-₹{abs(_atm_ce_1h):,.0f}</div>
-                                                    </div>
-                                                </div>
-                                                <div style="font-size:10px; color:#94a3b8; display:flex; justify-content:space-between; line-height:1.5;">
-                                                    <span>Delta: <strong id="card-ce-delta" style="color:{WHITE};">+0.50</strong></span>
-                                                    <span>Gamma: <strong id="card-ce-gamma" style="color:#fbbf24;">{_atm_gam_ce:.5f}</strong></span>
-                                                    <span>Vega: <strong id="card-ce-vega" style="color:#c084fc;">₹600</strong></span>
-                                                </div>
-                                            </div>
-
-                                            <!-- STRADDLE (CE+PE) TOGETHER IN THE CENTER -->
-                                            <div class="card" style="border-top:3px solid #ffd54f; background:rgba(22,20,38,0.9); padding:10px; margin:0;">
-                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                                                    <span style="font-size:12px; font-weight:900; color:#ffd54f; letter-spacing:1px;">STRADDLE (CE+PE)</span>
-                                                    <span style="font-size:14px; font-weight:900; color:#ffd54f;" id="card-strad-price">LTP: ₹{_atm_strad_prem:.1f}</span>
-                                                </div>
-                                                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:6px;">
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(255,213,79,0.08); border:1px solid rgba(255,213,79,0.25);">
-                                                        <div class="metric-label" style="color:#ffd54f; font-size:9px;">Combined / Day</div>
-                                                        <div id="card-strad-day" style="font-size:13px; font-weight:800; color:#ef5350;">-₹{abs(_atm_strad_inr):,.0f}</div>
-                                                    </div>
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(255,213,79,0.08); border:1px solid rgba(255,213,79,0.25);">
-                                                        <div class="metric-label" style="color:#ffd54f; font-size:9px;">BE Move Cushion</div>
-                                                        <div id="card-strad-be" style="font-size:13px; font-weight:800; color:#00e676;">±{_atm_strad_cushion:.0f} pts</div>
-                                                    </div>
-                                                </div>
-                                                <div style="font-size:10px; color:#94a3b8; display:flex; justify-content:space-between; line-height:1.5;">
-                                                    <span>Net Δ: <strong id="card-strad-net-delta" style="color:{WHITE};">0.00</strong></span>
-                                                    <span>Tot Γ: <strong id="card-strad-gamma" style="color:#fbbf24;">{_atm_gam:.5f}</strong></span>
-                                                    <span>Tot Vega: <strong id="card-strad-vega" style="color:#c084fc;">₹1,200</strong></span>
-                                                    <span>Yield: <strong id="card-strad-yield" style="color:#ffd54f;">{_atm_strad_yield:.1f}%/d</strong></span>
-                                                </div>
-                                            </div>
-
-                                            <!-- PUT (PE) CARD -->
-                                            <div class="card" style="border-top:3px solid #ff7043; background:rgba(18,14,36,0.9); padding:10px; margin:0;">
-                                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                                                    <span style="font-size:12px; font-weight:900; color:#ff7043; letter-spacing:1px;">PUT (PE)</span>
-                                                    <span style="font-size:13px; font-weight:800; color:{WHITE};" id="card-pe-price">LTP: ₹{_atm_pe_ltp:.1f}</span>
-                                                </div>
-                                                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-bottom:6px;">
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(255,112,67,0.08); border:1px solid rgba(255,112,67,0.25);">
-                                                        <div class="metric-label" style="color:#ff7043; font-size:9px;">Decay / Day</div>
-                                                        <div id="card-pe-day" style="font-size:13px; font-weight:800; color:#ef5350;">-₹{abs(_atm_pe_inr):,.0f}</div>
-                                                    </div>
-                                                    <div class="metric-box" style="padding:4px 6px; background:rgba(255,112,67,0.08); border:1px solid rgba(255,112,67,0.25);">
-                                                        <div class="metric-label" style="color:#ff7043; font-size:9px;">Decay / Hour</div>
-                                                        <div id="card-pe-hour" style="font-size:13px; font-weight:800; color:#ffd54f;">-₹{abs(_atm_pe_1h):,.0f}</div>
-                                                    </div>
-                                                </div>
-                                                <div style="font-size:10px; color:#94a3b8; display:flex; justify-content:space-between; line-height:1.5;">
-                                                    <span>Delta: <strong id="card-pe-delta" style="color:{WHITE};">-0.50</strong></span>
-                                                    <span>Gamma: <strong id="card-pe-gamma" style="color:#fbbf24;">{_atm_gam_pe:.5f}</strong></span>
-                                                    <span>Vega: <strong id="card-pe-vega" style="color:#c084fc;">₹600</strong></span>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <!-- 5. PER-STRIKE ACTIONABLE MATRIX TABLE (Pure Analysis, No Position Advice) -->
-                                    <div class="card">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                                            <div style="color:{ACCENT}; font-size:12px; font-weight:800; letter-spacing:1.5px;">PER-STRIKE GREEKS & VOLATILITY MATRIX</div>
-                                            <div style="font-size:11px; color:{MUTED};">Straddle LTP · CE/PE Premium & IV · Delta (Δ) · Gamma (Γ) · Theta (₹/d) · Vega · Daily Cushion</div>
-                                        </div>
-                                        <div id="theta-table-container" style="max-height:380px; overflow-y:auto; position:relative; scroll-behavior:smooth;">
-                                            <table class="data-table" id="theta-decay-table">
-                                                <thead>
-                                                    <tr style="position:sticky; top:0; background:{CARD_BG}; z-index:2;">
-                                                        <th style="text-align:left;">Strike</th>
-                                                        <th>Dist</th>
-                                                        <th style="color:#ffd54f;">Straddle LTP</th>
-                                                        <th style="color:#38bdf8;">CE LTP (IV)</th>
-                                                        <th style="color:#38bdf8;">CE Δ</th>
-                                                        <th style="color:#38bdf8;">CE Γ</th>
-                                                        <th style="color:#38bdf8;">CE θ/d</th>
-                                                        <th style="color:#38bdf8;">CE Vega</th>
-                                                        <th style="color:#ff7043;">PE LTP (IV)</th>
-                                                        <th style="color:#ff7043;">PE Δ</th>
-                                                        <th style="color:#ff7043;">PE Γ</th>
-                                                        <th style="color:#ff7043;">PE θ/d</th>
-                                                        <th style="color:#ff7043;">PE Vega</th>
-                                                        <th style="color:#ffd54f;">Net Straddle θ/d</th>
-                                                        <th style="color:#00e676;">Daily Cushion</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
+                                                <tbody id="theta-decay-tbody">
                                                     {''.join(_theta_table_rows)}
                                                 </tbody>
                                             </table>
@@ -5479,6 +5307,7 @@ class VolatilityAnalyzer:
                             _by_strike['oi_pe'] = _by_strike['strike'].map(_pe_map).fillna(0)
 
                             _mm_rows = ''
+                            _atm_mm_strike = min(_by_strike['strike'], key=lambda s: abs(s - spot)) if not _by_strike.empty else 0
                             for _, _mr in _by_strike.iterrows():
                                 _msk = int(_mr['strike'])
                                 _dist = _msk - spot
@@ -5488,7 +5317,7 @@ class VolatilityAnalyzer:
                                 _d_l = float(_mr['dex_lots'])
                                 _d_cr = float((_d_l * _lot_mm * spot) / 1e7)
 
-                                _is_atm = abs(_dist) < 75
+                                _is_atm = (_msk == _atm_mm_strike)
                                 _is_cw = (_msk == _call_wall)
                                 _is_pw = (_msk == _put_wall)
                                 _is_mp = (_msk == _max_pain)
@@ -5508,9 +5337,11 @@ class VolatilityAnalyzer:
                                 else:
                                     _role_badge = '<span style="color:#777;">TRANSITION</span>'
 
+                                _row_id = 'id="mm-row-atm"' if _is_atm else ''
+                                _row_atm_attr = 'data-is-atm="true"' if _is_atm else ''
                                 _row_bg = "rgba(79,195,247,0.08)" if _is_atm else ("rgba(255,51,102,0.05)" if _is_cw else ("rgba(0,230,118,0.05)" if _is_pw else "transparent"))
                                 _mm_rows += (
-                                    f'<tr style="background:{_row_bg};border-bottom:1px solid #1a1a2e;">'
+                                    f'<tr {_row_id} {_row_atm_attr} style="background:{_row_bg};border-bottom:1px solid #1a1a2e;">'
                                     f'<td style="padding:7px 10px;font-weight:700;color:{ACCENT if _is_atm else WHITE};">{_msk}{" ◄ ATM" if _is_atm else ""}</td>'
                                     f'<td style="padding:7px 10px;text-align:right;color:{MUTED};">{_dist:+.0f}</td>'
                                     f'<td style="padding:7px 10px;text-align:right;color:{WHITE};">{_ce_oi:,}</td>'
@@ -5616,7 +5447,7 @@ class VolatilityAnalyzer:
                                     <div style="color:{ACCENT};font-size:12px;font-weight:800;letter-spacing:1.5px;">PER-STRIKE INVENTORY &amp; DEALER EXPOSURE</div>
                                     <div style="font-size:11px;color:{MUTED};">Open Interest · Signed Dealer Gamma (₹ Cr) &amp; Delta Exposure</div>
                                 </div>
-                                <div style="max-height:420px;overflow-y:auto;">
+                                <div id="dealer-inventory-container" style="max-height:420px;overflow-y:auto;scroll-behavior:smooth;">
                                     <table style="width:100%;border-collapse:collapse;font-size:11px;">
                                         <thead>
                                             <tr style="color:{MUTED};border-bottom:1px solid #2a2a4a;position:sticky;top:0;background:{CARD_BG};z-index:2;">
@@ -5758,93 +5589,107 @@ class VolatilityAnalyzer:
                         _har_1d_pts = spot * (_har_1d / 100.0) / 15.874
                         _har_5d_pts = spot * (_har_5d / 100.0) / 15.874
 
-                        # ── PLOTLY MULTI-HORIZON VOLATILITY CASCADE LINE PLOT ──
+                        # ── MULTI-HORIZON TERM STRUCTURE COMPARISON & PAST NUMBERS ──
+                        _vol_hist = regime_snapshot.get('history', {})
+                        _rv_10d = float(regime_snapshot['rv'].get('10d', (_rv_5d + _rv_20d)/2.0))
+                        _pts_10d = spot * (_rv_10d / 100.0) / 15.874
+
+                        _term_rows = [
+                            ('1D Session (Intraday)', '1 Day', float(_rv_intra if _rv_intra > 0 else _rv_cons), float(_atm_iv), float(_pts_1d), float(_pts_1d * _lot)),
+                            ('5D Weekly (5 DTE)', '5 Days', float(_rv_5d), float(_atm_iv), float(_pts_5d), float(_pts_5d * _lot)),
+                            ('10D Bi-Weekly', '10 Days', float(_rv_10d), float(_atm_iv), float(_pts_10d), float(_pts_10d * _lot)),
+                            ('20D Monthly (Benchmark)', '20 Days', float(_rv_cons), float(_atm_iv), float(_pts_20d), float(_pts_20d * _lot)),
+                            ('60D Quarterly', '60 Days', float(_rv_60d), float(_atm_iv), float(_pts_60d), float(_pts_60d * _lot)),
+                            ('252D Annual Macro', '1 Year', float(_hv_20d), float(_atm_iv), float(_pts_1y), float(_pts_1y * _lot)),
+                        ]
+
+                        _term_table_rows_html = ''
+                        for _h_title, _h_period, _h_rv, _h_iv_val, _h_pt, _h_inr_val in _term_rows:
+                            _h_vrp = _h_iv_val - _h_rv
+                            _vrp_color = '#00e676' if _h_vrp > 0.5 else ('#ff3366' if _h_vrp < -0.5 else '#ffd54f')
+                            _vrp_badge = 'PREMIUM OVERPRICED' if _h_vrp > 0.5 else ('DISCOUNTED CHEAP' if _h_vrp < -0.5 else 'FAIR VALUE')
+                            _term_table_rows_html += f'''
+                            <tr style="border-bottom:1px solid rgba(255,255,255,0.05); font-family:var(--font-mono, monospace);">
+                                <td style="padding:9px 12px; text-align:left; font-family:'Inter', sans-serif; font-weight:700; color:{WHITE};">{_h_title}</td>
+                                <td style="padding:9px 12px; text-align:center; color:#64748b;">{_h_period}</td>
+                                <td style="padding:9px 12px; text-align:center; font-weight:800; color:#00e5ff;">{_h_rv:.2f}%</td>
+                                <td style="padding:9px 12px; text-align:center; font-weight:700; color:#ffd54f;">{_h_iv_val:.2f}%</td>
+                                <td style="padding:9px 12px; text-align:center; font-weight:800; color:{_vrp_color};">{_h_vrp:+.2f}%</td>
+                                <td style="padding:9px 12px; text-align:right; font-weight:700; color:{WHITE};">±{_h_pt:.1f} pts</td>
+                                <td style="padding:9px 12px; text-align:right; font-weight:800; color:#38bdf8;">±₹{_h_inr_val:,.0f}</td>
+                                <td style="padding:9px 12px; text-align:left;">
+                                    <span style="background:{_vrp_color}18; color:{_vrp_color}; font-size:10px; font-weight:800; padding:2px 8px; border-radius:4px; border:1px solid {_vrp_color}44;">
+                                        {_vrp_badge}
+                                    </span>
+                                </td>
+                            </tr>
+                            '''
+
+                        # ── PAST NUMBERS & HISTORICAL VOLATILITY EVOLUTION CHART ──
+                        _p_cur_rv20 = _vol_hist.get('cur_rv20', _rv_cons)
+                        _p_yest_rv20 = _vol_hist.get('yesterday_rv20', _rv_cons)
+                        _p_d5_rv20 = _vol_hist.get('d5_ago_rv20', _rv_cons)
+                        _p_d20_rv20 = _vol_hist.get('d20_ago_rv20', _rv_cons)
+
+                        _chg_yest = _p_cur_rv20 - _p_yest_rv20
+                        _chg_d5 = _p_cur_rv20 - _p_d5_rv20
+                        _chg_d20 = _p_cur_rv20 - _p_d20_rv20
+
                         try:
-                            fig_cascade = go.Figure()
+                            fig_vol_history = go.Figure()
+                            _h_dates = _vol_hist.get('dates', [])
+                            _h_rv20_vals = _vol_hist.get('rv20', [])
+                            _h_rv5_vals = _vol_hist.get('rv5', [])
 
-                            _h_names = ['1D Session', '5D Weekly', '20D Monthly', '60D Quarterly', '252D 1Y Macro']
-                            _h_rvs = [
-                                float(_rv_intra if _rv_intra > 0 else _rv_cons),
-                                float(_rv_5d),
-                                float(_rv_cons),
-                                float(_rv_60d),
-                                float(_hv_20d)
-                            ]
-                            _h_pts = [float(_pts_1d), float(_pts_5d), float(_pts_20d), float(_pts_60d), float(_pts_1y)]
-                            _h_iv = [float(_atm_iv)] * 5
-                            _h_inr = [p * _lot for p in _h_pts]
-
-                            # 1. 1-Year Historical Cone Bounds (Ceiling & Floor Lines)
-                            if _macro_max > 0:
-                                fig_cascade.add_trace(
+                            if _h_dates and len(_h_dates) == len(_h_rv20_vals):
+                                fig_vol_history.add_trace(
                                     go.Scatter(
-                                        x=_h_names,
-                                        y=[_macro_max] * 5,
-                                        mode='lines',
-                                        name=f"1Y Ceiling ({_macro_max:.1f}%)",
-                                        line=dict(color='rgba(255, 51, 102, 0.45)', width=1.5, dash='dot'),
-                                        hovertemplate="<b>1-Year Vol Ceiling</b>: %{y:.2f}%<extra></extra>"
+                                        x=_h_dates,
+                                        y=_h_rv20_vals,
+                                        mode='lines+markers',
+                                        name='20D Realized Vol (RV)',
+                                        line=dict(color='#00e5ff', width=2.5),
+                                        marker=dict(size=4, color='#00e5ff'),
+                                        hovertemplate="<b>%{x|%d %b %Y}</b><br>20D Realized Vol: <b>%{y:.2f}%</b><extra></extra>"
                                     )
                                 )
-                            if _macro_min > 0:
-                                fig_cascade.add_trace(
+                                if _h_rv5_vals and len(_h_rv5_vals) == len(_h_dates):
+                                    fig_vol_history.add_trace(
+                                        go.Scatter(
+                                            x=_h_dates,
+                                            y=_h_rv5_vals,
+                                            mode='lines',
+                                            name='5D Short-Term RV',
+                                            line=dict(color='#ffd54f', width=1.8, dash='dot'),
+                                            hovertemplate="<b>%{x|%d %b %Y}</b><br>5D Short-Term RV: <b>%{y:.2f}%</b><extra></extra>"
+                                        )
+                                    )
+                                fig_vol_history.add_trace(
                                     go.Scatter(
-                                        x=_h_names,
-                                        y=[_macro_min] * 5,
+                                        x=_h_dates,
+                                        y=[float(_atm_iv)] * len(_h_dates),
                                         mode='lines',
-                                        name=f"1Y Floor ({_macro_min:.1f}%)",
-                                        line=dict(color='rgba(0, 230, 118, 0.45)', width=1.5, dash='dot'),
-                                        hovertemplate="<b>1-Year Vol Floor</b>: %{y:.2f}%<extra></extra>"
+                                        name=f"Live ATM IV ({_atm_iv:.1f}%)",
+                                        line=dict(color='#c084fc', width=1.8, dash='dash'),
+                                        hovertemplate="<b>Live ATM IV Benchmark</b>: <b>%{y:.2f}%</b><extra></extra>"
                                     )
                                 )
-
-                            # 2. Live ATM Implied Volatility Benchmark Line (Gold Dashed)
-                            fig_cascade.add_trace(
-                                go.Scatter(
-                                    x=_h_names,
-                                    y=_h_iv,
-                                    mode='lines+markers',
-                                    name=f"Live ATM IV ({_atm_iv:.1f}%)",
-                                    line=dict(color='#ffd54f', width=2.5, dash='dash'),
-                                    marker=dict(size=7, color='#ffd54f', symbol='diamond'),
-                                    hovertemplate="<b>Live ATM Implied Vol</b>: <b>%{y:.2f}%</b><extra></extra>"
-                                )
-                            )
-
-                            # 3. Realized Volatility Term Curve (Vibrant Solid Cyan Line)
-                            _custom_rv = [
-                                [pts, inr, rv - _atm_iv, name]
-                                for pts, inr, rv, name in zip(_h_pts, _h_inr, _h_rvs, _h_names)
-                            ]
-                            fig_cascade.add_trace(
-                                go.Scatter(
-                                    x=_h_names,
-                                    y=_h_rvs,
-                                    mode='lines+markers+text',
-                                    name="Realized Vol Curve (RV)",
-                                    line=dict(color='#00e5ff', width=3.5),
-                                    marker=dict(
-                                        size=10,
-                                        color='#00e5ff',
-                                        symbol='circle',
-                                        line=dict(color='#ffffff', width=2)
-                                    ),
-                                    text=[f"{v:.1f}%" for v in _h_rvs],
-                                    textposition="top center",
-                                    textfont=dict(color="#00e5ff", size=11, family="JetBrains Mono, monospace"),
-                                    customdata=_custom_rv,
-                                    hovertemplate=(
-                                        "<b>%{x}</b><br>"
-                                        "Realized Vol: <b>%{y:.2f}%</b><br>"
-                                        "ATM IV: <b>" + f"{_atm_iv:.2f}%" + "</b> (VRP: <b>%{customdata[2]:+.2f}%</b>)<br>"
-                                        "Daily Expected Move: <b>±%{customdata[0]:.0f} pts</b> (₹%{customdata[1]:,.0f}/lot)<extra></extra>"
+                                _med_val = _macro.get('hv_median', _hv_20d)
+                                if _med_val > 0:
+                                    fig_vol_history.add_trace(
+                                        go.Scatter(
+                                            x=_h_dates,
+                                            y=[float(_med_val)] * len(_h_dates),
+                                            mode='lines',
+                                            name=f"1Y Median ({_med_val:.1f}%)",
+                                            line=dict(color='#64748b', width=1.2, dash='dot'),
+                                            hovertemplate="<b>1-Year Vol Median</b>: <b>%{y:.2f}%</b><extra></extra>"
+                                        )
                                     )
-                                )
-                            )
 
-                            fig_cascade.update_layout(
-                                height=340,
-                                margin=dict(l=45, r=40, t=25, b=25),
+                            fig_vol_history.update_layout(
+                                height=280,
+                                margin=dict(l=45, r=40, t=20, b=25),
                                 paper_bgcolor='rgba(0,0,0,0)',
                                 plot_bgcolor='rgba(0,0,0,0)',
                                 showlegend=True,
@@ -5854,64 +5699,41 @@ class VolatilityAnalyzer:
                                     y=1.02,
                                     xanchor="right",
                                     x=1,
-                                    font=dict(size=11, color="#cbd5e1")
+                                    font=dict(size=10, color="#94a3b8", family="JetBrains Mono, monospace"),
+                                    bgcolor='rgba(15,23,42,0.6)'
                                 ),
                                 xaxis=dict(
+                                    title=dict(text="Date", font=dict(color="#868993", size=10)),
                                     showgrid=True,
-                                    gridcolor='#2a2e39',
-                                    gridwidth=1,
-                                    tickfont=dict(size=11, color="#cbd5e1", family="Inter, sans-serif")
+                                    gridcolor='rgba(255, 255, 255, 0.04)',
+                                    tickfont=dict(size=10, color="#868993", family="JetBrains Mono, monospace"),
+                                    type='date',
+                                    tickformat='%d %b',
+                                    hoverformat='%d %b %Y'
                                 ),
                                 yaxis=dict(
-                                    title=dict(text="Annualized Volatility (%)", font=dict(color="#00e5ff", size=11)),
+                                    title=dict(text="Annualized Vol (%)", font=dict(color="#00e5ff", size=10)),
                                     showgrid=True,
-                                    gridcolor='#2a2e39',
-                                    gridwidth=1,
+                                    gridcolor='rgba(255, 255, 255, 0.04)',
                                     tickfont=dict(size=10, color="#868993", family="JetBrains Mono, monospace")
                                 ),
                                 hovermode="x unified"
                             )
-
-                            cascade_chart_html = fig_cascade.to_html(include_plotlyjs=False, full_html=False, div_id='cascade-term-structure-plot', default_height='340px', default_width='100%')
-                        except Exception as _casc_err:
-                            cascade_chart_html = f'<div style="color:#ff4444; padding:20px;">Cascade chart error: {_casc_err}</div>'
+                            vol_history_chart_html = fig_vol_history.to_html(include_plotlyjs=False, full_html=False, div_id='vol-history-evolution-plot', default_height='280px', default_width='100%')
+                        except Exception as _hist_err:
+                            vol_history_chart_html = f'<div style="color:#ff4444; padding:20px;">History chart error: {_hist_err}</div>'
 
                         regime_tab_html = f'''
                         <div style="display:flex; flex-direction:column; gap:14px;">
 
-                            <!-- 1. Executive Multi-Horizon Regime Header -->
-                            <div class="card" style="border-left: 4px solid {ACCENT}; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e); padding:16px;">
-                                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
-                                    <div>
-                                        <div style="font-size:11px; font-weight:800; color:{MUTED}; text-transform:uppercase; letter-spacing:1px; margin-bottom:3px;">ACTIVE MARKET REGIME</div>
-                                        <h2 style="color:{ACCENT}; font-size:24px; font-weight:900; margin:0 0 4px 0;">{regime_snapshot['regime']['name']}</h2>
-                                    </div>
-                                    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                                        <span style="background:rgba(0, 229, 255, 0.1); color:{ACCENT}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid rgba(0, 229, 255, 0.25);">
-                                            MACRO (1-YR): <strong>{_macro_stage}</strong> ({_hv_pctile:.0f}th %ile)
-                                        </span>
-                                        <span style="background:rgba(255,255,255,0.04); color:{_curve_color}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {_curve_color}44;">
-                                            CURVE: {_curve_badge}
-                                        </span>
-                                        <span style="background:rgba(255,255,255,0.04); color:{WHITE}; font-size:11px; font-weight:700; padding:4px 10px; border-radius:6px; border:1px solid var(--border-subtle, #2a2e39);">
-                                            BIAS: <strong style="color:{ACCENT};">{regime_snapshot['regime']['bias']}</strong>
-                                        </span>
-                                        <span style="background:{GREEN}18; color:{GREEN}; font-size:11px; font-weight:800; padding:4px 10px; border-radius:6px; border:1px solid {GREEN}44;">
-                                            VOL: {regime_snapshot['regime']['vol_action']}
-                                        </span>
-                                    </div>
-                                </div>
-                                <p style="color:#cbd5e1; font-size:13px; line-height:1.5; margin:0;">{regime_snapshot['regime']['description']}</p>
-                            </div>
-
-                            <!-- 2. Price-Grounded VRP & Expected Move Matrix -->
+                            <!-- 1. Price-Grounded VRP & Expected Move Matrix -->
                             <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
                                     <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
                                         💰 VOLATILITY RISK PREMIUM IN PRICE (POINTS & RUPEES)
                                     </div>
                                     <div style="font-size:11px; color:{MUTED};">
-                                        NIFTY Spot: <strong style="color:{WHITE}; font-family:var(--font-mono);">{spot:,.2f}</strong> · Lot Size: <strong style="color:{ACCENT};">{_lot} Qty</strong> <span style="color:{MUTED};">(₹{_notional_per_lot:.2f}L Notional/Lot)</span>
+                                        NIFTY Spot: <strong style="color:{WHITE}; font-family:var(--font-mono);">{spot:,.2f}</strong> · Lot Size: <strong style="color:{ACCENT};">{_lot} Qty</strong>
                                     </div>
                                 </div>
                                 <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;">
@@ -6041,18 +5863,74 @@ class VolatilityAnalyzer:
                                 </div>
                             </div>
 
-                            <!-- 3. Multi-Horizon Volatility Term Structure Cascade (Plot) -->
+                            <!-- 2. Multi-Horizon Volatility Term Structure Matrix -->
                             <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
-                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                                    <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
-                                        📊 MULTI-HORIZON VOLATILITY TERM STRUCTURE CASCADE (1D &rarr; 252D MACRO)
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+                                    <div>
+                                        <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
+                                            📐 MULTI-HORIZON VOLATILITY TERM STRUCTURE MATRIX
+                                        </div>
+                                        <div style="font-size:11px; color:{MUTED}; margin-top:2px;">
+                                            Term Slope (5D - 60D): <strong style="color:{'#ff3366' if (_rv_5d - _rv_60d) > 1 else '#00e676' if (_rv_5d - _rv_60d) < -1 else ACCENT}; font-family:var(--font-mono);">{_rv_5d - _rv_60d:+.2f}%</strong> ({'Inverted / Backwardation' if (_rv_5d - _rv_60d) > 1 else 'Normal Contango' if (_rv_5d - _rv_60d) < -1 else 'Flat Curve'}) · Consensus RV: <strong style="color:{WHITE}; font-family:var(--font-mono);">{_rv_cons:.2f}%</strong>
+                                        </div>
                                     </div>
                                     <div style="font-size:11px; color:{MUTED};">
-                                        Term Slope (5D - 60D): <strong style="color:{'#ff3366' if (_rv_5d - _rv_60d) > 1 else '#00e676' if (_rv_5d - _rv_60d) < -1 else ACCENT}; font-family:var(--font-mono);">{_rv_5d - _rv_60d:+.2f}%</strong> ({'Inverted / Stress' if (_rv_5d - _rv_60d) > 1 else 'Normal Contango' if (_rv_5d - _rv_60d) < -1 else 'Flat Curve'}) · Consensus RV: <strong style="color:{WHITE}; font-family:var(--font-mono);">{_rv_cons:.2f}%</strong>
+                                        Lot Size: <strong style="color:{WHITE};">{_lot} Qty</strong>
                                     </div>
                                 </div>
-                                {cascade_chart_html}
+                                <div style="overflow-x:auto;">
+                                    <table style="width:100%; border-collapse:collapse; font-size:11px;">
+                                        <thead>
+                                            <tr style="background:#131722; color:{MUTED}; border-bottom:1px solid var(--border-subtle, #2a2e39);">
+                                                <th style="padding:8px 12px; text-align:left;">Horizon & Tenor</th>
+                                                <th style="padding:8px 12px; text-align:center;">Days</th>
+                                                <th style="padding:8px 12px; text-align:center; color:#00e5ff;">Realized Vol (RV)</th>
+                                                <th style="padding:8px 12px; text-align:center; color:#ffd54f;">Live Implied Vol (IV)</th>
+                                                <th style="padding:8px 12px; text-align:center;">VRP Spread (IV - RV)</th>
+                                                <th style="padding:8px 12px; text-align:right;">Expected Move (Pts)</th>
+                                                <th style="padding:8px 12px; text-align:right; color:#38bdf8;">Expected Move (₹/Lot)</th>
+                                                <th style="padding:8px 12px; text-align:left;">Premium State</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {_term_table_rows_html}
+                                        </tbody>
+                                    </table>
+                                </div>
                             </div>
+
+                            <!-- 3. Past Numbers & Historical Volatility Evolution -->
+                            <div class="card" style="padding:16px; background:var(--bg-surface, #1e222d); border:1px solid var(--border-card, #363c4e);">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+                                    <div>
+                                        <div style="font-size:12px; font-weight:800; color:{ACCENT}; text-transform:uppercase; letter-spacing:1px;">
+                                            📈 HISTORICAL VOLATILITY EVOLUTION & PAST NUMBERS
+                                        </div>
+                                        <div style="font-size:11px; color:{MUTED}; margin-top:2px;">
+                                            Compare current realized volatility directly against yesterday, 5 days ago, 20 days ago, and 1-year macro range
+                                        </div>
+                                    </div>
+                                    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                        <span style="background:rgba(0, 229, 255, 0.1); color:#00e5ff; font-size:10px; font-weight:800; padding:3px 8px; border-radius:4px; border:1px solid rgba(0,229,255,0.25);">
+                                            Current 20D RV: <strong>{_p_cur_rv20:.2f}%</strong>
+                                        </span>
+                                        <span style="background:rgba(255,255,255,0.04); color:{'#ff3366' if _chg_yest > 0 else '#00e676'}; font-size:10px; font-weight:700; padding:3px 8px; border-radius:4px;">
+                                            Yesterday: <strong>{_p_yest_rv20:.2f}%</strong> ({_chg_yest:+.2f}%)
+                                        </span>
+                                        <span style="background:rgba(255,255,255,0.04); color:{'#ff3366' if _chg_d5 > 0 else '#00e676'}; font-size:10px; font-weight:700; padding:3px 8px; border-radius:4px;">
+                                            5D Ago: <strong>{_p_d5_rv20:.2f}%</strong> ({_chg_d5:+.2f}%)
+                                        </span>
+                                        <span style="background:rgba(255,255,255,0.04); color:{'#ff3366' if _chg_d20 > 0 else '#00e676'}; font-size:10px; font-weight:700; padding:3px 8px; border-radius:4px;">
+                                            20D Ago: <strong>{_p_d20_rv20:.2f}%</strong> ({_chg_d20:+.2f}%)
+                                        </span>
+                                        <span style="background:rgba(255,213,79,0.1); color:#ffd54f; font-size:10px; font-weight:800; padding:3px 8px; border-radius:4px; border:1px solid rgba(255,213,79,0.25);">
+                                            1Y Range: <strong>{_macro_min:.1f}% — {_macro_max:.1f}%</strong> ({_hv_pctile:.0f}%ile)
+                                        </span>
+                                    </div>
+                                </div>
+                                {vol_history_chart_html}
+                            </div>
+
                             <!-- 4. 1-Year Realized Volatility Cone & HV Statistics -->
                             {vol_tab_html}
                         </div>
@@ -6061,6 +5939,7 @@ class VolatilityAnalyzer:
                         regime_tab_html = "<div style='padding:40px; color:#ff4444; text-align:center;'>Waiting for sufficient daily history data (requires 20+ trading days).</div>"
 
                     # Write fragment file that the running page will fetch
+                    builder_tab_html = self._BUILDER_TERMINAL_SHELL
                     frag_path = html_path.replace('.html', '_fragment.html')
                     fragment_html = f'''
 <div id="frag-regime">{regime_tab_html}</div>
@@ -6070,6 +5949,7 @@ class VolatilityAnalyzer:
 <div id="frag-theta">{theta_tab_html}</div>
 <div id="frag-prob">{prob_tab_html}</div>
 <div id="frag-mm">{mm_tab_html}</div>
+<div id="frag-builder">{builder_tab_html}</div>
 <div id="frag-spot" data-spot="{spot:.0f}" data-time="{now_str}"></div>'''
                     # Atomic write to prevent lock contention on Windows
                     frag_tmp = frag_path + '.tmp'
@@ -6100,10 +5980,11 @@ class VolatilityAnalyzer:
     <link rel="manifest" href="/static/manifest.json">
 
     <!-- Stylesheets -->
-    <link rel="stylesheet" href="/static/css/theme.css">
-    <link rel="stylesheet" href="/static/css/layout.css">
-    <link rel="stylesheet" href="/static/css/gamma_explosion.css">
-    <link rel="stylesheet" href="/static/css/iv_surface.css">
+    <link rel="stylesheet" href="/static/css/theme.css?v=20260918_v2">
+    <link rel="stylesheet" href="/static/css/layout.css?v=20260918_v2">
+    <link rel="stylesheet" href="/static/css/gamma_explosion.css?v=20260918_v2">
+    <link rel="stylesheet" href="/static/css/iv_surface.css?v=20260918_v2">
+    <link rel="stylesheet" href="/static/css/strategy_builder.css?v=20260922_v1">
 </head>
 <body>
 
@@ -6138,7 +6019,8 @@ class VolatilityAnalyzer:
         <button class="tab-btn" data-tab="iv"><span>IV SURFACE</span></button>
         <button class="tab-btn" data-tab="chain"><span>OPTION CHAIN & GREEKS</span></button>
         <button class="tab-btn" data-tab="theta"><span>GREEKS</span></button>
-        <button class="tab-btn mm-tab-btn" data-tab="mm"><span>GAMMA EXPLOSION & MM</span></button>
+        <button class="tab-btn" data-tab="mm"><span>GAMMA EXPLOSION & MM</span></button>
+        <button class="tab-btn" data-tab="builder"><span>STRATEGY BUILDER</span></button>
     </nav>
 
     <!-- Main Workspace Container -->
@@ -6149,17 +6031,19 @@ class VolatilityAnalyzer:
         <section id="tab-chain" class="tab-content">{chain_tab_html}</section>
         <section id="tab-theta" class="tab-content">{theta_tab_html}</section>
         <section id="tab-mm" class="tab-content">{mm_tab_html}</section>
+        <section id="tab-builder" class="tab-content">{builder_tab_html}</section>
     </main>
 
     <!-- Client Scripts -->
     <!-- background_canvas.js removed: FX animation disabled in new flat design -->
-    <script src="/static/js/theta_simulator.js"></script>
-    <script src="/static/js/gamma_explosion_terminal.js"></script>
-    <script src="/static/js/advanced_vol_terminal.js"></script>
-    <script src="/static/js/gex_rebalance_radar.js"></script>
-    <script src="/static/js/oi_velocity_radar.js"></script>
-    <script src="/static/js/iv_surface_terminal.js"></script>
-    <script src="/static/js/dashboard_core.js"></script>
+    <script src="/static/js/theta_simulator.js?v=20260918_v2"></script>
+    <script src="/static/js/gamma_explosion_terminal.js?v=20260918_v2"></script>
+    <script src="/static/js/advanced_vol_terminal.js?v=20260918_v2"></script>
+    <script src="/static/js/gex_rebalance_radar.js?v=20260918_v2"></script>
+    <script src="/static/js/oi_velocity_radar.js?v=20260918_v2"></script>
+    <script src="/static/js/iv_surface_terminal.js?v=20260918_v2"></script>
+    <script src="/static/js/strategy_builder_terminal.js?v=20260922_v1"></script>
+    <script src="/static/js/dashboard_core.js?v=20260918_v2"></script>
 </body>
 </html>'''
                     # Atomic write for unified_dashboard.html
@@ -6212,8 +6096,8 @@ class VolatilityAnalyzer:
                         print(f"  Dashboard opened: {_dashboard_url}")
 
                     print(f"  [{now_str}] Updated | {pred['direction']} ({pred['confidence']:.0%}) | Spot:{spot:.0f}")
-                    _gc_tick = locals().get('_gc_tick', 0) + 1
-                    if _gc_tick % 10 == 0:
+                    _gc_counter += 1
+                    if _gc_counter % 10 == 0:
                         import gc; gc.collect()  # free Plotly figure memory
                     if single_run:
                         break

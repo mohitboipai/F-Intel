@@ -27,10 +27,12 @@ class DealerPositionEngine:
                  risk_free_rate: float | None = None,
                  dividend_yield: float | None = None,
                  positioning_model: Literal['standard', 'inverted', 'flow'] = 'standard',
-                 default_iv: float | None = None):
+                 default_iv: float | None = None,
+                 oi_is_shares: bool | None = True):
         self.lot_size = lot_size if lot_size is not None else _DEFAULT_LOT_SIZE
         self.positioning_model = positioning_model
         self.default_iv = default_iv if default_iv is not None else _DEFAULT_IV
+        self.oi_is_shares = oi_is_shares if oi_is_shares is not None else True
         
         # Instantiate the pure mathematical greeks engine with dividend yield
         self.greeks_engine = GreeksEngine(
@@ -107,7 +109,9 @@ class DealerPositionEngine:
         dealer_sign = self._infer_dealer_sign(df)
         
         # Calculate exposure per contract side
-        is_shares = bool((df['oi'].max() > 100_000)) if not df.empty else False
+        # In NSE / Fyers API, 'oi' and 'volume' are reported in underlying units/shares.
+        # When oi_is_shares is False, multiply by lot_size to convert contract count to shares.
+        is_shares = self.oi_is_shares if self.oi_is_shares is not None else True
         total_shares = df['oi'] if is_shares else (df['oi'] * self.lot_size)
         base_multiplier = total_shares * dealer_sign
         

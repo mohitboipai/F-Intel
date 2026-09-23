@@ -105,8 +105,21 @@ _DEFAULTS: dict[str, Any] = {
     "rv_weight_gk"            : 0.20,
 
     # ── Trade Execution Broadcasting ──────────────────────────────────────────
-    "enable_trade_broadcast"  : True,     # Broadcast setups to minion nodes
-    "minion_endpoints"        : ["http://127.0.0.1:5000/execute_trade"],
+    "enable_trade_broadcast"  : False,    # Minion mode removed per user request
+    "minion_endpoints"        : [],
+
+    # ── Ignition Scanner (0DTE Gamma Compression → Ignition Detector) ─────────
+    "ignition_scan_range_strikes"      : 6,       # ATM ± N strikes (both CE & PE)
+    "ignition_compression_lookback"    : 8,       # bars for range_pct calculation
+    "ignition_compression_percentile"  : 20,      # flag if below this %-ile of own dist
+    "ignition_premium_ceiling"         : 40.0,    # max premium ₹ for compression filter
+    "ignition_spot_atr_percentile"     : 25,      # underlying ATR gate percentile
+    "ignition_spot_zscore_threshold"   : 2.0,     # spot ROC z-score for ignition trigger
+    "ignition_volume_zscore_threshold" : 1.5,     # option volume z-score for confirmation
+    "ignition_iv_spike_pct"            : 0.05,    # 5% IV acceleration threshold
+    "ignition_entry_threshold"         : 65,      # confluence score to flag IGNITING
+    "ignition_trail_stop_pct"          : 25,      # % giveback from HWM for runner trailing
+    "ignition_max_candidates"          : 6,       # max ranked candidates returned
 }
 
 # ── Section mapping for structured JSON storage ───────────────────────────────
@@ -128,6 +141,12 @@ _SECTION_MAP: dict[str, str] = {
     "rv_weight_yz": "vol_signals", "rv_weight_c2c": "vol_signals",
     "rv_weight_park": "vol_signals", "rv_weight_gk": "vol_signals",
     "enable_trade_broadcast": "execution", "minion_endpoints": "execution",
+    "ignition_scan_range_strikes": "ignition", "ignition_compression_lookback": "ignition",
+    "ignition_compression_percentile": "ignition", "ignition_premium_ceiling": "ignition",
+    "ignition_spot_atr_percentile": "ignition", "ignition_spot_zscore_threshold": "ignition",
+    "ignition_volume_zscore_threshold": "ignition", "ignition_iv_spike_pct": "ignition",
+    "ignition_entry_threshold": "ignition", "ignition_trail_stop_pct": "ignition",
+    "ignition_max_candidates": "ignition",
 }
 
 # ── Active config state (in-memory; may differ from disk after load_profile) ──

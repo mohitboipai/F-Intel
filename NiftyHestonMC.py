@@ -176,9 +176,11 @@ class NiftyHestonMC:
         opts = data.get('optionsChain', [])
         recs = []
         for x in opts:
+            raw_type = str(x.get('option_type', '')).upper()
+            opt_type = 'CE' if raw_type in ('CE', 'CALL') else 'PE'
             recs.append({
                 'strike': x.get('strike_price'),
-                'type': 'CE' if x.get('option_type') == 'CALL' else 'PE',
+                'type': opt_type,
                 'price': x.get('ltp'),
                 'iv': x.get('iv'),
             })

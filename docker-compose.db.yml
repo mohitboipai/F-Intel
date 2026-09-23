@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: fintel_timescale
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${FINTEL_DB_USER:-fintel}
+      POSTGRES_PASSWORD: ${FINTEL_DB_PASSWORD:-fintel}
+      POSTGRES_DB: ${FINTEL_DB_NAME:-fintel}
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${FINTEL_DB_USER:-fintel} -d ${FINTEL_DB_NAME:-fintel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+volumes:
+  timescaledb_data:
+    driver: local

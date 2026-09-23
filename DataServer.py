@@ -11,6 +11,8 @@ import os
 import time
 import json
 import threading
+import gzip
+import re
 import pandas as pd
 from flask import Flask, jsonify, send_file, request, render_template, make_response
 from flask_cors import CORS
@@ -25,6 +27,9 @@ try:
 except ImportError:
     config = None
 
+# Get risk-free rate from config for consistent pricing
+_RISK_FREE = float(config.get("risk_free_rate", 0.051274)) if config else 0.051274
+
 # --- CONFIG ---
 from dotenv import load_dotenv
 load_dotenv()
@@ -37,9 +42,30 @@ CHAIN_REFRESH_INTERVAL = 5 # Seconds (Safe high-speed poll with 429 backoff guar
 
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 app.jinja_env.auto_reload = True
 CORS(app)  # type: ignore
 sock = Sock(app)
+
+# ── Playback & Historical Writer Integration ──────────────────────────────────
+try:
+    from PlaybackEngine import playback_bp
+    app.register_blueprint(playback_bp)
+except Exception as _e:
+    print(f"DataServer: Warning registering playback_bp: {_e}")
+
+try:
+    from HistoricalDataWriter import get_writer
+except ImportError:
+    get_writer = None
+
+@app.after_request
+def add_no_cache_headers(response):
+    if request.path.startswith('/static/') or request.path.startswith('/fragment'):
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 class DataHub:
     def __init__(self):
@@ -93,6 +119,11 @@ class DataHub:
                         self.latest_data["spot"] = lp
                         self.latest_data["tick_count"] += 1
                         self.latest_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+                    if get_writer:
+                        try:
+                            get_writer().push_spot_tick(lp, self.latest_data["tick_count"])
+                        except Exception:
+                            pass
                     # Push spot update to UI immediately (support both tick and spot_tick types, and server_time)
                     self.broadcast({
                         "type": "tick",
@@ -142,6 +173,29 @@ class DataHub:
                         with self.lock:
                             self.latest_data["chain"] = chain
                             self.latest_data["status"] = "Live"
+                        # Push chain snapshot to historical DB
+                        if get_writer:
+                            try:
+                                opts = chain.get("optionsChain", [])
+                                if opts:
+                                    exp = str(chain.get("expiry", ""))
+                                    norm_opts = []
+                                    for o in opts:
+                                        norm_opts.append({
+                                            "strike": o.get("strike_price", 0),
+                                            "opt_type": o.get("option_type", "CE"),
+                                            "ltp": o.get("ltp", 0),
+                                            "iv": o.get("iv", 0),
+                                            "oi": o.get("oi", 0),
+                                            "volume": o.get("volume", 0),
+                                            "delta": o.get("delta", 0),
+                                            "gamma": o.get("gamma", 0),
+                                            "theta": o.get("theta", 0),
+                                            "vega": o.get("vega", 0)
+                                        })
+                                    get_writer().push_chain_snapshot(norm_opts, exp)
+                            except Exception:
+                                pass
                         # Push chain update to UI
                         self.broadcast({"type": "chain", "chain": chain})
                     elif c_res and (c_res.get('code') == 429 or 'limit' in str(c_res).lower()):
@@ -220,6 +274,11 @@ class _DataHubCacheAdapter:
     def set_heston_params(self, params: dict):
         self._heston_params = params
         self._heston_ts     = time.time()
+        if get_writer and params:
+            try:
+                get_writer().push_heston_params(params)
+            except Exception:
+                pass
 
     # ── OI Snapshot & Velocity Ring ────────────────────────────────────
     def push_oi_snapshot(self, chain_df: pd.DataFrame, spot: float = 0.0):
@@ -331,13 +390,18 @@ class _DataHubCacheAdapter:
     # ── Realized Volatility / OHLC Data ────────────────────────────────
     def get_rv_data(self, force: bool = False) -> dict:
         """Returns cached Realized Volatility / OHLC data if available."""
-        if hasattr(self, '_rv_data') and self._rv_data and not force:
+        if self._rv_data and not force:
             return self._rv_data
-        return getattr(self, '_rv_data', {})
+        return self._rv_data or {}
 
     def set_rv_data(self, rv_dict: dict):
         if rv_dict and isinstance(rv_dict, dict):
             self._rv_data = rv_dict
+            if get_writer:
+                try:
+                    get_writer().push_vol_snapshot(rv_dict)
+                except Exception:
+                    pass
 
     def get_rv(self) -> float:
         """Returns consensus or 20d realized volatility as a float."""
@@ -375,6 +439,19 @@ def get_data():
     with hub.lock:
         return jsonify(hub.latest_data)
 
+@app.route('/status', methods=['GET'])
+def status():
+    """Health check endpoint for DataClient.is_alive()."""
+    with hub.lock:
+        spot = hub.latest_data.get('spot', 0.0)
+        status_val = hub.latest_data.get('status', 'Initializing')
+    return jsonify({
+        'ok': True,
+        'status': status_val,
+        'spot': spot,
+        'time': datetime.now().strftime('%H:%M:%S')
+    })
+
 @app.route('/', methods=['GET'])
 @app.route('/unified_dashboard.html', methods=['GET'])
 def index():
@@ -391,39 +468,96 @@ def index():
     response.headers['Expires'] = '0'
     return response
 
-_LAST_CACHED_FRAGMENT = [""]
+class _FragmentCache:
+    def __init__(self) -> None:
+        self.mtime: float = 0.0
+        self.content: str = ""
+        self.gzip_content: bytes = b""
+        self.etag: str = ""
+        self.tabs: dict[str, str] = {}
+        self.gzip_tabs: dict[str, bytes] = {}
+
+_FRAG_CACHE = _FragmentCache()
 
 @app.route('/fragment', methods=['GET'])
 def serve_fragment():
-    """Serve the latest pre-rendered dashboard fragment for refreshContent()."""
+    """Serve the latest pre-rendered dashboard fragment with Gzip, ETag, and tab targeting."""
+    global _FRAG_CACHE
     frag_file = os.path.join(os.path.dirname(__file__), 'unified_dashboard_fragment.html')
     if not os.path.exists(frag_file):
         frag_file = 'unified_dashboard_fragment.html'
 
-    for _ in range(5):
-        try:
-            if os.path.exists(frag_file):
-                with open(frag_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                if content and len(content) > 100:
-                    _LAST_CACHED_FRAGMENT[0] = content
-                    response = make_response(content)
-                    response.mimetype = 'text/html'
-                    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
-                    response.headers['Pragma'] = 'no-cache'
-                    response.headers['Expires'] = '0'
-                    return response
-            time.sleep(0.05)
-        except Exception:
-            time.sleep(0.05)
+    try:
+        if os.path.exists(frag_file):
+            cur_mtime = float(os.path.getmtime(frag_file))
+            if cur_mtime != _FRAG_CACHE.mtime or not _FRAG_CACHE.content:
+                for _ in range(3):
+                    try:
+                        with open(frag_file, 'r', encoding='utf-8') as f:
+                            raw = f.read()
+                        if raw and len(raw) > 100:
+                            _FRAG_CACHE.mtime = cur_mtime
+                            _FRAG_CACHE.content = raw
+                            _FRAG_CACHE.gzip_content = gzip.compress(raw.encode('utf-8'))
+                            _FRAG_CACHE.etag = f'"{int(cur_mtime)}-{len(raw)}"'
+                            _FRAG_CACHE.tabs = {}
+                            _FRAG_CACHE.gzip_tabs = {}
+                            break
+                    except Exception:
+                        time.sleep(0.05)
+    except Exception:
+        pass
 
-    if _LAST_CACHED_FRAGMENT[0]:
-        response = make_response(_LAST_CACHED_FRAGMENT[0])
-        response.mimetype = 'text/html'
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
-        return response
+    content: str = _FRAG_CACHE.content
+    if not content:
+        return '<div id="frag-regime"></div>', 200
 
-    return '<div id="frag-regime"></div>', 200
+    target_tab = request.args.get('tab', '').strip().lower()
+    etag: str = _FRAG_CACHE.etag
+    if target_tab:
+        etag = f'{etag[:-1]}-{target_tab}"'
+
+    # ETag / 304 Not Modified check
+    if_none_match = request.headers.get('If-None-Match')
+    if if_none_match and if_none_match == etag:
+        res = make_response('', 304)
+        res.headers['ETag'] = etag
+        res.headers['Cache-Control'] = 'no-cache, must-revalidate'
+        return res
+
+    accept_gzip = 'gzip' in request.headers.get('Accept-Encoding', '').lower()
+
+    # Tab targeting: if specific tab requested, extract it plus frag-spot
+    if target_tab and target_tab in ['chain', 'regime', 'theta', 'mm', 'iv', 'builder']:
+        if target_tab not in _FRAG_CACHE.tabs:
+            pattern = rf'(<div id="frag-{target_tab}">[\s\S]*?</div>\s*)(?=<div id="frag-|\Z)'
+            m_tab = re.search(pattern, content)
+            m_spot = re.search(r'(<div id="frag-spot"[\s\S]*?</div>)', content)
+            tab_html = (m_tab.group(1) if m_tab else "") + (m_spot.group(1) if m_spot else "")
+            if not tab_html:
+                tab_html = content
+            _FRAG_CACHE.tabs[target_tab] = tab_html
+            _FRAG_CACHE.gzip_tabs[target_tab] = gzip.compress(tab_html.encode('utf-8'))
+
+        if accept_gzip and target_tab in _FRAG_CACHE.gzip_tabs:
+            res = make_response(_FRAG_CACHE.gzip_tabs[target_tab])
+            res.headers['Content-Encoding'] = 'gzip'
+        else:
+            res = make_response(_FRAG_CACHE.tabs[target_tab])
+    else:
+        # Full fragment
+        if accept_gzip and _FRAG_CACHE.gzip_content:
+            res = make_response(_FRAG_CACHE.gzip_content)
+            res.headers['Content-Encoding'] = 'gzip'
+        else:
+            res = make_response(content)
+
+    res.mimetype = 'text/html'
+    res.headers['ETag'] = etag
+    res.headers['Vary'] = 'Accept-Encoding'
+    res.headers['Cache-Control'] = 'no-cache, must-revalidate, max-age=0'
+    res.headers['Pragma'] = 'no-cache'
+    return res
 
 @app.route('/static/manifest.json', methods=['GET'])
 def serve_manifest():
@@ -442,7 +576,6 @@ def serve_icon():
 # ─────────────────────────────────────────────
 # Strategy Engine API Endpoints
 # ─────────────────────────────────────────────
-from flask import request
 
 # Lazy imports (avoid circular/slow imports at module load)
 _bt_cache = {}          # strategy_type → latest BacktestReport
@@ -478,12 +611,12 @@ def api_chain_live():
             oi = int(o.get('oi', 0) or 0)
             
             if iv == 0 and ltp > 0 and spot > 0:
-                iv = bsm_implied_volatility(ltp, spot, strike, T, 0.07, opt_type) * 100.0
+                iv = bsm_implied_volatility(ltp, spot, strike, T, _RISK_FREE, opt_type) * 100.0
 
             # Calculate Greeks if IV > 0
             greeks = {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
             if iv > 0 and spot > 0:
-                greeks = bsm_greeks(spot, strike, T, 0.07, iv/100.0, opt_type)
+                greeks = bsm_greeks(spot, strike, T, _RISK_FREE, iv/100.0, opt_type)
                 
             enriched_options.append({
                 'strike': strike,
@@ -899,6 +1032,19 @@ except Exception as _iv_init_e:
     _iv_surface_engine = None
     print(f"[IV_SURFACE] Init warning: {_iv_init_e}")
 
+# In-memory 0DTE Gamma Ignition Scanner snapshot
+_ignition_scanner_snapshot: dict = {
+    "ok": True, "candidates": [], "scan_count": 0, "compressed_count": 0, "spot_compressed": False
+}
+_ignition_scanner_lock = threading.Lock()
+try:
+    from calculations.IgnitionScannerEngine import IgnitionScannerEngine
+    _ise_lot = config.get("nifty_lot_size", 65) if config else 65
+    _ignition_scanner_engine = IgnitionScannerEngine(lot_size=_ise_lot)
+except Exception as _ise_init_e:
+    _ignition_scanner_engine = None
+    print(f"[IGNITION_SCANNER] Init warning: {_ise_init_e}")
+
 
 def _parse_chain_to_df(chain: dict, spot: float = 0.0, T: float = 0.0) -> "pd.DataFrame":
     """Convert Fyers optionsChain dict to a clean DataFrame with resolved IVs for calculations/."""
@@ -993,6 +1139,14 @@ def _get_recent_1min_candles():
 
 def _gex_refresh_loop(interval: int = 3):
     """Background thread: refresh GEX + Dealer snapshots every `interval` seconds."""
+    import pandas as pd
+    from calculations.GexEngine import GexEngine
+    from calculations.DealerPositionEngine import DealerPositionEngine
+
+    _lot = config.get("nifty_lot_size", 65) if config else 65
+    gex_eng = GexEngine(lot_size=_lot, positioning_model='standard')
+    dep = DealerPositionEngine(lot_size=_lot)
+
     while True:
         try:
             spot  = hub.latest_data.get("spot", 0)
@@ -1002,16 +1156,15 @@ def _gex_refresh_loop(interval: int = 3):
                 continue
             
             if spot > 0 and chain:
-                import pandas as pd
-                from calculations.GexEngine import GexEngine
-                from calculations.DealerPositionEngine import DealerPositionEngine
+                _cur_lot = config.get("nifty_lot_size", 65) if config else 65
+                if gex_eng.lot_size != _cur_lot:
+                    gex_eng.lot_size = _cur_lot
+                    dep.lot_size = _cur_lot
 
                 T_gex = hub_cache.get_T()
                 df = _parse_chain_to_df(chain, spot=float(spot), T=T_gex)
                 if not df.empty:
                     # ── GEX via calculations/GexEngine ──────────────────────
-                    _lot = config.get("nifty_lot_size", 65) if config else 65
-                    gex_eng = GexEngine(lot_size=_lot, positioning_model='standard')
                     gex_res = gex_eng.calculate_gex(df, spot)
 
                     profile   = gex_res.get("profile")
@@ -1102,11 +1255,15 @@ def _gex_refresh_loop(interval: int = 3):
                     with _gex_lock:
                         gex_bc_copy = dict(_gex_snapshot)
                     hub.broadcast({"type": "gex_update", "payload": gex_bc_copy})
+                    if get_writer:
+                        try:
+                            get_writer().push_gex_snapshot(gex_bc_copy)
+                        except Exception:
+                            pass
                     print(f"[GEX] net={_gex_snapshot.get('net_gex_crores', 0):.1f} Cr, flip={_gex_snapshot.get('gex_flip_point', gex_res.get('zero_gamma_level', 0)):.0f}")
 
                     # ── Dealer Inventory via DealerPositionEngine ──────────
                     try:
-                        dep   = DealerPositionEngine(lot_size=_lot)
                         d_res = dep.calculate_dealer_inventory(df, spot)
                         sp    = d_res.get("strike_profile", {})
 
@@ -1243,6 +1400,7 @@ def _gex_refresh_loop(interval: int = 3):
                             except Exception:
                                 pass
 
+                            mkt_ctx = hub.latest_data.get("market_context", {})
                             gr_payload   = _gex_rebalance_engine.evaluate(
                                 df, spot,
                                 oi_velocity_data=oi_vel_arg,
@@ -1251,8 +1409,15 @@ def _gex_refresh_loop(interval: int = 3):
                                 intraday_signal_data=ids_snap,
                                 gamma_explosion_data=ge_snap,
                                 dealer_data=dl_snap,
-                                vol_data=econ_vol
+                                vol_data=econ_vol,
+                                regime_data=mkt_ctx
                             )
+                            try:
+                                from GexMoveForecaster import GexMoveForecaster
+                                _gmf = GexMoveForecaster()
+                                gr_payload["expected_move"] = _gmf.analyze_gex_setup(spot, df)
+                            except Exception:
+                                pass
                             with _gex_rebalance_lock:
                                 _gex_rebalance_snapshot.clear()
                                 _gex_rebalance_snapshot.update(gr_payload)
@@ -1264,6 +1429,35 @@ def _gex_refresh_loop(interval: int = 3):
                             print(f"[GEX_REBALANCE] Status: {gr_payload.get('status')} | Score: {gr_payload.get('confluence_score')}/100 | Tier: {gr_payload.get('active_tier')} | Ready: {gr_payload.get('trade_ready')}")
                         except Exception as _gr_e:
                             print(f"[GEX_REBALANCE] Error (non-fatal): {_gr_e}")
+
+                    # ── 0DTE Gamma Ignition Scanner (Cross-Strike Compression → Ignition) ──
+                    if _ignition_scanner_engine is not None:
+                        try:
+                            dte_val = hub_cache.get_T() * 365.0
+                            oi_vel_data = hub_cache.get_oi_velocity_data(window_secs=900)
+                            oi_vel_arg = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
+
+                            ignition_payload = _ignition_scanner_engine.scan(
+                                chain_df=df,
+                                spot=spot,
+                                dte=dte_val,
+                                gex_data=gex_res,
+                                oi_vel_data=oi_vel_arg
+                            )
+                            with _ignition_scanner_lock:
+                                _ignition_scanner_snapshot.clear()
+                                _ignition_scanner_snapshot.update(ignition_payload)
+
+                            hub.broadcast({
+                                "type": "ignition_update",
+                                "payload": ignition_payload
+                            })
+                            num_cand = len(ignition_payload.get('candidates', []))
+                            if num_cand > 0:
+                                top_c = ignition_payload['candidates'][0]
+                                print(f"[IGNITION_SCANNER] Scanned {ignition_payload.get('scan_count')} strikes | Candidates: {num_cand} | Top: {top_c['strike']} {top_c['opt_type']} (Score: {top_c['confluence_score']}/100 - {top_c['status']})")
+                        except Exception as _ise_e:
+                            print(f"[IGNITION_SCANNER] Error (non-fatal): {_ise_e}")
 
                     # ── IV Surface & Real-Time Smile Engine ──
                     if _iv_surface_engine is not None:
@@ -1412,6 +1606,7 @@ def api_gex_rebalance():
                     except Exception:
                         pass
 
+                    mkt_ctx = hub.latest_data.get("market_context", {})
                     live_eval = _gex_rebalance_engine.evaluate(
                         df, spot,
                         oi_velocity_data=oi_vel_arg,
@@ -1420,8 +1615,15 @@ def api_gex_rebalance():
                         intraday_signal_data=ids_snap,
                         gamma_explosion_data=ge_snap,
                         dealer_data=dl_snap,
-                        vol_data=econ_vol
+                        vol_data=econ_vol,
+                        regime_data=mkt_ctx
                     )
+                    try:
+                        from GexMoveForecaster import GexMoveForecaster
+                        _gmf = GexMoveForecaster()
+                        live_eval["expected_move"] = _gmf.analyze_gex_setup(spot, df)
+                    except Exception:
+                        pass
                     with _gex_rebalance_lock:
                         _gex_rebalance_snapshot.clear()
                         _gex_rebalance_snapshot.update(live_eval)
@@ -1431,6 +1633,47 @@ def api_gex_rebalance():
     return jsonify(snap or {"ok": True, "status": "STAND_ASIDE", "trade_ready": False, "action_summary": "Awaiting market data..."})
 
 
+@app.route('/api/ignition-candidates', methods=['GET'])
+def api_ignition_candidates():
+    """
+    GET /api/ignition-candidates — 0DTE Gamma Ignition Scanner.
+    Returns ranked compression-to-ignition candidates across ATM ± N strikes
+    with entry/exit levels, Greeks at entry, and confluence scoring.
+    """
+    with _ignition_scanner_lock:
+        snap = dict(_ignition_scanner_snapshot)
+    if not snap or not snap.get("candidates"):
+        spot = hub.latest_data.get("spot", 0)
+        chain = hub.latest_data.get("chain", {})
+        if spot > 0 and chain and _ignition_scanner_engine is not None:
+            try:
+                df = _parse_chain_to_df(chain)
+                if not df.empty:
+                    dte_val = hub_cache.get_T() * 365.0
+                    oi_vel_data = hub_cache.get_oi_velocity_data(window_secs=900)
+                    oi_vel_arg = oi_vel_data if oi_vel_data.get('vel_by_strike') else None
+                    gex_res = None
+                    try:
+                        from calculations.GexEngine import GexEngine
+                        _lot = config.get("nifty_lot_size", 65) if config else 65
+                        gex_eng = GexEngine(lot_size=_lot, positioning_model='standard')
+                        gex_res = gex_eng.calculate_gex(df, spot)
+                    except Exception:
+                        pass
+                    live_eval = _ignition_scanner_engine.scan(
+                        chain_df=df,
+                        spot=spot,
+                        dte=dte_val,
+                        gex_data=gex_res,
+                        oi_vel_data=oi_vel_arg
+                    )
+                    with _ignition_scanner_lock:
+                        _ignition_scanner_snapshot.clear()
+                        _ignition_scanner_snapshot.update(live_eval)
+                        snap = dict(_ignition_scanner_snapshot)
+            except Exception as _e:
+                print(f"[api_ignition_candidates] Evaluation error: {_e}")
+    return jsonify(snap or {"ok": True, "candidates": [], "scan_count": 0, "compressed_count": 0, "spot_compressed": False})
 
 
 @app.route('/api/intraday-signal', methods=['GET'])
@@ -1479,8 +1722,16 @@ def api_intraday_signal():
                         _intraday_signal_snapshot.update(snap)
             except Exception:
                 pass
-    return jsonify(snap or {"ok": True, "score": 0.0, "actionable": False,
-                            "reason": "No data yet — waiting for first GEX cycle."})
+    def _clean_json_keys(obj):
+        if isinstance(obj, dict):
+            return {f"{k[0]}_{k[1]}" if isinstance(k, tuple) else str(k): _clean_json_keys(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_clean_json_keys(x) for x in obj]
+        return obj
+
+    cleaned_snap = _clean_json_keys(snap) if snap else None
+    return jsonify(cleaned_snap or {"ok": True, "score": 0.0, "actionable": False,
+                                    "reason": "No data yet — waiting for first GEX cycle."})
 
 
 @app.route('/api/oi-velocity', methods=['GET'])
@@ -1651,10 +1902,112 @@ def api_regime():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Legacy Backtest Routes  (used by the dashboard's bt tab)
-# /bt_run  →  triggers async backtest (same logic as /api/backtest)
-# /bt_<type>.html  →  polls and serves the HTML result
+# Backtesting & GEX Move Forecasting Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+_backtest_cache = {}
+
+@app.route('/api/backtest/run', methods=['POST'])
+def api_backtest_run():
+    """
+    POST /api/backtest/run
+    Payload: { strategy: 'RADAR_ATM'|'RADAR_OTM'|'SHORT_STRADDLE', days: 365, sl: 0.40, target: 0.80, confluence: 50, lots: 1 }
+    """
+    try:
+        from HistoricalDataManager import HistoricalDataManager
+        from StrategyBacktestEngine import StrategyBacktestEngine, OptionBuyerRadarStrategy, ShortStraddleStrategy
+
+        body = request.get_json(force=True) or {}
+        strat_name = body.get('strategy', 'RADAR_ATM').upper()
+        days = int(body.get('days', 365))
+        sl = float(body.get('sl', 0.40))
+        target = float(body.get('target', 0.80))
+        confluence = float(body.get('confluence', 50.0))
+        lots = int(body.get('lots', 1))
+
+        hdm = HistoricalDataManager()
+        engine = StrategyBacktestEngine(hdm)
+
+        if strat_name == 'RADAR_ATM':
+            strat = OptionBuyerRadarStrategy(mode='ATM', stop_loss_pct=sl, target_pct=target, min_confluence=confluence)
+        elif strat_name == 'RADAR_OTM':
+            strat = OptionBuyerRadarStrategy(mode='OTM', stop_loss_pct=sl, target_pct=target, min_confluence=confluence)
+        elif strat_name == 'SHORT_STRADDLE':
+            strat = ShortStraddleStrategy(stop_loss_mult=1.5)
+        else:
+            strat = OptionBuyerRadarStrategy(mode='ATM', stop_loss_pct=sl, target_pct=target, min_confluence=confluence)
+
+        res = engine.run(strat, days=days, lots=lots)
+        if res.get('ok'):
+            job_id = f"{strat_name}_{days}_{int(time.time())}"
+            _backtest_cache[job_id] = res
+            res['job_id'] = job_id
+        return jsonify(res)
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/api/backtest/gex-moves', methods=['GET'])
+def api_backtest_gex_moves():
+    """
+    GET /api/backtest/gex-moves?days=365
+    Evaluates historical GEX metrics against realized next-day and expiry moves.
+    """
+    try:
+        from GexMoveForecaster import GexBacktestEngine
+        days = int(request.args.get('days', 365))
+        engine = GexBacktestEngine()
+        res = engine.run(days=days)
+        return jsonify(res)
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/api/backtest/export', methods=['GET'])
+def api_backtest_export():
+    """
+    GET /api/backtest/export?job_id=... OR ?strategy=RADAR_ATM&days=365
+    Returns CSV file download of trade results.
+    """
+    try:
+        from flask import Response
+        import io
+        job_id = request.args.get('job_id')
+        res = _backtest_cache.get(job_id) if job_id else None
+
+        if not res:
+            # Generate fresh backtest on demand
+            strat_name = request.args.get('strategy', 'RADAR_ATM').upper()
+            days = int(request.args.get('days', 365))
+            sl = float(request.args.get('sl', 0.40))
+            target = float(request.args.get('target', 0.80))
+            from HistoricalDataManager import HistoricalDataManager
+            from StrategyBacktestEngine import StrategyBacktestEngine, OptionBuyerRadarStrategy
+            hdm = HistoricalDataManager()
+            engine = StrategyBacktestEngine(hdm)
+            mode = 'OTM' if 'OTM' in strat_name else 'ATM'
+            strat = OptionBuyerRadarStrategy(mode=mode, stop_loss_pct=sl, target_pct=target)
+            res = engine.run(strat, days=days)
+
+        trades = res.get('trades', [])
+        if not trades:
+            return "No trades to export", 404
+
+        df = pd.DataFrame(trades)
+        output = io.StringIO()
+        df.to_csv(output, index=False)
+        csv_data = output.getvalue()
+
+        filename = f"{res.get('strategy_name', 'backtest')}_trades_{datetime.now().strftime('%Y%m%d')}.csv"
+        return Response(
+            csv_data,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        return f"Export error: {e}", 500
+
 
 
 @app.route('/api/confluence', methods=['GET'])
@@ -1688,7 +2041,8 @@ def health_engines():
             'gex_engine': _gex_snapshot.get('last_update', 'Never'),
             'dealer_engine': _dealer_snapshot.get('last_update', 'Never'),
             'signal_memory': context.get('last_updated', 'Never'),
-            'chain_cache': chain_update
+            'chain_cache': chain_update,
+            'ignition_scanner': _ignition_scanner_snapshot.get('timestamp', 'Never')
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -1716,8 +2070,26 @@ def api_portfolio_deploy():
         
         if not legs:
             return jsonify({'ok': False, 'error': 'No legs provided'}), 400
-            
-        pos = portfolio_mgr.deploy(name, legs, spot)
+
+        source = body.get('source', 'MANUAL')
+        sl_premium = body.get('sl_premium', body.get('sl'))
+        target_premiums = body.get('target_premiums')
+        if not target_premiums:
+            t1 = body.get('target_1')
+            t2 = body.get('target_2')
+            if t1 is not None:
+                target_premiums = [t1]
+                if t2 is not None:
+                    target_premiums.append(t2)
+        greeks_at_entry = body.get('greeks_at_entry')
+
+        pos = portfolio_mgr.deploy(
+            name, legs, spot,
+            source=source,
+            sl_premium=sl_premium,
+            target_premiums=target_premiums,
+            greeks_at_entry=greeks_at_entry
+        )
         return jsonify({'ok': True, 'position': pos})
     except Exception as e:
         import traceback
@@ -1796,6 +2168,7 @@ _AUTH_EXEMPT  = {"/", "/fragment", "/builder", "/health", "/ready",
                  "/api/gamma/explosion", "/api/gex", "/api/dealer",
                  "/api/oi-velocity", "/api/oi_velocity",
                  "/api/iv-surface", "/api/iv_surface",
+                 "/api/ignition-candidates",
                  "/static/manifest.json", "/static/sw.js", "/static/icon.png"}
 
 @app.before_request

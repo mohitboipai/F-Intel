@@ -30,7 +30,11 @@ class SharedDataCache:
 
     SPOT_TTL  = 15    # seconds
     CHAIN_TTL = 30    # seconds
-    LOT_SIZE  = 75    # NIFTY
+    try:
+        import config as _cfg
+        LOT_SIZE = int(_cfg.get("nifty_lot_size", 65))
+    except Exception:
+        LOT_SIZE = 65     # NSE revised Aug 2024
 
     def __init__(self, fyers, symbol="NSE:NIFTY50-INDEX"):
         self.fyers  = fyers

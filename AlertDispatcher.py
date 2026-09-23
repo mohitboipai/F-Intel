@@ -18,8 +18,10 @@
 
 import json
 import os
+import urllib.request
 import urllib.parse
 from datetime import datetime
+from typing import Optional, Dict, Any
 
 ALERT_LOG = "alerts.jsonl"
 
@@ -34,7 +36,7 @@ class AlertDispatcher:
         self.telegram_token = os.environ.get("FINTEL_TG_TOKEN", "")
         self.telegram_chat  = os.environ.get("FINTEL_TG_CHAT", "")
 
-    def fire(self, source: str, level: str, title: str, body: str, data: dict = None):
+    def fire(self, source: str, level: str, title: str, body: str, data: Optional[Dict[str, Any]] = None):
         """
         source: module name e.g. 'GammaExplosionModel'
         level:  'INFO' | 'WARNING' | 'CRITICAL'
@@ -52,6 +54,11 @@ class AlertDispatcher:
         }
         self._log(event)
         self._print(event)
+        try:
+            from HistoricalDataWriter import get_writer
+            get_writer().push_alert(source, level, title, body, data)
+        except Exception:
+            pass
         if self.telegram_token and level in ("WARNING", "CRITICAL"):
             self._send_telegram(event)
 
@@ -72,6 +79,7 @@ class AlertDispatcher:
     def _send_telegram(self, event: dict):
         try:
             import urllib.request
+            import urllib.parse
             msg = f"{event['level']}: {event['title']}\n{event['body']}"
             url = (
                 f"https://api.telegram.org/bot{self.telegram_token}"
@@ -87,6 +95,6 @@ class AlertDispatcher:
 _dispatcher = AlertDispatcher()
 
 
-def fire(source: str, level: str, title: str, body: str, data: dict = None):
+def fire(source: str, level: str, title: str, body: str, data: Optional[Dict[str, Any]] = None):
     """Module-level shortcut so callers don't need to manage the singleton."""
     _dispatcher.fire(source, level, title, body, data)

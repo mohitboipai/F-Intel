@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import traceback
 import math
+from typing import Any, Optional, Dict
 
 # Fyers API
 from fyers_apiv3 import fyersModel
@@ -44,11 +45,19 @@ LOOKBACK_DAYS = 300
 SEQ_LEN = 60 # Look back 60 minutes
 MODEL_PATH = "models/nifty_lstm_15m_opt_v1.keras"
 
-LOT_SIZE = 75   # NIFTY lot size — must match GammaExplosionModel.LOT_SIZE
+try:
+    import config as _cfg
+    LOT_SIZE = int(_cfg.get("nifty_lot_size", 65))
+    RISK_FREE_RATE = float(_cfg.get("risk_free_rate", 0.051274))
+    DIVIDEND_YIELD = float(_cfg.get("dividend_yield", 0.0122))
+except Exception:
+    LOT_SIZE = 65   # NSE revised Aug 2024
+    RISK_FREE_RATE = 0.051274
+    DIVIDEND_YIELD = 0.0122
 
 class NiftyRangePredictor:
     def __init__(self):
-        self.fyers = None
+        self.fyers: Any = None
         self.model = None
         self.analytics = OptionAnalytics()
         self.gex_cache = None
@@ -77,7 +86,7 @@ class NiftyRangePredictor:
     def authenticate(self):
         try:
             from fyers_auth_manager import get_fyers_instance
-        self.fyers = get_fyers_instance()
+            self.fyers = get_fyers_instance()
             print("Authentication Successful.")
         except Exception as e:
             print(f"Auth Failed: {e}")
@@ -101,10 +110,11 @@ class NiftyRangePredictor:
                 "range_to": current_end.strftime("%Y-%m-%d"), "cont_flag": "1"
             }
             try:
-                r = self.fyers.history(data=p)
-                if r.get('s') == 'ok':
-                    all_candles.extend(r['candles'])
-                    print(f"  > Got {len(r['candles'])} candles ({current_start.date()})")
+                if self.fyers:
+                    r = self.fyers.history(data=p)
+                    if r.get('s') == 'ok':
+                        all_candles.extend(r['candles'])
+                        print(f"  > Got {len(r['candles'])} candles ({current_start.date()})")
             except: pass
             
             current_start = current_end + datetime.timedelta(days=1)
@@ -113,12 +123,13 @@ class NiftyRangePredictor:
         if not all_candles: return False
         
         df = pd.DataFrame(all_candles, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        df['datetime'] = pd.to_datetime(df['ts'], unit='s').dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+        df['datetime'] = pd.DatetimeIndex(pd.to_datetime(df['ts'], unit='s')).tz_localize('UTC').tz_convert('Asia/Kolkata')
         df = df.set_index('datetime').sort_index()
-        df = df[~df.index.duplicated(keep='first')]
+        df = df.loc[np.logical_not(df.index.duplicated(keep='first'))]
         
         rename = {'o':'open', 'h':'high', 'l':'low', 'c':'close', 'v':'volume'}
-        self.data = df.rename(columns=rename)[['open','high','low','close','volume']]
+        renamed_df = pd.DataFrame(df).rename(columns=rename)
+        self.data = pd.DataFrame(renamed_df[['open','high','low','close','volume']])
         print(f"Loaded {len(self.data)} candles.")
         return True
 
@@ -131,8 +142,9 @@ class NiftyRangePredictor:
         # 2. Fallback
         try:
             data = {"symbol": SYMBOL, "strikecount": 500, "timestamp": ""}
-            r = self.fyers.optionchain(data=data)
-            if r.get('s') == 'ok': return r.get('data', {})
+            if self.fyers:
+                r = self.fyers.optionchain(data=data)
+                if r.get('s') == 'ok': return r.get('data', {})
         except: pass
         return None
 
@@ -171,11 +183,12 @@ class NiftyRangePredictor:
             if abs(strike - spot) > 2000: continue
             
             oi = item.get('oi', 0)
-            o_type = 'CE' if item['option_type'] == 'CALL' else 'PE'
+            raw_type = str(item.get('option_type', '')).upper()
+            o_type = 'CE' if raw_type in ('CE', 'CALL') else 'PE'
             iv = item.get('iv', 0)
             if iv <= 0.01: iv = 15.0
             
-            greeks = self.analytics.calculate_greeks(spot, strike, T, 0.10, iv/100.0, o_type)
+            greeks = self.analytics.calculate_greeks(spot, strike, T, RISK_FREE_RATE, iv/100.0, o_type, q=DIVIDEND_YIELD)
             gamma = greeks.get('gamma', 0)
             
             # Record OI for Walls
@@ -191,8 +204,8 @@ class NiftyRangePredictor:
                 net_gamma += gex_val # Dealer Short Put
                 
         # Find Walls (Max OI)
-        call_wall = max(call_oi_map, key=call_oi_map.get) if call_oi_map else 0
-        put_wall = max(put_oi_map, key=put_oi_map.get) if put_oi_map else 0
+        call_wall = max(call_oi_map, key=lambda k: call_oi_map.get(k, 0)) if call_oi_map else 0
+        put_wall = max(put_oi_map, key=lambda k: put_oi_map.get(k, 0)) if put_oi_map else 0
         
         res = {
             'call_wall': call_wall,
@@ -284,7 +297,7 @@ class NiftyRangePredictor:
         df_processed = self.prepare_data(self.data)
         X, y, feats = self.build_sequences(df_processed)
         
-        if X is None or len(X) < 100:
+        if X is None or feats is None or len(X) < 100:
             print("Not enough data to train.")
             return
 
@@ -338,7 +351,7 @@ class NiftyRangePredictor:
 
     # --- Live Dashboard Logic ---
     def dashboard_ui(self, spot, h15, l15, gex, regime, advice):
-        os.system('cls' if os.name == 'nt' else 'clear')
+        print("\033[2J\033[H", end="")
         
         h15 = int(h15)
         l15 = int(l15)
@@ -398,6 +411,10 @@ class NiftyRangePredictor:
                     "range_from": (now - datetime.timedelta(days=20)).strftime("%Y-%m-%d"),
                     "range_to": now.strftime("%Y-%m-%d"), "cont_flag": "1"
                 }
+                if not self.fyers:
+                    time.sleep(5)
+                    continue
+
                 r = self.fyers.history(data=p)
                 if r.get('s') != 'ok':
                     time.sleep(5)
@@ -405,7 +422,7 @@ class NiftyRangePredictor:
                     
                 candles = r['candles']
                 df = pd.DataFrame(candles, columns=['ts','o','h','l','c','v'])
-                df['datetime'] = pd.to_datetime(df['ts'], unit='s').dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+                df['datetime'] = pd.DatetimeIndex(pd.to_datetime(df['ts'], unit='s')).tz_localize('UTC').tz_convert('Asia/Kolkata')
                 df = df.set_index('datetime').sort_index()
                 df['close'] = df['c']; df['high'] = df['h']; df['low'] = df['l']; df['volume'] = df['v']
                 
@@ -457,12 +474,12 @@ class NiftyRangePredictor:
                 cp = current_prediction
                 if cp:
                     # Logic
-                    range_h = cp['h']
-                    range_l = cp['l']
+                    range_h = float(cp['h']) if isinstance(cp['h'], (int, float)) else float(spot_price)
+                    range_l = float(cp['l']) if isinstance(cp['l'], (int, float)) else float(spot_price)
                     
-                    if spot_price >= range_h - 5:
+                    if spot_price >= range_h - 5.0:
                         advice = "RESISTANCE TEST: Watch for Rejection or Breakout."
-                    elif spot_price <= range_l + 5:
+                    elif spot_price <= range_l + 5.0:
                         advice = "SUPPORT TEST: Watch for Bounce or Breakdown."
                     else:
                         advice = "IN RANGE: Monitor Levels."
@@ -495,7 +512,7 @@ class NiftyRangePredictor:
 
     def main_menu(self):
         while True:
-            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\033[2J\033[H", end="")
             print("=== NIFTY AI ASSISTANT (GEX v2.0) ===")
             print("1. Run Live Assistant")
             print("2. Retrain Model (Full History)")

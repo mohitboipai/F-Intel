@@ -102,14 +102,14 @@ class IntradayTickDB:
         
         conn = sqlite3.connect(self.db_path)
         # Find the absolute closest recorded epoch to the requested time
-        query = f'''
+        query = '''
             SELECT timestamp_epoch 
             FROM option_ticks 
-            ORDER BY ABS(timestamp_epoch - {target_epoch}) ASC 
+            ORDER BY ABS(timestamp_epoch - ?) ASC 
             LIMIT 1
         '''
         cursor = conn.cursor()
-        cursor.execute(query)
+        cursor.execute(query, (target_epoch,))
         res = cursor.fetchone()
         
         if not res:
@@ -119,11 +119,11 @@ class IntradayTickDB:
         closest_epoch = res[0]
         
         # Fetch all strikes for that exact closest snapshot
-        df = pd.read_sql_query(f'''
+        df = pd.read_sql_query('''
             SELECT strike, opt_type as type, price, symbol 
             FROM option_ticks 
-            WHERE timestamp_epoch = {closest_epoch}
-        ''', conn)
+            WHERE timestamp_epoch = ?
+        ''', conn, params=(closest_epoch,))
         
         conn.close()
         return df
